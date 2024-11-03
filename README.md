@@ -86,9 +86,9 @@ Really any size is possible, a naked set of 1 being a naked single, and a naked 
 all of the row.
 
 * consequences of finding a naked set:
-..* no other cell in that section can contain these N candidates.
+  * no other cell in that section can contain these N candidates.
   This leaves us with another set (the complementary set).
-..* the complementary set cells can therefore be purged of the N candidates found.
+  * the complementary set cells can therefore be purged of the N candidates found.
   The complementary set is usually a hidden set. 
 
 * once more, after removing the extra candidates from the hidden set, repeat from the beginning.
@@ -146,7 +146,7 @@ To name a few:
 - options to prove uniqueness and verify the solutions
 - an option to check the puzzle
 - options to control the number of threads
-- optionally provde statistics and timing information
+- optionally provide statistics and timing information
 - optionally solve a single puzzle from a puzzle file
 
 Also, some adaptivity is welcome, e.g. when faster and/or specialized instructions
