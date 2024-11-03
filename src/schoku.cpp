@@ -1,4 +1,4 @@
-// This code uses AVX2 instructions...
+/// This code uses AVX2 instructions...
 /*
  * Schoku
  *
@@ -8,35 +8,34 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.5 (major capability update)
+ * Version 0.6  (cleanup)
  *
  * Performance changes:
- * - full 256 bit hidden single search
- *   including box hidden singles
- * - 128 bit type
- * - bi-value universal grave detection
- * - dynamic support for pext/pdep BMI2 instructions
+ * - move enter loop into solve (beware: more spaghetti logic)
+ * - the enter loop detects additional naked singles
+ * - add bit96_t
+ *   in order to tighten GridState
+ * - combined column and box in naked set search
  *
  * Functional changes:
- * - full set of command line options
- *   correctness, uniqueness, puzzle validation, step-by-step progress
+ * - report complementary sets as 'hidden', pairs as 'pairs'
  *
  * Performance measurement and statistics:
  *
- * data: 17-clue sudoku
+ * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.5
+ * schoku version: 0.6
  *     49151  puzzles entered
- *    41.4ms   0.84µs/puzzle  solving time
- *     49151  puzzles solved
- *     34206  69.59%  puzzles solved without guessing
- *     38515   0.78/puzzle  total guesses
- *     24031   0.49/puzzle  total back tracks
- *    316780   6.45/puzzle  total digits entered and retracted
- *   1455691  29.62/puzzle  total 'rounds'
- *    143509   2.92/puzzle  naked sets found
- *   3757199  76.44/puzzle  naked sets searched
+ *     49151  1183663/s  puzzles solved
+ *    41.5ms   0.84µs/puzzle  solving time
+ *     34234   69.65%  puzzles solved without guessing
+ *     38484    0.78/puzzle  guesses
+ *     24011    0.49/puzzle  back tracks
+ *    321296    6.54/puzzle  digits entered and retracted
+ *   1526646   31.06/puzzle  'rounds'
+ *     88712    1.80/puzzle  naked sets found
+ *   3915828   79.67/puzzle  naked sets searched
  *       838  bi-value universal graves detected
  *
  */
@@ -54,17 +53,13 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-const char *version_string = "0.5";
+const char *version_string = "0.6";
 
 const char *compilation_options = 
 ""
 ;
 
-
-bool bmi2_support = false;
-
-
-// using type v16us for the built-in vector of unsigned short[16] 
+// using type v16us for the built-in vector of unsigned short[16]
 using v16us  = __v16hu;
 using v8us   = __v8hu;
 using v16usb = __v16hu;	// for boolean representation
@@ -89,11 +84,20 @@ union {
     unsigned long long u64[2];
     unsigned int u32[4];
     unsigned short u16[8];
+    unsigned char u8[16];
+
+    inline operator __uint128_t () {
+        return this->u128;
+    }
+
     inline bool check_indexbit(unsigned char idx) {
-        return this->u16[idx>>4] & (1<<(idx & 0xf));
+        return this->u8[idx>>3] & (1<<(idx & 0x7));
+    }
+    inline bool check_and_mask_index(unsigned char idx) {
+        return _bittestandreset64((long long int *)&this->u64[idx>>6], idx & 0x3f);
     }
     inline void set_indexbit(unsigned char idx) {
-        this->u16[idx>>4] |= 1<<(idx & 0xf);
+        this->u8[idx>>3] |= 1<<(idx & 0x7);
     }
     inline void set_indexbits(unsigned long long mask, unsigned char pos, unsigned char bitcount) {
         mask &= (unsigned long long)((1LL<<bitcount)-1);  // since the bit count is specific, enforce it
@@ -123,59 +127,120 @@ union {
         }
         return res;
     }
-    // bit storage scheme specifically for tracking naked sets:
-    // (optionally) 'interleaved' (il_) bits storage scheme.
-    // If interleaved is false, each section occupies 9 contiguous bit,
-    // repeated for each section, 81 bits total.
-    // Note that this corresponds for Rows only to the pattern used in unlocked etc.
-    // throughout.  For Cols and Boxes, its another story - essentially not convertable.
-    //
-    // When 'interleaved' is true, accommodate 'doubledbits' boolean vectors to save
-    // some cycles.  Even less convertable than above.
-    // In this scheme:
-    // Each section occupies 9 bit, but interleaved spaced over 18 bits.
-    // sections 0-4 are consecutive, over 90 bits (0..88).
-    // sections 5-8 are offset by one and stored in the interleaved (0+1..70+1) bits.
-    // All this to accommodate the 'doubledbits' returned by the movemask intrinsics.
-    // (avoiding spending an extra call to obtain the same bit mask single spaced)
-    // API:
-    // The API for check/set is based on the section index ({row,col,box}_index,
-    // and the offset (0..8) into the section.
-    // computing the idx for the call is only cumbersome for the box kind.
-    // The API for set_index_bits is even simpler, just specify the 18/9 bit mask and
-    // section (0..8) where it goes to.
-    //
-    template<bool interleave>
-    inline bool il_check_indexbit(unsigned char sct, unsigned char off) {
-        if ( interleave ) {
-            off = (off<<1) + ((sct>4)?1:0);
-            return check_indexbit(sct%5*18+off);
-        } else {
-            return check_indexbit(sct*9+off);
-        }
-    }
-    template<bool interleave>
-    inline void il_set_indexbit(unsigned char sct, unsigned char off) {
-        if ( interleave ) {
-            off = (off<<1) + ((sct>4)?1:0);
-            set_indexbit(sct%5*18+off);
-        } else {
-            return set_indexbit(sct*9+off);
-        }
-    }
-    // bitcount is always 18-1 for 'interleaved' and 9 otherwise!
-    // the 18 bits are 'normalized' by masking out the interleaved bits.
-    template<bool interleave>
-    inline void il_set_section_indexbits(unsigned long long mask, unsigned char section) {
-        if ( interleave ) {
-            set_indexbits(mask & 0b10101010101010101ULL, section%5*18 + (section>4?1:0), 18-1);
-        } else {
-            set_indexbits(mask, section*9, 9);
-        }
-    }
 } bit128_t;
 
+// bit96_t type
+// for the updated 81-bit field to support different access patterns.
+typedef
+union  __attribute__ ((packed))    // we want to pack the GridState data.
+{
+    unsigned long long u64[1];
+    unsigned int u32[3];
+    unsigned short u16[6];
+    unsigned short u8[12];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waddress-of-packed-member"
+
+    inline bool check_indexbit(unsigned char idx) {
+        return this->u8[idx>>3] & (1<<(idx & 0x7));
+    }
+    inline bool check_and_mask_index(unsigned char idx) {
+        return _bittestandreset64((long long int *)&this->u64[idx>>6], idx & 0x3f);
+    }
+    inline void set_indexbit(unsigned char idx) {
+        this->u8[idx>>3] |= 1<<(idx & 0x7);
+    }
+#pragma GCC diagnostic pop
+
+    inline void set_indexbits(unsigned long long mask, unsigned char pos, unsigned char bitcount) {
+        mask &= (unsigned long long)((1LL<<bitcount)-1);  // since the bit count is specific, enforce it
+        if ( pos < 64 ) {
+            u64[0] |= mask << pos;
+            if ( pos + bitcount >= 64 ) {
+                u32[2] |= mask >> (64 - pos);
+            }
+        } else {
+            u32[2] |= mask << (pos-64);
+        }
+    }
+    // bitcount <= 64
+    inline unsigned long long get_indexbits(unsigned char pos, unsigned char bitcount) {
+        unsigned long long res = 0;
+        if ( pos < 64 ) {
+            res = u64[0] >> pos;
+            if ( pos + bitcount >= 64 ) {
+                res |= u32[2] << (64 - pos);
+            }
+        } else {
+            res = u32[2] >> (pos-64);
+        }
+        // clip result
+        if ( bitcount < 64 ) {
+            res &= ((1LL<<bitcount)-1);
+        }
+        return res;
+    }
+} bit96_t;
+
+// alignment helper construct
+// The goal is to not mix heavily used and lesser used data on the same cache line.
+// The secondary goal is to associate data structures with as few cache lines as possible.
+typedef struct alignas(64) {} align64_empty;
+
+const align64_empty c1;
+// not heavily used
+const unsigned char index_by_i[81][3] = {
+  { 0, 0, 0},  { 0, 1, 0},  { 0, 2, 0},  { 0, 3, 1},  { 0, 4, 1},  { 0, 5, 1},  { 0, 6, 2},  { 0, 7, 2},  { 0, 8, 2},
+  { 1, 0, 0},  { 1, 1, 0},  { 1, 2, 0},  { 1, 3, 1},  { 1, 4, 1},  { 1, 5, 1},  { 1, 6, 2},  { 1, 7, 2},  { 1, 8, 2},
+  { 2, 0, 0},  { 2, 1, 0},  { 2, 2, 0},  { 2, 3, 1},  { 2, 4, 1},  { 2, 5, 1},  { 2, 6, 2},  { 2, 7, 2},  { 2, 8, 2},
+  { 3, 0, 3},  { 3, 1, 3},  { 3, 2, 3},  { 3, 3, 4},  { 3, 4, 4},  { 3, 5, 4},  { 3, 6, 5},  { 3, 7, 5},  { 3, 8, 5},
+  { 4, 0, 3},  { 4, 1, 3},  { 4, 2, 3},  { 4, 3, 4},  { 4, 4, 4},  { 4, 5, 4},  { 4, 6, 5},  { 4, 7, 5},  { 4, 8, 5},
+  { 5, 0, 3},  { 5, 1, 3},  { 5, 2, 3},  { 5, 3, 4},  { 5, 4, 4},  { 5, 5, 4},  { 5, 6, 5},  { 5, 7, 5},  { 5, 8, 5},
+  { 6, 0, 6},  { 6, 1, 6},  { 6, 2, 6},  { 6, 3, 7},  { 6, 4, 7},  { 6, 5, 7},  { 6, 6, 8},  { 6, 7, 8},  { 6, 8, 8},
+  { 7, 0, 6},  { 7, 1, 6},  { 7, 2, 6},  { 7, 3, 7},  { 7, 4, 7},  { 7, 5, 7},  { 7, 6, 8},  { 7, 7, 8},  { 7, 8, 8},
+  { 8, 0, 6},  { 8, 1, 6},  { 8, 2, 6},  { 8, 3, 7},  { 8, 4, 7},  { 8, 5, 7},  { 8, 6, 8},  { 8, 7, 8},  { 8, 8, 8},
+};
+
+const align64_empty c2;
+// some box related indices
+// 
+const unsigned char box_start[81] = {
+    0, 0, 0, 3, 3, 3, 6, 6, 6,
+    0, 0, 0, 3, 3, 3, 6, 6, 6,
+    0, 0, 0, 3, 3, 3, 6, 6, 6,
+    27, 27, 27, 30, 30, 30, 33, 33, 33,
+    27, 27, 27, 30, 30, 30, 33, 33, 33,
+    27, 27, 27, 30, 30, 30, 33, 33, 33,
+    54, 54, 54, 57, 57, 57, 60, 60, 60,
+    54, 54, 54, 57, 57, 57, 60, 60, 60,
+    54, 54, 54, 57, 57, 57, 60, 60, 60
+};
+
+const unsigned char box_start_by_boxindex[9] = {
+    0, 3, 6, 27, 30, 33, 54, 57, 60
+};
+
+const unsigned char box_offset[9] = {
+    0, 1, 2, 9, 10, 11, 18, 19, 20
+};
+
+const align64_empty c3;
+// this table provides the bit masks corresponding to each section index and each Kind of section.
+const unsigned long long small_index_lut[9][3][2] = {
+{{              0x1ff,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }},
+{{            0x3fe00,        0x0 }, {   0x80402010080402,      0x201 }, {           0xe07038,        0x0 }},
+{{          0x7fc0000,        0x0 }, {  0x100804020100804,      0x402 }, {          0x70381c0,        0x0 }},
+{{        0xff8000000,        0x0 }, {  0x201008040201008,      0x804 }, {     0xe07038000000,        0x0 }},
+{{     0x1ff000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }},
+{{   0x3fe00000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {   0x381c0e00000000,        0x0 }},
+{{ 0x7fc0000000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, { 0x81c0000000000000,      0x703 }},
+{{ 0x8000000000000000,       0xff }, { 0x2010080402010080,     0x8040 }, {  0xe00000000000000,     0x381c }},
+{{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }},
+};
+
+const align64_empty c4;
 // lookup tables that may or may not speed things up by avoiding division
+// heavily used
 const unsigned char index_by_kind[3][81] = {
 {    0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -208,46 +273,28 @@ const unsigned char index_by_kind[3][81] = {
     6, 6, 6, 7, 7, 7, 8, 8, 8
 } };
 
+const align64_empty c5;
+const bit128_t box_bitmasks[9] = {
+    ((bit128_t*)small_index_lut[0][Box])->u128,
+    ((bit128_t*)small_index_lut[1][Box])->u128,
+    ((bit128_t*)small_index_lut[2][Box])->u128,
+    ((bit128_t*)small_index_lut[3][Box])->u128,
+    ((bit128_t*)small_index_lut[4][Box])->u128,
+    ((bit128_t*)small_index_lut[5][Box])->u128,
+    ((bit128_t*)small_index_lut[6][Box])->u128,
+    ((bit128_t*)small_index_lut[7][Box])->u128,
+    ((bit128_t*)small_index_lut[8][Box])->u128
+};
+
 const unsigned char *row_index = index_by_kind[Row];
 const unsigned char *column_index = index_by_kind[Col];
 const unsigned char *box_index = index_by_kind[Box];
 
-const unsigned char box_start[81] = {
-    0, 0, 0, 3, 3, 3, 6, 6, 6,
-    0, 0, 0, 3, 3, 3, 6, 6, 6,
-    0, 0, 0, 3, 3, 3, 6, 6, 6,
-    27, 27, 27, 30, 30, 30, 33, 33, 33,
-    27, 27, 27, 30, 30, 30, 33, 33, 33,
-    27, 27, 27, 30, 30, 30, 33, 33, 33,
-    54, 54, 54, 57, 57, 57, 60, 60, 60,
-    54, 54, 54, 57, 57, 57, 60, 60, 60,
-    54, 54, 54, 57, 57, 57, 60, 60, 60
-};
-
-const unsigned char box_start_by_boxindex[9] = {
-    0, 3, 6, 27, 30, 33, 54, 57, 60
-};
-
-const unsigned char box_offset[9] = {
-    0, 1, 2, 9, 10, 11, 18, 19, 20
-};
-
-// this table provides the bit masks corresponding to each section index and each Kind of section.
-// The 4th column contains all Kind's or'ed together. 
-const unsigned long long small_index_lut[9][3][2] = {
-{{              0x1ff,        0x0 }, { 0x8040201008040201u,     0x100 }, {           0x1c0e07,        0x0 }},
-{{            0x3fe00,        0x0 }, {   0x80402010080402,      0x201 }, {           0xe07038,        0x0 }},
-{{          0x7fc0000,        0x0 }, {  0x100804020100804,      0x402 }, {          0x70381c0,        0x0 }},
-{{        0xff8000000,        0x0 }, {  0x201008040201008,      0x804 }, {     0xe07038000000,        0x0 }},
-{{     0x1ff000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }},
-{{   0x3fe00000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {   0x381c0e00000000,        0x0 }},
-{{ 0x7fc0000000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, { 0x81c0000000000000u,     0x703 }},
-{{ 0x8000000000000000u,      0xff }, { 0x2010080402010080,     0x8040 }, {  0xe00000000000000,     0x381c }},
-{{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }},
-};
-
+const align64_empty c8;
 // this table provides the bit masks corresponding to each index and each Kind of section.
 // The 4th column contains all Kind's or'ed together. 
+// Heavily used
+// 
 const unsigned long long big_index_lut[81][4][2] = {
 {{              0x1ff,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x80402010081c0fff,      0x100 }},
 {{              0x1ff,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x804020101c0fff,      0x201 }},
@@ -332,31 +379,26 @@ const unsigned long long big_index_lut[81][4][2] = {
 {{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7020100804020100,    0x1ffe0 }},
 };
 
-const bit128_t box_bitmasks[9] = {
-    ((bit128_t*)small_index_lut[0][Box])->u128,
-    ((bit128_t*)small_index_lut[1][Box])->u128,
-    ((bit128_t*)small_index_lut[2][Box])->u128,
-    ((bit128_t*)small_index_lut[3][Box])->u128,
-    ((bit128_t*)small_index_lut[4][Box])->u128,
-    ((bit128_t*)small_index_lut[5][Box])->u128,
-    ((bit128_t*)small_index_lut[6][Box])->u128,
-    ((bit128_t*)small_index_lut[7][Box])->u128,
-    ((bit128_t*)small_index_lut[8][Box])->u128
-};
-unsigned char fit_delta = 2;
+align64_empty c9;
+
+bool bmi2_support = false;
+
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
 int verify          = 0; // verify solution correctness (implied otherwise)
 int unique_check    = 0; // check solution uniqueness
 int debug           = 0; // provide step by step output on the solution
 int thorough_check  = 0; // check for back tracking even if no guess was made.
+int numthreads      = 0; // if not 0, number of threads
+
+signed char *output;
 
 std::atomic<long> solved_count(0);          // puzzles solved
-std::atomic<long> unsolved_count = 0;       // puzzles unsolved (no solution exists)
-std::atomic<long> non_unique_count = 0;     // puzzles not unique (with -u)
-std::atomic<long> not_verified_count = 0;   // puzzles non verified (with -v)
-std::atomic<long> verified_count = 0;       // puzzles successfully verified (with -v)
-std::atomic<long> bug_count = 0;            // universal grave detected
+std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exists)
+std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
+std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
+std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
+std::atomic<long> bug_count(0);             // universal grave detected
 std::atomic<long long> guesses(0);          // how many guesses did it take
 std::atomic<long long> trackbacks(0);       // how often did we back track
 std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
@@ -365,11 +407,10 @@ std::atomic<long long> naked_sets_searched(0); // how many naked sets did we sea
 std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
 std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
 
-signed char *output;
-
-inline __m128i expand_bitvector128(unsigned char m) {
-    const __m128i bit_mask = _mm_setr_epi16(1<<0, 1<<1, 1<<2, 1<<3, 1<<4, 1<<5, 1<<6, 1<<7);
-    return _mm_cmpeq_epi16(_mm_and_si128( bit_mask, _mm_set1_epi16(m)), bit_mask);
+inline unsigned char tzcnt_and_mask(unsigned long long &mask) {
+    unsigned char ret = _tzcnt_u64(mask);
+    mask = _blsr_u64(mask);
+    return ret;
 }
 
 inline __m256i expand_bitvector(unsigned short m) {
@@ -404,13 +445,9 @@ inline __attribute__((always_inline)) unsigned int compress_epi16_boolean(__m256
 template<bool doubledbits=false>
 inline __attribute__((always_inline)) unsigned long long compress_epi16_boolean(__m256i b1, __m256i b2) {
     if (doubledbits) {
-        return (unsigned long long)_mm256_movemask_epi8(b2) | _mm256_movemask_epi8(b1);
+        return (((unsigned long long)_mm256_movemask_epi8(b2))<<32) | _mm256_movemask_epi8(b1);
     }
-    if ( bmi2_support ) {
-        return _pext_u64((unsigned long long)_mm256_movemask_epi8(b2) | _mm256_movemask_epi8(b1),0x5555555555555555ull);
-    } else {
-        return _mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(b1,b2), 0xD8));
-    }
+    return _mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(b1,b2), 0xD8));
 }
 
 inline __attribute__((always_inline))__m256i and_unless(__m256i a, __m256i b, __m256i bcond) {
@@ -424,13 +461,11 @@ inline __attribute__((always_inline))__m256i and_unless(__m256i a, unsigned shor
 // combine an epi16 boolean mask and a 16-bit mask to a 16/32-bit mask.
 // Two pathways:
 // 1. compress the wide boolean, then combine. (BMI2 instructions required)
-//    Complication: the ep16 op boolean gives two bits for each element.
+//    Complication: the epi16 op boolean gives two bits for each element.
 //    compress the wide boolean to 2 or 1 bits as desired
 //    and with the bitvector modified to doubled bits if desired
 //    using template parameter doubledbits.
 //    Performance: pdep/pext are expensive on AMD Zen2, but good when available elsewhere.
-//    If you want to run this on a AMD Zen2 computer, define NO_ZEN2_BMI2 to prevent
-//    use of the offending pext/pdep instructions, or just don't compile for BMI2.
 // 2. expand the compressed boolean, and then compress again to 1 or 2 bits
 //    using template parameter doubledbits.
 //    (the old way, pure AVX/AVX2)
@@ -452,29 +487,9 @@ inline __attribute__((always_inline)) unsigned int and_compress_masks(__m256i a,
     }
 }
 
-// combine an epi16 boolean mask of 128 bits and a 8-bit mask to an 8/16-bit mask.
-// Same considerations as above apply.
-// 
-
-template<bool doubledbits=false>
-inline __attribute__((always_inline)) unsigned short and_compress_masks128(__m128i a, unsigned short b) {
-    if ( bmi2_support ) {
-// path 1:
-        unsigned int res = compress_epi16_boolean128<doubledbits>(a);
-        if (doubledbits) {
-            return res & _pdep_u32(b, 0x5555);
-        } else {
-            return res & b;
-        }
-    } else {
-// path 2:
-        return compress_epi16_boolean128<doubledbits>(_mm_and_si128(a, expand_bitvector128(b)));
-    }
-}
-
-// for the 9 aligned cells of a box as a vector (given by the index of the box),
-// return the corresponding masking bits from indices (i.e. unlocked)
-inline unsigned int get_box_unlocked_mask(unsigned long long indices[2], int boxi) {
+// for the 9 cells of a box (given by the index of the box),
+// return the corresponding masking bits as a contiguous bit vector
+inline unsigned int get_contiguous_masked_indices_for_box(unsigned long long indices[2], int boxi) {
 
     // step 1, and-combine the indices with const bitmask for the box
     bit128_t ret = { .u64 = { box_bitmasks[boxi].u64[0] & indices[0], box_bitmasks[boxi].u64[1] & indices[1] } };
@@ -512,7 +527,7 @@ inline void add_and_mask_all_indices(bit128_t *indices, bit128_t *mask, unsigned
 }
 
 template<Kind kind>
-inline void and_indices(bit128_t *indices, unsigned char i) {
+inline void add_indices(bit128_t *indices, unsigned char i) {
 	indices->u128 |= *(const __uint128_t *)&big_index_lut[i][kind][0];
 }
 #pragma GCC diagnostic pop
@@ -535,26 +550,54 @@ inline void format_candidate_set(char *ret, unsigned short digits) {
                                     buff[5], buff[6], buff[7], buff[8], buff[9]);
 }
 
+// a helper function to print a grid, not used in production code.
+inline void grid_dump(unsigned short *candidates, FILE *stream) {
+    for ( int i_=0; i_<81; i_++ ) {
+        char ret[32];
+        format_candidate_set(ret, candidates[i_]);
+        fprintf(stream, "%8s,", ret);
+        if ( i_%9 == 8 ) {
+            printf("\n");
+        }
+    }
+}
+inline void grid_dump(unsigned short *candidates) {
+    grid_dump(candidates, stdout);
+}
+
+// The maximum levels of guesses is given by GRIDSTATE_MAX.
+// On average, the number of levels is pretty low, but we want to be 'reasonably' sure
+// that we don't bust the envelope.
+// The other 'property' of the GRIDSTATE_MAX constant is to keep the L2 cache happy.
+// 28 is a good choice either way.
+// 
 #define	GRIDSTATE_MAX 28
 
-class __attribute__ ((aligned(32))) GridState
+// GridState encapsulates the current state of the solver, specifically for the
+// purpose of guessing and back tracking.
+//
+// An array of size GRIDSTATE_MAX is used and stackpointer is incremented when a
+// guess is made and decremented when back tracking.
+//
+// To match cache line boundaries, align on 64 bytes.
+//
+class __attribute__ ((aligned(64))) GridState
 {
 public:
-    bit128_t unlocked;           // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
-    bit128_t updated;            // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
-    unsigned short candidates[81];        // which digits can go in this cell? Set bits correspond to possible digits
-    bit128_t set23_found[3];     // for keeping track of found sets of size 2 and 3
-    short stackpointer;                   // this-1 == last grid state before a guess was made, used for backtracking
-// An array GridState[n] can use stackpointer to increment until it reaches n.
-// Similary, for back tracking, the relative GridState-1 is considered the ancestor
-// until stackpointer is 0.
-//
+    unsigned short candidates[81];    // which digits can go in this cell? Set bits correspond to possible digits
+    short stackpointer;               // this-1 == last grid state before a guess was made, used for backtracking
+    bit96_t updated;                  // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
+    bit128_t unlocked;                // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
+    bit128_t set23_found[3];          // for keeping track of found sets of size 2 and 3
+
 // GridState is normally copied for recursion
 // Here we initialize the starting state including the puzzle.
 //
 inline void initialize(signed char grid[81]) {
     // 0x1ffffffffffffffffffffULLL is (0x1ULL << 81) - 1
-    updated.u128 = unlocked.u128 = (((__uint128_t)1)<<81)-1;
+    unlocked.u128 = (((__uint128_t)1)<<81)-1;
+    updated.u64[0] = ~(unsigned long long)0;
+    updated.u32[2] = 0x1ffff;
 
     set23_found[0] = set23_found[1] = set23_found[2] = {__int128 {0}};
 
@@ -572,9 +615,10 @@ inline void initialize(signed char grid[81]) {
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
-                unlocked.u64[0] &= ~(1ULL << i);
+                _bittestandreset64((long long int *)unlocked.u64, i);
             }
         }
+
         for (unsigned char i = 64; i < 81; ++i) {
             digit = grid[i] - 49;
             if (digit >= 0) {
@@ -582,7 +626,7 @@ inline void initialize(signed char grid[81]) {
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
-                unlocked.u64[1] &= ~(1ULL << (i-64));
+                _bittestandreset64((long long int *)&unlocked.u64[1], i-64);
             }
         }
 
@@ -591,11 +635,14 @@ inline void initialize(signed char grid[81]) {
             candidates[i] = 0x01ff ^ (rows[row_index[i]] | columns[column_index[i]] | boxes[box_index[i]]);         
         } else {
             candidates[i] = 1 << (grid[i]-49);
-
         }
     }
 }
 
+// Normally digits are entered by a 'goto enter;'.
+// enter_digit is not used in that case.
+// Only make_guess uses this member function.
+protected:
 template<bool verbose=false>
 inline __attribute__((always_inline)) void enter_digit( unsigned short digit, unsigned char i) {
     // lock this cell and and remove this digit from the candidates in this row, column and box
@@ -603,7 +650,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
     bit128_t to_update = {0};
 
     if ( verbose && debug ) {
-        printf(" %x found at [%d,%d]\n", _tzcnt_u32(digit)+1, i/9, i%9);
+        printf(" %x at [%d,%d]\n", _tzcnt_u32(digit)+1, i/9, i%9);
     }
 #ifndef NDEBUG
     if ( __popcnt16(digit) != 1 ) {
@@ -612,16 +659,17 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 #endif
 
     if (i < 64) {
-        unlocked.u64[0] &= ~(1ULL << i);
+        _bittestandreset64((long long int *)&unlocked.u64[0], i);
     } else {
-        unlocked.u64[1] &= ~(1ULL << (i-64));
+        _bittestandreset64((long long int *)&unlocked.u64[1], i-64);
     }
     
     candidates[i] = digit;
 
     add_and_mask_all_indices(&to_update, &unlocked, i);
 
-    updated.u128 |= to_update.u128;
+    updated.u64[0] |= to_update.u64[0];
+    updated.u32[2] |= to_update.u32[2];
     const __m256i mask = _mm256_set1_epi16(~digit);
     for (unsigned char j = 0; j < 80; j += 16) {
         unsigned short m = to_update.u16[j>>4];
@@ -637,7 +685,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
     }
 }
 
-
+public:
 template<bool verbose>
 GridState* make_guess() {
     // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
@@ -652,9 +700,8 @@ GridState* make_guess() {
     unsigned char best_cnt = 16;
     
     to_visit = unlocked.u64[0];
-    while (to_visit != 0 && best_cnt > 2) {
-		i_rel = _tzcnt_u64(to_visit);
-        to_visit &= ~(1ULL << i_rel);
+    while ( best_cnt > 2 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit);
         cnt = __popcnt16(candidates[i_rel]);
         if (cnt < best_cnt) {
             best_cnt = cnt;
@@ -663,18 +710,18 @@ GridState* make_guess() {
     }
 
     to_visit = unlocked.u64[1];
-    while (best_cnt > 2 && to_visit != 0 ) {
-		i_rel = _tzcnt_u32(to_visit);
-        to_visit &= ~(1UL << i_rel);
-        cnt = __popcnt16(candidates[i_rel + 64]);
+    while ( best_cnt > 2 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit) + 64;
+        cnt = __popcnt16(candidates[i_rel]);
         if (cnt < best_cnt) {
             best_cnt = cnt;
-            guess_index = i_rel + 64;
+            guess_index = i_rel;
         }
     }
     
-    // Find the first candidate in this cell
-	unsigned short digit = 1 << __bsrd(candidates[guess_index]);
+    // Find the first candidate in this cell (lsb set)
+    // Note: using tzcnt would be equally valid; this pick is historical
+    unsigned short digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
     
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
@@ -688,11 +735,8 @@ GridState* make_guess() {
     // Remove the guessed candidate from the old grid
     // when we get back here to the old grid, we know the guess was wrong
     candidates[guess_index] &= ~digit;
-    if (guess_index < 64) {
-        updated.u64[0] |= 1ULL << guess_index;
-    } else {
-        updated.u64[1] |= 1ULL << (guess_index-64);
-    }
+
+    updated.set_indexbit(guess_index);
 
     if ( verbose && (debug > 1) ) {
         char gridout[82];
@@ -725,78 +769,21 @@ GridState* make_guess() {
                 gridout[j] = 49+_tzcnt_u32(candidates[j]);
             }
         }
-    printf("grid_state at level >%d< now: %.81s\n",
+        printf("grid_state at level >%d< now: %.81s\n",
                new_grid_state->stackpointer, gridout);
-    }    
-    return new_grid_state;
-}
-
-template<bool verbose>
-GridState* make_guess(unsigned short digit, unsigned char guess_index) {
-    // This is for an educated guess only.
-
-    GridState* new_grid_state = this+1;
-
-    if ( verbose && (debug > 1) ) {
-        char gridout[82];
-        for (unsigned char j = 0; j < 81; ++j) {
-            if ( (candidates[j] & (candidates[j]-1)) ) {
-                gridout[j] = '0';
-            } else {
-                gridout[j] = 49+__bsrd(candidates[j]);
-            }
-        }
-        printf("educated guess at [%d,%d]\nsaved grid_state level >%d<: %.81s\n",
-               guess_index/9, guess_index%9, stackpointer, gridout);
     }
-    
-    memcpy(new_grid_state, this, sizeof(GridState));
-    new_grid_state->stackpointer++;
-
-    // Remove the guessed candidate from the old grid
-    // when we get back here to the old grid, we know the guess was wrong
-    candidates[guess_index] &= ~digit;
-    if (guess_index < 64) {
-        updated.u64[0] |= 1ULL << guess_index;
-    } else {
-        updated.u64[1] |= 1ULL << (guess_index-64);
-    }
-
-    // Update candidates
-    if ( verbose && debug ) {
-        printf("educated guess at level >%d< - new level >%d<\nguess", stackpointer, new_grid_state->stackpointer);
-    }
-    
-    new_grid_state->enter_digit<verbose>( digit, guess_index);
-    guesses++;
-
-    if ( verbose && (debug > 1) ) {
-        unsigned short *candidates = new_grid_state->candidates;
-        char gridout[82];
-        for (unsigned char j = 0; j < 81; ++j) {
-            if ( (candidates[j] & (candidates[j]-1)) ) {
-                gridout[j] = '0';
-            } else {
-                gridout[j] = 49+__bsrd(candidates[j]);
-            }
-        }
-    printf("grid_state at level >%d< now: %s\n",
-               new_grid_state->stackpointer, gridout);
-    }    
     return new_grid_state;
 }
 
 template<Kind kind>
-inline unsigned char get_ul_set_search( bool &fitm1, unsigned char cnt, unsigned char si) {
-    unsigned char ret = (kind == Row) ? 9-get_section_index_cnt<kind>(set23_found[Row].u64, si) : get_section_index_cnt<kind>(unlocked.u64, si);
-    fitm1 = cnt < ret;
-    return ret;
+inline unsigned char get_ul_set_search( unsigned char si) {
+    return 9-get_section_index_cnt<kind>(set23_found[kind].u64, si);
 }
 };
 
 // The pair of functions below can be used to iteratively isolate all distinct bit values
 // and determine whether popcnt(X) == N is true for the input vector elements using movemask
-// at each iteration of interest.
+// at each interation of interest.
 // For small N, this is faster than a full popcnt.
 //
 
@@ -818,22 +805,30 @@ template <bool verbose>
 bool solve(signed char grid[81], GridState stack[], int line) {
 
     GridState *grid_state = &stack[0];
+    unsigned long long *unlocked = grid_state->unlocked.u64;
+    unsigned short* candidates;
 
     int unique_check_mode = 0;
-    bool unique_check_reported = false;
+    bool nonunique_reported = false;
 
    unsigned long long my_digits_entered_and_retracted = 0;
    unsigned long long my_naked_sets_searched = 0;
    unsigned char no_guess_incr = 1;
 
     unsigned int my_past_naked_count = 0;
+ 
     if ( verbose && debug ) {
         printf("Line %d: %.81s\n", line, grid);
     }
 
+    // The 'API' for code that uses the 'goto enter:' method of entering digits
+    unsigned short e_digit = 0;
+    unsigned char e_i = 0;
+
+    bool check_back = thorough_check;
     goto start;
 
-    back:
+back:
 
     // Each algorithm (naked single, hidden single, naked set)
     // has its own non-solvability detecting trap door to detect the grid is bad.
@@ -854,6 +849,7 @@ bool solve(signed char grid[81], GridState stack[], int line) {
         // cleanup and return
         if ( verbose && reportstats ) {
             past_naked_count += my_past_naked_count;
+            naked_sets_searched += my_naked_sets_searched;
             digits_entered_and_retracted += my_digits_entered_and_retracted;
         }
         return true;
@@ -863,7 +859,7 @@ bool solve(signed char grid[81], GridState stack[], int line) {
     if ( verbose && reportstats ) {
         my_digits_entered_and_retracted += 
             (_popcnt64((grid_state-1)->unlocked.u64[0] & ~grid_state->unlocked.u64[0]))
-          + (_popcnt64((grid_state-1)->unlocked.u64[1] & ~grid_state->unlocked.u64[1]));
+          + (_popcnt32((grid_state-1)->unlocked.u64[1] & ~grid_state->unlocked.u64[1]));
     }
 
     // Go back to the state when the last guess was made
@@ -877,101 +873,196 @@ bool solve(signed char grid[81], GridState stack[], int line) {
 
 start:
 
-    bool check_back = grid_state->stackpointer || thorough_check || unique_check_mode;
+    e_digit = 0;
 
-    unsigned long long *unlocked = grid_state->unlocked.u64;
-    unsigned short* candidates = grid_state->candidates;
+    // at start, set everything that depends on grid_state:
+    check_back = grid_state->stackpointer || thorough_check || unique_check_mode;
 
-    // Find naked singles
-    {
-        bool found;
-        unsigned char found_idx = 0xff;
-        const __m256i ones = _mm256_set1_epi16(1);
-        do {
-            found = false;
-            for (unsigned char i = 0; i < 80; i += 16) {
-                unsigned short m = ((bit128_t*)unlocked)->u16[i>>4];
-                if ( m ) {
-                    __m256i c = _mm256_load_si256((__m256i*) &candidates[i]);
-                    // Check if any cell has zero candidates
-                    if (check_back && _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()))) {
-                        // Back track, no solutions along this path
-                        if ( verbose ) {
-                            unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
-                            unsigned char pos = i+(_tzcnt_u32(mx)>>1);
-                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
-                            } else if ( debug ) {
-                                printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
-                            }
-                        }
-                        goto back;
-                    } else {
-                        // remove least significant digit and compare to 0:
-                        // (c = c & (c-1)) == 0  => naked single
-                        __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
-                        unsigned int mask = and_compress_masks<true>(a,m);
-                        while (mask) {     // note that the mask has two bits set for each detected single
-                            int idx3 = _tzcnt_u32(mask);
-                            int idx = (idx3>>1) + i;
-                            mask &= ~(3<<idx3);
-                            // the candidate could have disappeared due to the last enter_digit
-                            // in this loop.
-                            if ( check_back && candidates[idx] == 0 ) {
-                                if ( verbose && debug ) {
-                                    printf("back track - cell [%d,%d] is 0\n", idx/9, idx%9);
-                                }
-                                goto back;
-                            }
-                            if ( verbose && debug ) {
-                                printf("naked  single");
-                            }
-                            grid_state->enter_digit<verbose>( candidates[idx], idx);
-                            found = true;
-                            found_idx = i;
-                        }
-                        if (  found == false && found_idx == i ) {
-                            break;
-                        }
+    unlocked   = grid_state->unlocked.u64;
+    candidates = grid_state->candidates;
+
+    const __m256i ones = _mm256_set1_epi16(1);
+
+// algorithm 0:
+// Enter a digit into the solution by setting it as the value of cell and by
+// removing the cell from the set of unlocked cells.  Update all affected cells
+// by removing any now impossible candidates.
+// 
+// algorithm 1:
+// for each cell check whether it has a single candidate: enter that candidate as
+// the solution.
+// for each cell check whether a cell has no candidates: back track.
+//
+// Below, two cases are implemented: a) cover algorithm 0 _and_ 1, or b) algorithm 1 alone.
+//
+enter:
+
+    if ( e_digit ) {
+        // inlined flavor of enter_digit
+        //
+        // lock this cell and and remove this digit from the candidates in this row, column and box
+        // and for good measure, detect 0s (back track) and singles.
+        bit128_t to_update = {0};
+
+        if ( verbose && debug ) {
+            printf(" %x at [%d,%d]\n", _tzcnt_u32(e_digit)+1, e_i/9, e_i%9);
+        }
+#ifndef NDEBUG
+        if ( __popcnt16(e_digit) != 1 ) {
+            printf("error in e_digit: %x\n", e_digit);
+        }
+#endif
+
+        if (e_i < 64) {
+            _bittestandreset64((long long int *)&unlocked[0], e_i);
+        } else {
+            _bittestandreset64((long long int *)&unlocked[1], e_i-64);
+        }
+    
+        candidates[e_i] = e_digit;
+
+        add_and_mask_all_indices(&to_update, &grid_state->unlocked, e_i);
+
+        grid_state->updated.u64[0] |= to_update.u64[0];
+        grid_state->updated.u32[2] |= to_update.u32[2];
+
+        const __m256i mask = _mm256_set1_epi16(~e_digit);
+
+        unsigned short dtct_j = 0;
+        unsigned int dtct_m = 0;
+        for (unsigned char j = 0; j < 80; j += 16) {
+            __m256i c = _mm256_load_si256((__m256i*) &candidates[j]);
+            // this if is only taken very occasionally, branch prediction
+            if (__builtin_expect (check_back && _mm256_movemask_epi8(
+                                  _mm256_cmpeq_epi16(c, _mm256_setzero_si256())
+                                  ), 0)) {
+                // Back track, no solutions along this path
+                if ( verbose ) {
+                    unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
+                    unsigned char pos = j+(_tzcnt_u32(mx)>>1);
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                    } else if ( debug ) {
+                        printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
                     }
                 }
+                e_digit=0;
+                goto back;
             }
-            if (unlocked[1] & (1ULL << (80-64))) {
-                if (candidates[80] == 0) {
-                    // no solutions go back
+
+            // expand locked unsigned short to boolean vector
+            __m256i mlocked = expand_bitvector(~to_update.u16[j>>4]);
+            // apply mask (remove bit), preserving the locked cells     
+            c = and_unless(c, mask, mlocked);
+            __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
+            unsigned int mask = and_compress_masks<true>(a, grid_state->unlocked.u16[j>>4]);
+            if ( mask ) {
+                dtct_m = mask;
+                dtct_j = j;
+            }
+            _mm256_store_si256((__m256i*) &candidates[j], c);
+        }
+        if (unlocked[1] & (1ULL << (80-64))) {
+            if ((to_update.u16[5] & 1) != 0) {
+                candidates[80] &= ~e_digit;
+            }
+        }
+        if ( dtct_m ) {
+            int idx = _tzcnt_u32(dtct_m)>>1;
+            e_i = idx+dtct_j;
+            e_digit = candidates[e_i];
+            if ( e_digit ) {
+                if ( verbose && debug ) {
+                    printf("naked  single      ");
+                }
+                goto enter;
+            } else {
+                if ( verbose ) {
+                    unsigned char pos = e_i;
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                    } else if ( debug ) {
+                        printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
+                    }
+                }
+                goto back;
+            }
+        }
+        e_digit = 0;
+    } else {
+        // no digit to enter
+        for (unsigned char i = 0; i < 80; i += 16) {
+            unsigned short m = ((bit128_t*)unlocked)->u16[i>>4];
+            if ( m ) {
+                __m256i c = _mm256_load_si256((__m256i*) &candidates[i]);
+                // Check if any cell has zero candidates
+                if (__builtin_expect (check_back && _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256())),0)) {
+                    // Back track, no solutions along this path
                     if ( verbose ) {
+                        unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
+                        unsigned char pos = i+(_tzcnt_u32(mx)>>1);
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: cell[8,8] is 0\n", line);
-                        } else {
-                            if ( debug ) {
-                                printf("back track - cell [8,8] is 0\n");
-                            }
+                            printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                        } else if ( debug ) {
+                            printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
                         }
                     }
                     goto back;
-                } else if (__popcnt16(candidates[80]) == 1) {
-                    // Enter the digit and update candidates
-                    if ( verbose && debug ) {
-                        printf("naked  single");
+                } else {
+                    // remove least significant digit and compare to 0:
+                    // (c & (c-1)) == 0  => naked single
+                    __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
+                    unsigned int mask = and_compress_masks<true>(a,m);
+                    if ( mask ) {
+                        int idx = _tzcnt_u32(mask)>>1;
+                        e_i = idx+i;
+                        e_digit = candidates[e_i];
+                        if ( verbose && debug ) {
+                            printf("naked  single      ");
+                        }
+                        goto enter;
                     }
-                    grid_state->enter_digit<verbose>( candidates[80], 80);
-                    found = true;
-                    found_idx=72;		// run a full loop next.
                 }
             }
-        } while (found);
+        }
     }
-    
+    if (unlocked[1] & (1ULL << (80-64))) {
+        if (__builtin_expect (candidates[80] == 0,0) ) {
+            // no solutions go back
+            if ( verbose ) {
+                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                    printf("Line %d: cell[8,8] is 0\n", line);
+                } else {
+                    if ( debug ) {
+                        printf("back track - cell [8,8] is 0\n");
+                    }
+                }
+            }
+            goto back;
+        } else if (__popcnt16(candidates[80]) == 1) {
+            // Enter the digit and update candidates
+            if ( verbose && debug ) {
+                printf("naked  single      ");
+            }
+            e_i = 80;
+            e_digit = candidates[80];
+            goto enter;
+        }
+    }
+    // The solving algorithm ends when there are no remaining unlocked cell.
+    // The finishing tasks include verifying the solution and/or confirming
+    // its uniqueness, if requested.
+    //
     // Check if it's solved, if it ever gets solved it will be solved after looking for naked singles
     if ( *(__uint128_t*)unlocked == 0) {
         // Solved it
         if ( unique_check == 1 && unique_check_mode == 1 ) {
-            if ( !unique_check_reported ) {
+            if ( !nonunique_reported ) {
                 if ( verbose && reportstats ) {
                     printf("Line %d: solution to puzzle is not unique\n", line);
                 }
                 non_unique_count++;
-                unique_check_reported = true;
+                nonunique_reported = true;
             }
         }
         if ( verify ) {
@@ -981,9 +1072,10 @@ start:
 
             const __m256i mask9 { -1LL, -1LL, 0xffffLL, 0 };
             const __m256i ones = _mm256_and_si256(_mm256_set1_epi16(1), mask9);
-            __m256i rowx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
-            __m256i colx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
-            __m256i boxx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
+            __m256i rowx;
+            __m256i colx;
+            __m256i boxx;
+            boxx = colx = rowx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
             __m256i uniq = _mm256_setzero_si256();
 
             for (unsigned char i = 0; i < 9; i++) {
@@ -993,7 +1085,7 @@ start:
                 rowx = _mm256_xor_si256(rowx,row);
 
                 // load element i of 9 columns
-                __m256i col = _mm256_and_si256(_mm256_loadu_si256((__m256i_u*) &candidates[i*9]),mask9);
+                __m256i col = _mm256_and_si256(*(__m256i_u*) &candidates[i*9], mask9);
                 colx = _mm256_xor_si256(colx,col);
 
                 uniq = _mm256_or_si256(_mm256_and_si256(col, _mm256_sub_epi16(col, ones)),uniq);
@@ -1066,7 +1158,22 @@ start:
 
     my_past_naked_count++;
 
-    // Find hidden singles
+    // Algorithm 2 - Find hidden singles
+    // For all sections (ie. rows/columns/boxes):
+    //   for each cell C in the given section
+    //      'or' all the other cells of the section
+    //          check whether C contains a candidate that does not occur in the other cells
+    // Back track checking:
+    //    1. If the found cell C contains more than one candidate that does not
+    //       appear in the other cells: back track
+    //    2. If the 'or' of all the cells does not contain all digits: back track
+    //
+    // columns are or'ed together, leaving out the current row, and hidden column singles are
+    // isolated for that row. For efficiency, precompute and save the or'ed rows (tails) and
+    // preserve the last leading set of rows (the head).
+    // To check for an invalid state of the puzzle:
+    // - check the columns or'ed value to be 0x1ff.
+    // - same for the rows and box
     //
     // Combine 8 cells from rows and 8 cells from boxes into one __m256i vector.
     // Rotate and or until each vector element represents 7 cells or'ed (except the cell 
@@ -1075,12 +1182,7 @@ start:
     // to isolate the hidden singles.
     // For the nineth cell, rotate and or one last time and use just one element of the result
     // to check the nineth cell for a hidden single.
-    // columns are or'ed together, leaving out the current row, and hidden column singles are
-    // isolated for that row. For efficiency, precompute and save the or'ed rows (tails) and
-    // preserve the last leading set of rows (the head).
-    // To check for an invalid state of the puzzle:
-    // - check the columns or'ed value to be 0x1ff.
-    // - same for the rows and box
+    //
     // The column singles and the row singles are first or'ed and checked to be singles.
     // Otherwise if the row and column checks disagree on a cell the last guess was wrong.
     // If everything is in order, compare the singles (if any) against the current row.
@@ -1088,11 +1190,10 @@ start:
     // isolate it, rince and repeat.
     //
     {
-        const __m256i ones = _mm256_set1_epi16(1);
         const __m256i mask9 { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ffLL, 0 };
         const __m256i mask1ff { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL };
 
-        __m256i column_or_tails[8];
+        __m256i column_or_tails[9];
         __m256i column_or_head = _mm256_setzero_si256();
         unsigned char irow = 0;
         for (unsigned char i = 0; i < 81; i += 9, irow++) {
@@ -1105,7 +1206,7 @@ start:
                     // working backwords
                     for (signed char j = 81-9; j > 0; j -= 9) {
                         column_or_tails[j/9-1] = column_mask;
-                        column_mask = _mm256_or_si256(column_mask, _mm256_loadu_si256((__m256i_u*) &candidates[j]));
+                        column_mask = _mm256_or_si256(column_mask, *(__m256i_u*) &candidates[j]);
                     }
                     // or in row 0 and check whether all digits or covered
                     if ( check_back && !_mm256_testz_si256(mask9,_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9)) ) {
@@ -1121,9 +1222,49 @@ start:
                         }
                         goto back;
                     }
-                } else {
+                    {
+                        // breaking out the column hidden singles this way will win some performance
+                        __m256i column_or_head_ = _mm256_setzero_si256();
+                        unsigned int jrow = 0;
+                        __m256i column_mask_ = column_mask;
+                        for (unsigned int j = 0; j < 81; j+=9, jrow++) {
+                            // turn the or'ed rows into a mask for the singletons, if any.
+                            __m256i column_mask_neg = _mm256_andnot_si256(column_mask_, mask9);
+                            // check col (9) candidates
+                            unsigned short m = (j < 64) ? (unlocked[0] >> j) : (unlocked[1] >> (j-64));
+                            if ( j > 64-9) {
+                                m |= unlocked[1] << (64-j);
+                            }
+                            __m256i a = _mm256_cmpgt_epi16(column_mask_neg, _mm256_setzero_si256());
+                            unsigned int mask = and_compress_masks<true>(a, m & 0x1ff);
+                            if (mask) {
+                                int idx = __tzcnt_u32(mask)>>1;
+                                e_i = j+idx;
+                                e_digit = ((v16us)column_mask_neg)[idx];
+                                if ( e_digit & (e_digit-1) ) {
+                                    if ( verbose ) {
+                                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                            printf("Line %d: stack 0, back track - col cell [%d,%d] does contain multiple hidden singles\n", line, e_i/9, e_i%9);
+                                        } else if ( debug ) {
+                                            printf("back track - multiple hidden singles in col cell [%d,%d]\n", e_i/9, e_i%9);
+                                        }
+                                    }
+                                    e_i = 0;
+                                    goto back;
+                                }
+                                if ( verbose && debug ) {
+                                    printf("hidden single (col)");
+                                }
+                                goto enter;
+                            }
+                            // leverage previously computed or'ed rows in head and tails.
+                            column_or_head_ = column_mask_ = _mm256_or_si256(*(__m256i_u*) &candidates[j], column_or_head_);
+                            column_mask_ = _mm256_or_si256(column_or_tails[jrow],column_mask_);
+                        }
+                    }
+                } else {  // i > 0
                     // leverage previously computed or'ed rows in head and tails.
-                    column_or_head = column_mask = _mm256_or_si256(_mm256_loadu_si256((__m256i_u*) &candidates[i-9]), column_or_head);
+                    column_or_head = column_mask = _mm256_or_si256(*(__m256i_u*) &candidates[i-9], column_or_head);
                     column_mask = _mm256_or_si256(column_or_tails[irow-1],column_mask);
                 }
                 // turn the or'ed rows into a mask for the singletons, if any.
@@ -1223,21 +1364,18 @@ start:
                 }
 
                 // check row/col (9) candidates
-                unsigned short m = (i < 64) ? (unlocked[0] >> i) : (unlocked[1] >> (i-64));
-                if ( i > 64-9) {
-                    m |= unlocked[1] << (64-i);
-                }
-                __m256i a = _mm256_cmpgt_epi16(_mm256_and_si256(*(__m256i_u*)&candidates[i], or_mask), _mm256_setzero_si256());
+                unsigned short m = grid_state->unlocked.get_indexbits(i, 9);
+                __m256i a = _mm256_cmpgt_epi16(or_mask, _mm256_setzero_si256());
                 unsigned int mask = and_compress_masks<true>(a, m & 0x1ff);
                 while (mask) {
-
                     int idx = __tzcnt_u32(mask)>>1;
                     if ( verbose && debug ) {
                         bool is_col = ((v16us)column_mask)[idx] == ((v16us)or_mask)[idx];
                         printf("hidden single (%s)", is_col?"col":"row");
                     }
-                    grid_state->enter_digit<verbose>( ((v16us)or_mask)[idx], i+idx);
-                    goto start;
+                    e_i = i+idx;
+                    e_digit = ((v16us)or_mask)[idx];
+                    goto enter;
                 }
             } // rowbox block
             { // box
@@ -1245,7 +1383,7 @@ start:
                 // now look at the box.
                 // First the (8) candidates, in the high half of rowbox_mask.
                 __m256i a = _mm256_cmpgt_epi16(rowbox_mask, _mm256_setzero_si256());
-                unsigned int mask = and_compress_masks<true>(a, (get_box_unlocked_mask(unlocked,irow)&0xff)<<8);
+                unsigned int mask = and_compress_masks<true>(a, (get_contiguous_masked_indices_for_box(unlocked,irow)&0xff)<<8);
                 while (mask) {
                     int s_idx = __tzcnt_u32(mask)>>1;
                     int c_idx = b + box_offset[s_idx&7];
@@ -1253,8 +1391,9 @@ start:
                     if ( verbose && debug ) {
                         printf("hidden single (box)");
                     }
-                    grid_state->enter_digit<verbose>( digit, c_idx);
-                    goto start;
+                    e_i = c_idx;
+                    e_digit = digit;
+                    goto enter;
                 }
             } // box block
 
@@ -1280,56 +1419,75 @@ start:
                     if ( verbose && debug ) {
                         printf("hidden single (box)");
                     }
-                    grid_state->enter_digit<verbose>( cand9_box, idx);
-                    goto start;
+                    e_i = idx;
+                    e_digit = cand9_box;
+                    goto enter;
                 } // cand9
             }
         }   // for
-    }   // box
+    }
 
+// Algorithm 3 - Find naked sets
+// For each possible combination of candidates of size K, check for every section
+// whether there are exactly K cells that contain only this combination of candidates.
+// Back track when the number of found cells exceeds K.
+//
+// Implementation:
+// As an approximation, start with any cell and use its candidates as the starting
+// set.  Avoid useless and repeat searches using a variety of heuristics.
+//
 // Find naked sets, up to MAX_SET
 
 #define MAX_SET 5
 // Some general thoughts on the algorithm below.
 //
 // What does this search achieve:
-// for a row with N unlocked cells each naked set of K corresponds to a hidden set of N-K.
+// for a section with N unlocked cells each naked set of K corresponds to a hidden set of N-K.
 // Going up to size 5 allows to get at the very least all hidden sets of 4, and most likely
-// (with N<9) all hidden sets of 3.  There is a small gap concerning hidden pairs (fairly
-// common), which will then be detected only with N<7. On the other hand, since this
-// algorithm is hit repeatedly, they will eventually resolve too.
+// (with N<9) all hidden sets of 3.
+// Note that not all sets are detected, mainly because:
+// - the cells to examine are selected based on prior updates
+// - sets can exist whithout any of their cells having all the candidate values.
+//   (shortcoming of the algorithm used)
+// Note that the debug output reports the naked set/pair, or if the naked set is > 3 and 
+// the complement has less than 3 member candidates, it is reported instead as a hidden set/pair. 
 //
-// The other thing that is achieved, and not to be neglected, is the ability to detect back
+// The other important accomplishment is the ability to detect back
 // track scenarios if the discovered set is impossibly large.  This is quite important
-// for performance as a last chance to kill of bad guesses.
+// for performance as a chance to kill off bad guesses.
 //
 // Note that this search has it's own built-in heuristic to tackle only recently updated cells.
 // The algorithm will keep that list to revisit later, which is fine of course.
-// The number of cells to visit is expectedly pretty high.
-//  We could try other tricks around this area of 'work avoidance'.
-//
+// The number of cells to visit can be high (e.g. in the beginning).
+// Additional tracking mechanisms are used to reduce the number of searches:
+// - previously found sets (and their complements) as well as found triads
+// - sets that occupy all available space (minus one) - impossible due to perfect single detection
+
     {
-        bool can_backtrack = (grid_state->stackpointer != 0);
-
         bool found = false;
-        // visit only the changed (updated) cells
-        
-        // for naked sets only. Can be set to true or false.
-        const bool doubledbits = false;
-        unsigned long long *to_visit_n = grid_state->updated.u64;
-        *(__uint128_t*)to_visit_n &= *(__uint128_t*)unlocked;
 
-        // A cheap way to avoid unnecessary naked set searches, at least for Rows
+        // visit only the changed (updated) cells
+
+        bit128_t to_visit_n;          // tracks all the cells to visit
+        bit128_t to_visit_again {};   // those cells that have been updated
+
+       to_visit_n.u64[0] = grid_state->updated.u64[0] & unlocked[0];
+       to_visit_n.u64[1] = grid_state->updated.u32[2] & unlocked[1];
+
+        // A cheap way to avoid unnecessary naked set searches
         grid_state->set23_found[Row].u64[0] |= ~unlocked[0];
-        grid_state->set23_found[Row].u64[1] |= ~unlocked[1];
+        grid_state->set23_found[Row].u64[1] |= ~unlocked[1] & 0x1ffff;
+        grid_state->set23_found[Col].u64[0] |= ~unlocked[0];
+        grid_state->set23_found[Col].u64[1] |= ~unlocked[1] & 0x1ffff;
+        grid_state->set23_found[Box].u64[0] |= ~unlocked[0];
+        grid_state->set23_found[Box].u64[1] |= ~unlocked[1] & 0x1ffff;
+
         for (unsigned char n = 0; n < 2; ++n) {
-            unsigned long long tvnn = to_visit_n[n];
+            unsigned long long tvnn = to_visit_n.u64[n];
             while (tvnn) {
-                int i_rel = _tzcnt_u64(tvnn);
-                
-                tvnn ^= 1ULL << i_rel;
-                unsigned char i = (unsigned char) i_rel + 64*n;
-                
+                unsigned char i_rel = tzcnt_and_mask(tvnn);
+                unsigned char i = i_rel + (n<<6);
+
                 unsigned short cnt = __popcnt16(candidates[i]);
 
                 if (cnt <= MAX_SET && cnt > 1) {
@@ -1337,204 +1495,264 @@ start:
                     // {a,b},{a,c},{b,c} as all starting points are 2 bits only.
                     // same situation is possible for 4 set members.
                     //
-                    unsigned long long to_change[2] = {0};
+                    unsigned long long to_change[2] {};
 
-                    __m128i a_i = _mm_set1_epi16(candidates[i]);
-                    __m128i a_j;
+                    __m256i a_i = _mm256_set1_epi16(candidates[i]);
                     __m128i res;
                     unsigned char ul;
-                    bool fitm1;
                     unsigned char s;
 
                     // check row
                     // Same comments as above apply
                     //
-                  unsigned char ri = row_index[i];
-                  if ( !grid_state->set23_found[Row].il_check_indexbit<doubledbits>(ri, i%9))
-                  {
-                    ul = grid_state->get_ul_set_search<Row>(fitm1, cnt, ri);
-                    if (can_backtrack || (cnt <= ul-fit_delta) ) {
-                        my_naked_sets_searched++;
-                        a_j = _mm_loadu_si128((__m128i_u*) &candidates[9*ri]);
-                        res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
-                        unsigned long long m = compress_epi16_boolean128<doubledbits>(res);
-                        bool bit9 = candidates[i] == (candidates[i] | candidates[9*ri+8]);
-                        if ( bit9 ) {
-                            m |= doubledbits? 3<<16 : 1<<8;    // fake the 9th mask position
-                        }
-                        s = _popcnt32(m);
-                        if ( doubledbits ) {
-                            s >>= 1;
-                        }
-                        if (s > cnt) {
-                            if ( verbose ) {
-                                char ret[32];
-                                format_candidate_set(ret, candidates[i]);
-                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    printf("Line %d: naked  set (row) %s at [%d,%d], count exceeded\n", line, ret, ri, i%9);
-                                } else if ( debug ) {
-                                    printf("back track sets (row) %s at [%d,%d], count exceeded\n", ret, ri, i%9);
-                                }
+                    if ( !grid_state->set23_found[Row].check_indexbit(i)) {
+                        unsigned char ri = row_index[i];
+                        ul = grid_state->get_ul_set_search<Row>(ri);
+                        if (check_back || (cnt+2 <= ul) ) {
+                            my_naked_sets_searched++;
+                            res = _mm_cmpeq_epi16(_mm256_castsi256_si128(a_i), _mm_or_si128(_mm256_castsi256_si128(a_i), *(__m128i_u*) &candidates[9*ri]));
+                            unsigned int m = compress_epi16_boolean128(res);
+                            bool bit9 = candidates[i] == (candidates[i] | candidates[9*ri+8]);
+                            if ( bit9 ) {
+                                m |= 1<<8;    // fake the 9th mask position
                             }
-                            // no need to update grid_state
-                            goto back;
-                        } else if (s == cnt && fitm1) {
-                            naked_sets_found++;
-                            if ( s <= 3 ) {
-                                grid_state->set23_found[Row].il_set_section_indexbits<doubledbits>(m,ri);
-                            }
-                            if ( verbose && debug ) {
-                                char ret[30];
-                                format_candidate_set(ret, candidates[i]);
-                                printf("naked  set (row): %s [%d,%d]\n", ret, ri, i%9);
-                            }
-                            and_indices<Row>((bit128_t*)to_change, i);
-                        }
-                    }
-                  }
-
-                    // check column
-                    //
-                  unsigned char ci = column_index[i];
-                  if ( !grid_state->set23_found[Col].il_check_indexbit<doubledbits>(ci,i/9))
-                  {
-                    ul = grid_state->get_ul_set_search<Col>(fitm1, cnt, ci);
-                    if (can_backtrack || (cnt <= ul-fit_delta) ) {
-                        my_naked_sets_searched++;
-                        a_j = _mm_set_epi16(candidates[ci+63], candidates[ci+54], candidates[ci+45], candidates[ci+36], candidates[ci+27], candidates[ci+18], candidates[ci+9], candidates[ci]);
-                        res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
-                        unsigned long long m = compress_epi16_boolean128<doubledbits>(res);;
-                        bool bit9 = candidates[i] == (candidates[i] | candidates[ci+72]);
-                        if ( bit9 ) {
-                            m |= doubledbits? 3<<16 : 1<<8;    // fake the 9th mask position
-                        }
-                        s = _popcnt32(m);
-                        if ( doubledbits ) {
-                            s >>= 1;
-                        }
-                        // this covers the situation where there is a naked set of size x
-                        // which is found in y cells with y > x.  That's impossible, hence track back.
-                        if (s > cnt) {
-                            if ( verbose ) {
+                            s = _popcnt32(m);
+                            if (s > cnt) {
+                                if ( verbose ) {
                                     char ret[32];
                                     format_candidate_set(ret, candidates[i]);
-                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                        printf("Line %d: naked  set (col) %s at [%d,%d], count exceeded\n", line, ret, i/9, i%9);
-                                } else if ( debug ) {
-                                        printf("back track sets (col) %s at [%d,%d], count exceeded\n", ret, i/9, i%9);
+                                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                        printf("Line %d: naked  set (row) %s at [%d,%d], count exceeded\n", line, ret, ri, i%9);
+                                    } else if ( debug ) {
+                                        printf("back track sets (row) %s at [%d,%d], count exceeded\n", ret, ri, i%9);
+                                    }
+                                }
+                                // no need to update grid_state
+                                goto back;
+                            } else if (s == cnt) {
+                                char ret[32];
+                                if ( s <= 3 ) {
+                                    grid_state->set23_found[Row].set_indexbits(m,ri*9,9);
+                                }
+                                if ( ul <= 3 + s ) {
+                                    // could include locked slots, never mind
+                                    grid_state->set23_found[Row].set_indexbits(~m&0x1ff,ri*9,9);
+                                }
+                                if (cnt+2 <= ul) {
+                                    naked_sets_found++;
+                                    add_indices<Row>((bit128_t*)to_change, i);
+                                    if ( verbose && debug ) {
+                                        if ( cnt <=3 || cnt+3 < ul ) {
+                                            format_candidate_set(ret, candidates[i]);
+                                            printf("naked  %s (row): %-7s [%d,%d]\n", s==2?"pair":"set ", ret, ri, i%9);
+                                        } else {
+                                            unsigned char k = 0xff;
+                                            unsigned short complement = 0;
+                                            bit128_t mm {};
+                                            mm.set_indexbits(~m & 0x1ff, ri*9, 9);
+                                            for ( unsigned char n_=0; n_<2; n_++) {
+                                                unsigned long long m_ = mm.u64[n_] & to_change[n_] & unlocked[n_];
+
+                                                while (m_) {
+                                                    unsigned char k_i = tzcnt_and_mask(m_) + (n_?64:0);
+                                                    if ( k == 0xff ) {
+                                                        k = k_i;
+                                                    }
+                                                    complement |= candidates[k_i];
+                                                }
+                                                if ( ri<7) {
+                                                    break;
+                                                }
+                                            }
+                                            complement &= ~candidates[i];
+                                        if ( complement != 0 ) {
+                                                format_candidate_set(ret, complement);
+                                                printf("hidden %s (row): %-7s [%d,%d]\n", __popcnt16(complement)==2?"pair":"set ", ret, ri, k%9);
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            // no need to update grid_state
-                            goto back;
-                        } else if (s == cnt && fitm1 ) {
-                            naked_sets_found++;
-
-
-                            if ( s <= 3 ) {
-                                grid_state->set23_found[Col].il_set_section_indexbits<doubledbits>(m,ci);
-                            }
-                            if ( verbose && debug ) {
-                                char ret[30];
-                                format_candidate_set(ret, candidates[i]);
-                                printf("naked  set (col): %s [%d,%d]\n", ret, i/9, i%9);
-                            }
-                            and_indices<Col>((bit128_t*)to_change, i);
                         }
-                    }
-                  }
+                    } // row
 
-                    // check box
-                    // Same comments as above apply
+                    // check column and box
                     //
-                    // If there are n cells, cnt == n will just cause churn,
-                    // but cnt == n - 1 will detect hidden singles.
-                    //
-                  unsigned char b    = box_start[i];
-                  unsigned char boff = i-b;
-                  boff = boff/9*3 + boff%3;
-                  unsigned char bi   = box_index[i];
-                  if ( !grid_state->set23_found[Box].il_check_indexbit<doubledbits>(bi,boff))
-                  {
-                    ul = grid_state->get_ul_set_search<Box>(fitm1, cnt, bi);
-                    if (can_backtrack || (cnt <= ul-fit_delta) ) {
-                        my_naked_sets_searched++;
-                        a_j = _mm_set_epi16(candidates[b+19], candidates[b+18], candidates[b+11], candidates[b+10], candidates[b+9], candidates[b+2], candidates[b+1], candidates[b]);
-                        res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
-                        unsigned long long m = compress_epi16_boolean128<doubledbits>(res);
-                        bool bit9 = candidates[i] == (candidates[i] | candidates[b+20]);
-                        if ( bit9 ) {
-                            m |= doubledbits? 3<<16 : 1<<8;    // fake the 9th mask position
+                    unsigned char ci = column_index[i];
+                    unsigned char b    = box_start[i];
+                    unsigned char bi   = box_index[i];
+
+                    const bool chk[2] = { !grid_state->set23_found[Col].check_indexbit(i),
+                                          !grid_state->set23_found[Box].check_indexbit(i) };
+                    unsigned char uls[2];
+                    unsigned char ss[2] = {0,0};
+
+                    if ( chk[0] || chk[1] ) {
+                        ul = uls[0] = grid_state->get_ul_set_search<Col>(ci);
+                        uls[1] = grid_state->get_ul_set_search<Box>(bi);
+                        if ( uls[1] > ul ) {
+                            ul = uls[1];
                         }
-                        s = _popcnt32(m);
-                        if ( doubledbits ) {
-                            s >>= 1;
-                        }
-                        if (s > cnt) {
-                            if ( verbose ) {
-                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    printf("Line %d: naked set box, count exceeded\n", line);
-                                } else if ( debug ) {
-                                    printf("back track sets (box)\n");
+                        if (check_back || (cnt+2 <= ul) ) {
+                            __m256i a_j_256 = _mm256_set_epi16(candidates[b+19], candidates[b+18], candidates[b+11], candidates[b+10], candidates[b+9], candidates[b+2], candidates[b+1], candidates[b],
+                                              candidates[ci+63], candidates[ci+54], candidates[ci+45], candidates[ci+36], candidates[ci+27], candidates[ci+18], candidates[ci+9], candidates[ci]);
+                            __m256i res256 = _mm256_cmpeq_epi16(a_i, _mm256_or_si256(a_i, a_j_256));
+                            unsigned int ms[2] = { compress_epi16_boolean<true>(res256), 0 };
+                            ms[1] = ms[0] >> 16;
+                            ms[0] &= 0xffff;
+                            bool bit9s[2];
+                            bit9s[0] = candidates[i] == (candidates[i] | candidates[ci+72]);
+                            bit9s[1] = candidates[i] == (candidates[i] | candidates[b+20]);
+                            const char *js[2] = {"col","box"};
+                            for ( int j=0; j<2; j++) {  // check for back track first
+                                if ( !chk[j] ) {
+                                    continue;
+                                }
+                                my_naked_sets_searched++;
+                                if ( bit9s[j] ) {
+                                    ms[j] |= 3<<16;    // fake the 9th mask position
+                                }
+                                ss[j] = _popcnt32(ms[j])>>1;
+                                // this covers the situation where there is a naked set of size x
+                                // which is found in y cells with y > x.  That's impossible, hence track back.
+                                if (ss[j] > cnt) {
+                                    if ( verbose ) {
+                                        char ret[32];
+                                        format_candidate_set(ret, candidates[i]);
+                                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                            printf("Line %d: naked  set (%s) %s at [%d,%d], count exceeded\n", line, js[j], ret, i/9, i%9);
+                                        } else if ( debug ) {
+                                            printf("back track sets (%s) %s at [%d,%d], count exceeded\n", js[j], ret, i/9, i%9);
+                                        }
+                                    }
+                                    // no need to update grid_state
+                                    goto back;
                                 }
                             }
-                            // no need to update grid_state
-                            goto back;
-                        } else if (s == cnt && fitm1) {
-                            naked_sets_found++;
-                            if ( verbose && debug ) {
-                                char ret[30];
-                                format_candidate_set(ret, candidates[i]);
-                                printf("naked  set (box): %s [%d,%d]\n", ret, i/9, i%9);
+                            for ( int j=0; j<2; j++) {
+                                if ( !chk[j] || (ss[j] != cnt)) {
+                                    continue;
+                                }
+                                // OK, this is getting a little tricky.
+                                // Not only having to deal with columns and boxes, but also
+                                // with the detected set and its complement -
+                                // and to cast the trace in terms of pairs and sets
+                                // while having to manage set23_found bit by bit.
+                                //
+                                if ( (ss[j] == cnt) && (cnt+2 <= uls[j]) ) {
+                                    naked_sets_found++;
+                                    if ( j ) {
+                                        add_indices<Box>((bit128_t*)to_change, i);
+                                    } else {
+                                        add_indices<Col>((bit128_t*)to_change, i);
+                                    }
+                                    unsigned char k = 0xff;
+                                    unsigned short complement = 0;
+                                    Kind kind = j?Box:Col;
+                                    bit128_t s = { *(bit128_t*)&big_index_lut[i][kind][0] & ~grid_state->set23_found[kind] };
+                                    bool set23_cond1 = (cnt <= 3);
+                                    bool set23_cond2 = (uls[j] <= cnt+3);
+                                    unsigned char index_by_i_kind = index_by_i[i][kind];
+                                    for ( unsigned char k_m = 0; k_m<9; k_m++ ) {
+                                        unsigned char k_i = (j?(b+box_offset[k_m]):(ci+k_m*9));
+                                        if ( !s.check_indexbit(k_i) ) {
+                                            continue;
+                                        }
+                                        bool in_set = (candidates[k_i] | candidates[i]) == candidates[i];
+                                        // is this really an index originating from the Box/Col?
+                                        if ( index_by_i[k_i][kind] == index_by_i_kind ) {
+                                            if ( (set23_cond1 && in_set) || (set23_cond2 && !in_set) ) {
+                                                grid_state->set23_found[kind].set_indexbit(k_i);
+                                            }
+                                            if ( !in_set ) {
+                                                // set k and compute the complement set
+                                                if ( k == 0xff ) {
+                                                    k = k_i;
+                                                }
+                                                complement |= candidates[k_i];
+                                                found = true;
+                                            }
+                                        }
+                                    }
+                                    complement &= ~candidates[i];
+                                    if ( complement != 0 ) {
+                                        if ( verbose && debug ) {
+                                            char ret[32];
+                                            if ( set23_cond2 ) {
+                                                format_candidate_set(ret, complement & ~candidates[i]);
+                                                printf("hidden %s (%s): %-7s [%d,%d]\n", __popcnt16(complement)==2?"pair":"set ", js[j], ret, k/9, k%9);
+                                            } else {
+                                                format_candidate_set(ret, candidates[i]);
+                                                printf("naked  %s (%s): %-7s [%d,%d]\n", ss[j]==2?"pair":"set ", js[j], ret, i/9, i%9);
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            if ( s <= 3 ) {
-                                grid_state->set23_found[Box].il_set_section_indexbits<doubledbits>(m,bi);
-                            }
-                            and_indices<Box>((bit128_t*)to_change, i);
                         }
                     }
-                  }
 
                     ((bit128_t*)to_change)->u128 &= ((bit128_t*)unlocked)->u128;
-                    
-                    // update candidates
-                    for (unsigned char n = 0; n < 2; ++n) {
-                        while (to_change[n]) {
-                            int j_rel = _tzcnt_u64(to_change[n]);
-                            to_change[n] &= ~(1ULL << j_rel);
-                            unsigned char j = (unsigned char) j_rel + (n<<6);
+
+                    if ( ((bit128_t*)to_change)->u128 != (__int128)0 ) {
+                        const unsigned char *ci = index_by_i[i];
+                        // update candidates
+                        for (unsigned char n = 0; n < 2; ++n) {
+                            while (to_change[n]) {
+                                unsigned char j_rel = tzcnt_and_mask(to_change[n]);
+                                unsigned char j = j_rel + (n<<6);
                             
-                            // if this cell is not part of our set
-                            if ((candidates[j] | candidates[i]) != candidates[i]) {
-                                // if there are bits that need removing
-                                if (candidates[j] & candidates[i]) {
-                                    candidates[j] &= ~candidates[i];
-                                    tvnn |= 1ULL << j_rel;
-                                    found = true;
+                                // if this cell is not part of our set
+                                if ((candidates[j] | candidates[i]) != candidates[i]) {
+                                    // if there are bits that need removing
+                                    if (candidates[j] & candidates[i]) {
+                                        candidates[j] &= ~candidates[i];
+                                        to_visit_again.set_indexbit(j);
+                                        found = true;
+                                    }
+                                } else {
+                                    const unsigned char *cj = index_by_i[j];
+                                    if ( (cj[Col] == ci[Col]) && (ss[0] == cnt) && (ss[0] <= 3) ) {
+                                        grid_state->set23_found[Col].set_indexbit(j);
+                                    }
+                                    if ( (cj[Box] == ci[Box]) && (ss[1] == cnt) && (ss[1] <= 3) ) {
+                                        grid_state->set23_found[Box].set_indexbit(j);
+                                    }                                    
                                 }
                             }
                         }
+
+                        // If any cell's candidates got updated, go back and try all that other stuff again
+                        if (found) {
+                            to_visit_n.u64[n] = tvnn;
+                            to_visit_n.u128 |= to_visit_again.u128;
+                            grid_state->updated.u64[0] = to_visit_n.u64[0];
+                            grid_state->updated.u32[2] = to_visit_n.u64[1];
+                            goto start;
+                        }
                     }
-                    
-                    // If any cell's candidates got updated, go back and try all that other stuff again
-                    if (found) {
-                        to_visit_n[n] = tvnn;
-                        goto start;
-                    }
-                    
                 } else if ( cnt == 1 ) {
                     // this is not possible, but just to eliminate cnt == 1:
+                    to_visit_n.u64[n] = tvnn;
+                    to_visit_n.u128 |= to_visit_again.u128;
+                    grid_state->updated.u64[0] = to_visit_n.u64[0];
+                    grid_state->updated.u32[2] = to_visit_n.u64[1];
                     if ( verbose && debug ) {
                         printf("naked  (sets) ");
                     }
-                    grid_state->enter_digit<verbose>( candidates[i], i);
+                    e_i = i;
+                    e_digit = candidates[i];
                     printf("found a singleton in set search... strange\n");
-                    goto start;
+                    goto enter;
                 }
-            }
-        }
+            } // while
+        } // for
+        to_visit_n.u128 |= to_visit_again.u128;
+        grid_state->updated.u64[0] = to_visit_n.u64[0];
+        grid_state->updated.u32[2] = to_visit_n.u64[1];
     }
 
-    bit128_t bivalues {0};
+    bit128_t bivalues;
     {
         __m256i c;
         for (unsigned char i = 0; i < 64; i += 32) {
@@ -1564,7 +1782,7 @@ start:
                                  _mm256_cmpeq_epi16(lsb,c)));
 
         bivalues.u16[5] = (__popcnt16(candidates[80]) == 2)?1:0;
-        // now bivalues is now set for subsequent steps
+        // bivalues is now set for subsequent steps
     }
 
     {
@@ -1573,7 +1791,7 @@ start:
         // First get a count of unlocked.
         // With around 22 or less unresolved cells (N), accumulate a popcount of all cells.
         // Count the cells with a candidate count 2 (P). 81 - N - P = Q.
-        // If Q is 0, track back, if a guess was made before. without guess to track back to,
+        // If Q is 0, back track, if a guess was made before. without guess to back track to,
         // take note as duplicate solution, but carry on with a guess.
         // If Q > 1, go with a guess.
         // If Q == 1, identify the only cell which does not have a 2 candidate count.
@@ -1583,9 +1801,11 @@ start:
 
         unsigned char N = _popcnt64(unlocked[0]) + _popcnt32(unlocked[1]);
         if ( N < 23 ) {
-                unsigned char sum12s = 0;
-                unsigned char target = 0;
+                unsigned char sum12s = 0;   // count P, the number of bi-values + the number of locked cells
+                unsigned char target = 0;   // the index of the only cell with three candidates
 
+                // track wether there was a single cell with count > 2
+                // if there is a second such cell, goto guess
                 unsigned char not_pairs = 0;
 
                 for (unsigned char i = 0; i < 2; i++) {
@@ -1604,7 +1824,7 @@ start:
                 }
                 // sum12s is the total of 128 bits minus the ones that are neither 1 or 2
                 sum12s -= (64-17);    // only 81 possible bits, subtract 64-17 to compensate
-                if ( sum12s == 81 ) {
+                if ( sum12s == 81 ) { // this means Q == 0
                     if ( unique_check ) {
                         if ( verbose && debug ) {
                             printf("bi-value universal grave means at least two solutions exist.\n");
@@ -1649,8 +1869,9 @@ start:
                         if ( verbose && debug ) {
                             printf("bi-value universal grave pivot:");
                         }
-                        grid_state->enter_digit<verbose>(digit, target);
-                        goto start;
+                        e_i = target;
+                        e_digit = digit;
+                        goto enter;
                     }
                 }
         }
@@ -1661,7 +1882,7 @@ guess:
     grid_state = grid_state->make_guess<verbose>();
     no_guess_incr = 0;
     goto start;
-    
+
 }
 
 void print_help() {
@@ -1677,6 +1898,7 @@ Command line options:
         add a 2 for even more detail.
     -h  help information (this text)
     -l# solve a single line from the puzzle.
+    -t# set the number of threads
     -u  check the solution for uniqueness
     -v  verify the solution
     -x  provide some statistics
@@ -1724,6 +1946,14 @@ int main(int argc, const char *argv[]) {
         case 'l':    // line of puzzle to solve
              sscanf(argv[0]+2, "%d", &line_to_solve);
              break;
+        case 't':    // set number of threads
+             if ( argv[0][2] && isdigit(argv[0][2]) ) {
+                 sscanf(&argv[0][2], "%d", &numthreads);
+                 if ( numthreads != 0 ) {
+                     omp_set_num_threads(numthreads);
+                 }
+             }
+             break;
         }
         argc--, argv++;
     }
@@ -1747,6 +1977,7 @@ int main(int argc, const char *argv[]) {
     if ( debug ) {
          omp_set_num_threads(1);
          printf("debug mode requires restriction of the number of threads to 1\n");
+
          printf("BMI2 instructions %s %s\n",
                __builtin_cpu_supports("bmi2") ? "found" : "not found",
                bmi2_support? "and enabled" : __builtin_cpu_is("znver2")? "but use of pdep/pext instructions disabled":"");
@@ -1864,7 +2095,7 @@ int main(int argc, const char *argv[]) {
         //   are assigned dynmically (to minimize random effects of difficult puzzles)
         // shared(...) lists the variables that are shared (as opposed to separate copies per thread)
         //
-#pragma omp parallel for firstprivate(stack) shared(string_pre, output, npuzzles, i, imax, debug, reportstats) schedule(dynamic,32)
+#pragma omp parallel for proc_bind(close) firstprivate(stack) shared(string_pre, output, npuzzles, i, imax, debug, reportstats) schedule(dynamic,64)
         for (i = 0; i < imax; i+=82) {
             // copy unsolved grid
             signed char *grid = &output[i*2+82];
@@ -1907,8 +2138,8 @@ int main(int argc, const char *argv[]) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
         printf("schoku version: %s\ncompile options: %s\n", version_string, compilation_options);
         printf("%10ld  puzzles entered\n", npuzzles);
-		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
-        printf("%10ld  puzzles solved\n", solved_count.load());
+        printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
+		printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
         if ( unsolved_count.load()) {
             printf("%10ld  puzzles had no solution\n", unsolved_count.load());
         }
@@ -1918,17 +2149,19 @@ int main(int argc, const char *argv[]) {
         if ( verify ) {
             printf("%10ld  puzzle solutions were verified\n", verified_count.load());
         }
-        printf("%10ld  %5.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
-        printf("%10lld  %5.2f/puzzle  total guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
-        printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
-        printf("%10lld  %5.2f/puzzle  total digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/(double)solved_count.load());
-        printf("%10lld  %5.2f/puzzle  total 'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
-        printf("%10lld  %5.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
-        printf("%10lld %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+        printf( "%10ld  %6.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
+        printf("%10lld  %6.2f/puzzle  guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
+        printf("%10lld  %6.2f/puzzle  back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
+        printf("%10lld  %6.2f/puzzle  digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/(double)solved_count.load());
+        printf("%10lld  %6.2f/puzzle  'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
+        printf("%10lld  %6.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
+        printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
         }
     }
+
     if ( unique_check && non_unique_count.load()) {
         printf("%10ld  puzzles had more than one solution\n", non_unique_count.load());
     }

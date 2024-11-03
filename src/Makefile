@@ -5,7 +5,7 @@ XFLAGS := -fno-caller-saves -fpeel-loops
 CXX := g++
 
 # these architecture flags are required!
-TARGET_ARCH := -mavx2 -mbmi -mbmi2
+TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
 DFLAGS := -DNDEBUG
