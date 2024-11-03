@@ -23,14 +23,15 @@ a 17-clue puzzle file with 49151 puzzles, where the startup uses more than 40% o
 ### Summary of Changes
 Looking at speed improvements in terms of low hanging fruit, I found that the malloc'ation of the GridState
 structures did take up too much time and replaced it by fixed stacks allocated by each thread only once.  
-I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.  
+I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.
+In particular, allocating a GridState on a different thread will cause memory thrashing (unnessary/unwanted copying between L1 cache lines).   
 The hidden single search allowed for removal of repeating calculations, which offered a welcome boost.  I also made the search cover all hidden singles.  
 I pruned the naked set search to skip already found sets and not to look at sets that provide no benefit, e.g. sets covering all of the available cells (N or N-1).  
 The guessing code did search all cells, even though it could simply pick the first cell with 2 candidates found.  
 Throughout, I also added lookup tables where they were useful.  
 Then I integrated the entering loop (for solved cells) with the search for the next naked single.  This unfortunately involved some additional spaghetti coding techniques in form of labels and gotos.  
 I also changed the program to use memory mapped I/O (this relieves the main thread from doing nearly any computations or I/O.  
-Later I implemented a triad algorithm that finds and removes per triad candidates that are impossible.  
+Later I implemented a triad algorithm that finds and removes per triad candidates (aka LockedCandidates) that are impossible.  
 The default bi-value guessing strategy is suboptimal, as it searches guesses by preference always beginning in the same area and picks too easily pairs of bi-values that depend on each other and little else.  
 This causes the tree of guesses to grow unnecessarily.  
 I used an approach that pays off by reducing the overall number of guesses.  The key is to find 'balanced' guesses that bisect the set of possible paths.
@@ -45,10 +46,11 @@ The time command reported timing varies quite a bit while the internal timings w
 I elected to collect statistics based on the multi-threaded timings througout.  
 For the later versions of Schoku the factor between multi-threading and single-threading is close to 6
 for a 4 CPU / 8 execution units processor.  
-The original code's ratio of multi- to single-threaded performance started very low at 2.15 and improved with the allocation and alignment
+The original code's ratio of multi- to single-threaded performance started very low at 2.15
+(could be specific to my setup) and improved with the allocation and alignment
 of the grid state data.
 
-I am taking timings on a Zen2 Ryzen 7 4800U processor.
+I am taking timings on a Zen2 Ryzen 7 4700U processor.
 
 
 ### Approach
@@ -86,9 +88,9 @@ Really any size is possible, a naked set of 1 being a naked single, and a naked 
 all of the row.
 
 * consequences of finding a naked set:
-..* no other cell in that section can contain these N candidates.
+  * no other cell in that section can contain these N candidates.
   This leaves us with another set (the complementary set).
-..* the complementary set cells can therefore be purged of the N candidates found.
+  * the complementary set cells can therefore be purged of the N candidates found.
   The complementary set is usually a hidden set. 
 
 * once more, after removing the extra candidates from the hidden set, repeat from the beginning.
@@ -146,7 +148,7 @@ To name a few:
 - options to prove uniqueness and verify the solutions
 - an option to check the puzzle
 - options to control the number of threads
-- optionally provde statistics and timing information
+- optionally provide statistics and timing information
 - optionally solve a single puzzle from a puzzle file
 
 Also, some adaptivity is welcome, e.g. when faster and/or specialized instructions
