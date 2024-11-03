@@ -5,10 +5,10 @@ XFLAGS := -fno-caller-saves -fpeel-loops
 CXX := g++
 
 # these architecture flags are required!
-TARGET_ARCH := -mavx2 -mbmi
+TARGET_ARCH := -mavx2 -mbmi -mbmi2
 
 # preprocessor options
-DFLAGS :=
+DFLAGS := -DNDEBUG
 
 # optimization options 
 # Note: these are easily overridden on the command line, for example: make OFLAGS=-O2
