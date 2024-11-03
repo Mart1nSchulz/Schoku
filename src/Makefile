@@ -1,7 +1,7 @@
 TARGET  := schoku
 EXT     := cpp
 
-XFLAGS :=
+XFLAGS := -fno-caller-saves -fpeel-loops
 CXX := g++
 
 # these architecture flags are required!
