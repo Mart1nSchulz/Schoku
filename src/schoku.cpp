@@ -8,48 +8,47 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.7  (triads)
+ * Version 0.8  (guessing)
  *
  * Performance changes:
- * - full implementation of triad processing
- *   both full triad set detection (with OPT_TRIAD_RES) and removal of extra triad candidates
- * - process columns first in the hidden singles search to gain some performance.
+ * - implementation of an improved guessing algorithms, based on triads.
  *
  * Functional changes:
- * - allow OPT_TRIAD_RES and OPT_SETS as compilation options
+ * (none)
  *
  * Performance measurement and statistics:
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.7
+ * schoku version: 0.8
  * compile options:
- *     49151  1795772/s  puzzles solved
- *    27.1ms    0.55탎/puzzle  solving time
+ *     49151  puzzles entered
+ *     49151  1918822/s  puzzles solved
+ *    25.6ms    0.52탎/puzzle  solving time
  *     37834   76.98%  puzzles solved without guessing
- *     35124    0.71/puzzle  guesses
- *     24508    0.50/puzzle  back tracks
- *    338098    6.88/puzzle  digits entered and retracted
- *   1460259   29.71/puzzle  'rounds'
- *     22698    0.46/puzzle  triads resolved
- *    584439   11.89/puzzle  triad updates
- *       833  bi-value universal graves detected
+ *     30798    0.63/puzzle  guesses
+ *     20996    0.43/puzzle  back tracks
+ *    282418    5.75/puzzle  digits entered and retracted
+ *   1464744   29.80/puzzle  'rounds'
+ *     22972    0.47/puzzle  triads resolved
+ *    593316   12.07/puzzle  triad updates
+ *       693  bi-value universal graves detected
  *
  * compile options: OPT_TRIAD_RES OPT_SETS
  *     49151  puzzles entered
- *     49151  1639192/s  puzzles solved
- *    30.0ms    0.61탎/puzzle  solving time
+ *     49151  1748337/s  puzzles solved
+ *    28.1ms    0.57탎/puzzle  solving time
  *     42079   85.61%  puzzles solved without guessing
- *     14266    0.29/puzzle  guesses
- *      8663    0.18/puzzle  back tracks
- *    118220    2.41/puzzle  digits entered and retracted
- *   1392164   28.32/puzzle  'rounds'
- *    104475    2.13/puzzle  triads resolved
- *    599919   12.21/puzzle  triad updates
- *     17665    0.36/puzzle  naked sets found
- *   1001824   20.38/puzzle  naked sets searched
- *      1140  bi-value universal graves detected
+ *     12428    0.25/puzzle  guesses
+ *      7461    0.15/puzzle  back tracks
+ *    102347    2.08/puzzle  digits entered and retracted
+ *   1398095   28.44/puzzle  'rounds'
+ *    106118    2.16/puzzle  triads resolved
+ *    604548   12.30/puzzle  triad updates
+ *     17775    0.36/puzzle  naked sets found
+ *    902071   18.35/puzzle  naked sets searched
+ *       952  bi-value universal graves detected
  *
  */
 #include <atomic>
@@ -66,7 +65,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-const char *version_string = "0.7";
+const char *version_string = "0.8";
 
 const char *compilation_options = 
 // OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well together
@@ -414,6 +413,89 @@ const unsigned long long big_index_lut[81][4][2] = {
 {{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7020100804020100,    0x1ffe0 }},
 };
 
+const char * cl2txt[81] = {
+        /*   0 */  "[0,0]",
+        /*   1 */  "[0,1]",
+        /*   2 */  "[0,2]",
+        /*   3 */  "[0,3]",
+        /*   4 */  "[0,4]",
+        /*   5 */  "[0,5]",
+        /*   6 */  "[0,6]",
+        /*   7 */  "[0,7]",
+        /*   8 */  "[0,8]",
+        /*   9 */  "[1,0]",
+        /*  10 */  "[1,1]",
+        /*  11 */  "[1,2]",
+        /*  12 */  "[1,3]",
+        /*  13 */  "[1,4]",
+        /*  14 */  "[1,5]",
+        /*  15 */  "[1,6]",
+        /*  16 */  "[1,7]",
+        /*  17 */  "[1,8]",
+        /*  18 */  "[2,0]",
+        /*  19 */  "[2,1]",
+        /*  20 */  "[2,2]",
+        /*  21 */  "[2,3]",
+        /*  22 */  "[2,4]",
+        /*  23 */  "[2,5]",
+        /*  24 */  "[2,6]",
+        /*  25 */  "[2,7]",
+        /*  26 */  "[2,8]",
+        /*  27 */  "[3,0]",
+        /*  28 */  "[3,1]",
+        /*  29 */  "[3,2]",
+        /*  30 */  "[3,3]",
+        /*  31 */  "[3,4]",
+        /*  32 */  "[3,5]",
+        /*  33 */  "[3,6]",
+        /*  34 */  "[3,7]",
+        /*  35 */  "[3,8]",
+        /*  36 */  "[4,0]",
+        /*  37 */  "[4,1]",
+        /*  38 */  "[4,2]",
+        /*  39 */  "[4,3]",
+        /*  40 */  "[4,4]",
+        /*  41 */  "[4,5]",
+        /*  42 */  "[4,6]",
+        /*  43 */  "[4,7]",
+        /*  44 */  "[4,8]",
+        /*  45 */  "[5,0]",
+        /*  46 */  "[5,1]",
+        /*  47 */  "[5,2]",
+        /*  48 */  "[5,3]",
+        /*  49 */  "[5,4]",
+        /*  50 */  "[5,5]",
+        /*  51 */  "[5,6]",
+        /*  52 */  "[5,7]",
+        /*  53 */  "[5,8]",
+        /*  54 */  "[6,0]",
+        /*  55 */  "[6,1]",
+        /*  56 */  "[6,2]",
+        /*  57 */  "[6,3]",
+        /*  58 */  "[6,4]",
+        /*  59 */  "[6,5]",
+        /*  60 */  "[6,6]",
+        /*  61 */  "[6,7]",
+        /*  62 */  "[6,8]",
+        /*  63 */  "[7,0]",
+        /*  64 */  "[7,1]",
+        /*  65 */  "[7,2]",
+        /*  66 */  "[7,3]",
+        /*  67 */  "[7,4]",
+        /*  68 */  "[7,5]",
+        /*  69 */  "[7,6]",
+        /*  70 */  "[7,7]",
+        /*  71 */  "[7,8]",
+        /*  72 */  "[8,0]",
+        /*  73 */  "[8,1]",
+        /*  74 */  "[8,2]",
+        /*  75 */  "[8,3]",
+        /*  76 */  "[8,4]",
+        /*  77 */  "[8,5]",
+        /*  78 */  "[8,6]",
+        /*  79 */  "[8,7]",
+        /*  80 */  "[8,8]"
+    };
 align64_empty c9;
 
 bool bmi2_support = false;
@@ -602,16 +684,22 @@ inline void grid_dump(unsigned short *candidates) {
     grid_dump(candidates, stdout);
 }
 
-#ifdef OPT_TRIAD_RES
 // TriadInfo
-// for passing triad information.
+// for passing triad information to make_guess.
 //
-typedef struct {
+class TriadInfo {
+public:
+    unsigned short *row_triads;               // just to pass the real row_triads
+    unsigned short *col_triads;               // just to pass the real col_triads
     unsigned short row_triads_wo_musts[36];   //  triads minus tmusts for guessing
     unsigned short col_triads_wo_musts[36];   //  triads minus tmusts for guessing
+    unsigned int triads_selection[2];
 
-} TriadInfo;
-#endif
+    TriadInfo(unsigned short *row_triads, unsigned short *col_triads) {
+        this->row_triads = row_triads;
+        this->col_triads = col_triads;
+    }
+};
 
 // The maximum levels of guesses is given by GRIDSTATE_MAX.
 // On average, the number of levels is pretty low, but we want to be 'reasonably' sure
@@ -637,9 +725,7 @@ public:
     bit96_t updated;                  // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
     bit128_t unlocked;                // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
     bit128_t set23_found[3];          // for keeping track of found sets of size 2 and 3
-#ifdef OPT_TRIAD_RES
     unsigned int triads_unlocked[2];  // unlocked row and col triads (#candidates >3), 27 bits each
-#endif
 
 // GridState is normally copied for recursion
 // Here we initialize the starting state including the puzzle.
@@ -650,9 +736,7 @@ inline void initialize(signed char grid[81]) {
     updated.u64[0] = ~(unsigned long long)0;
     updated.u32[2] = 0x1ffff;
 
-#ifdef OPT_TRIAD_RES
     triads_unlocked[0] = triads_unlocked[1] = 0x1ffLL | (0x1ffLL<<10) | (0x1ffLL<<20);
-#endif
     set23_found[0] = set23_found[1] = set23_found[2] = {__int128 {0}};
 
     stackpointer = 0;
@@ -704,7 +788,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
     bit128_t to_update = {0};
 
     if ( verbose && debug ) {
-        printf(" %x at [%d,%d]\n", _tzcnt_u32(digit)+1, i/9, i%9);
+        printf(" %x at %s\n", _tzcnt_u32(digit)+1, cl2txt[i]);
     }
 #ifndef NDEBUG
     if ( __popcnt16(digit) != 1 ) {
@@ -740,6 +824,90 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 }
 
 public:
+template<bool verbose>
+inline GridState* make_guess(TriadInfo &triad_info) {
+    // Make a guess for a triad with 4 candidate values that has 2 candidates that are not
+    // constrained to the triad (not in 'tmust') and has at least 2 or more unresolved cells.
+    // If we cannot obtain such a triad, fall back to make_guess().
+    // With such a triad found, select one of the 2 identified candidates
+    // to eliminate in the new GridState, issue the debug info and proceed.
+    // Save the current GridState to back track to and eliminate the other candidate from it.
+
+    unsigned char tpos;
+    unsigned char type;
+    unsigned char inc;
+    unsigned short *wo_musts;
+    for ( int i=0; i<2; i++ ) {
+        unsigned long long totest = triad_info.triads_selection[i];
+        wo_musts  = i==0?triad_info.row_triads_wo_musts:triad_info.col_triads_wo_musts;
+        while (totest) {
+            int ti = tzcnt_and_mask(totest);
+            int can_ti = ti-ti/10;
+            if ( __popcnt16 (wo_musts[ti]) == 2 ) {
+#ifndef OPT_TRIAD_RES
+                if ( __popcnt16(i==0?triad_info.row_triads[ti]:triad_info.col_triads[ti]) != 4 ) {
+                    continue;
+                }
+#endif
+                // set the cell index for the triad start
+                type  = i;
+                inc   = type==0?1:9;
+                tpos  = type==0 ? row_triad_reverse_canonical_map[can_ti]*3 : can_ti/9*27+can_ti%9;
+                unsigned int b = unlocked.get_indexbits(tpos, type==0?3:19);
+                if ( type==1 ) {
+                    b &= 0x40201;
+                }
+                if ( _popcnt32(b) < 2 ) {
+                    continue;
+                }
+                // found the right candidate
+                wo_musts += ti;
+                goto found;
+            }
+        }
+    }
+    return make_guess<verbose>();
+found:
+    unsigned short select_digit = 0x8000 >> __lzcnt16(*wo_musts);
+    unsigned short other_digit  = *wo_musts & ~select_digit;
+    
+    // Create a copy of the state of the grid to make back tracking possible
+    GridState* new_grid_state = this+1;
+    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+        fprintf(stderr, "Error: no GridState struct availabe\n");
+        exit(0);
+    }
+    memcpy(new_grid_state, this, sizeof(GridState));
+    new_grid_state->stackpointer++;
+
+    unsigned char off = tpos;
+    for ( unsigned char k=0; k<3; k++, tpos += inc) {
+         new_grid_state->candidates[tpos] &= ~select_digit;
+         candidates[tpos] &= ~other_digit;
+    }
+    // Update candidates
+    if (type == 0 ) {
+        updated.set_indexbits(0x7,off,3);
+        new_grid_state->updated.set_indexbits(7,off,3);
+    } else {
+        updated.set_indexbits(0x40201,off,19);
+        new_grid_state->updated.set_indexbits(0x40201,off,19);
+    }
+    
+    if ( verbose && debug ) {
+        printf("guess at level >%d< - new level >%d<\n", stackpointer, new_grid_state->stackpointer);
+        printf("guess \\{%d} for %s triad at %s\n",
+               1+_tzcnt_u32(select_digit), type==0?"row":"col", cl2txt[off]);
+    }
+    if ( verbose && debug > 1 ) {
+        printf("guess saved state: \{%d} for %s triad at %s\n",
+               1+_tzcnt_u32(other_digit), type==0?"row":"col", cl2txt[off]);
+    }
+    guesses++;
+
+    return new_grid_state;
+}
+
 template<bool verbose>
 GridState* make_guess() {
     // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
@@ -801,8 +969,8 @@ GridState* make_guess() {
                 gridout[j] = 49+_tzcnt_u32(candidates[j]);
             }
         }
-        printf("guess at [%d,%d]\nsaved grid_state level >%d<: %.81s\n",
-               guess_index/9, guess_index%9, stackpointer, gridout);
+        printf("guess at %s\nsaved grid_state level >%d<: %.81s\n",
+               cl2txt[guess_index], stackpointer, gridout);
     }
     
     // Update candidates
@@ -862,12 +1030,12 @@ bool solve(signed char grid[81], GridState stack[], int line) {
     unsigned long long *unlocked = grid_state->unlocked.u64;
     unsigned short* candidates;
 
-#ifdef OPT_TRIAD_RES
     // the low byte is the real count, while
     // the high byte is increased/decreased with each guess/back track
     // init count of resolved cells to the size of the initial set
     unsigned short current_entered_count = 81 - _popcnt64(unlocked[0]) - _popcnt32(unlocked[1]);
 
+#ifdef OPT_TRIAD_RES
     unsigned short last_entered_count_col_triads = 0;
 #endif
 
@@ -918,10 +1086,8 @@ back:
         return true;
     }
 
-#ifdef OPT_TRIAD_RES
     current_entered_count  = ((grid_state-1)->stackpointer)<<8;        // back to previous stack.
     current_entered_count += _popcnt64((grid_state-1)->unlocked.u64[0]) + _popcnt32((grid_state-1)->unlocked.u64[1]);
-#endif
 
     // collect some guessing stats
     if ( verbose && reportstats ) {
@@ -973,7 +1139,7 @@ enter:
         bit128_t to_update = {0};
 
         if ( verbose && debug ) {
-            printf(" %x at [%d,%d]\n", _tzcnt_u32(e_digit)+1, e_i/9, e_i%9);
+            printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
         }
 #ifndef NDEBUG
         if ( __popcnt16(e_digit) != 1 ) {
@@ -988,9 +1154,7 @@ enter:
         }
     
         candidates[e_i] = e_digit;
-#ifdef OPT_TRIAD_RES
         current_entered_count++;
-#endif
 
         add_and_mask_all_indices(&to_update, &grid_state->unlocked, e_i);
 
@@ -1012,9 +1176,9 @@ enter:
                     unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
                     unsigned char pos = j+(_tzcnt_u32(mx)>>1);
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                        printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
                     } else if ( debug ) {
-                        printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
                 }
                 e_digit=0;
@@ -1051,9 +1215,9 @@ enter:
                 if ( verbose ) {
                     unsigned char pos = e_i;
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                        printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
                     } else if ( debug ) {
-                        printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
                 }
                 goto back;
@@ -1073,9 +1237,9 @@ enter:
                         unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
                         unsigned char pos = i+(_tzcnt_u32(mx)>>1);
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
                         } else if ( debug ) {
-                            printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
+                            printf("back track - cell %s is 0\n", cl2txt[pos]);
                         }
                     }
                     goto back;
@@ -1333,9 +1497,8 @@ enter:
     unsigned short row_triads[36];   //  27 triads, in groups of 9 with a gap of 1
     unsigned short col_triads[36];   //  27 triads, in groups of 9 with a gap of 1
 
-#ifdef OPT_TRIAD_RES
-    TriadInfo triad_info;
-#endif
+    TriadInfo triad_info(row_triads, col_triads);
+
         const __m256i mask9 { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ffLL, 0 };
 
     // Algo 2 and Algo 3.1
@@ -1417,9 +1580,9 @@ enter:
                                 if ( e_digit & (e_digit-1) ) {
                                     if ( verbose ) {
                                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                            printf("Line %d: stack 0, back track - col cell [%d,%d] does contain multiple hidden singles\n", line, e_i/9, e_i%9);
+                                            printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
                                         } else if ( debug ) {
-                                            printf("back track - multiple hidden singles in col cell [%d,%d]\n", e_i/9, e_i%9);
+                                            printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
                                         }
                                     }
                                     e_i = 0;
@@ -1622,9 +1785,9 @@ enter:
                     if ( cand9_box & (cand9_box-1) ) {
                         if ( verbose ) {
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: stack 0, multiple hidden singles in box cell at [%d,%d]\n", line, idx/9, idx%9);
+                                printf("Line %d: stack 0, multiple hidden singles in box cell at %s\n", line, cl2txt[idx]);
                             } else if ( debug ) {
-                                printf("back track - multiple hidden singles in box cell at [%d,%d]\n", idx/9, idx%9);
+                                printf("back track - multiple hidden singles in box cell at %s\n", cl2txt[idx]);
                             }
                         }
                         goto back;
@@ -1646,6 +1809,7 @@ enter:
 
         const __m256i low_mask  = _mm256_set1_epi8 ( 0x0f );
         const __m256i threes    = _mm256_set1_epi8 ( 3 );
+        const __m256i fours     = _mm256_set1_epi8 ( 4 );
         const __m256i word_mask = _mm256_set1_epi16 ( 0x00ff );
         const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                                    0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
@@ -1685,6 +1849,7 @@ enter:
     }
             }
 
+            triad_info.triads_selection[Col] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
             unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
             while (m) {
                 unsigned char tidx = tzcnt_and_mask(m);
@@ -1724,6 +1889,7 @@ enter:
             res = _mm256_and_si256(_mm256_permute4x64_epi64(res, 0xD8), mask27);
 
             m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
+            triad_info.triads_selection[Row] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
 
             // the best that can be done for rows - remember that the the order of 
             // row triads is not aligned with the order of cells.
@@ -1758,6 +1924,9 @@ enter:
                 triads_resolved++;
             } // while
     }   // Algo 3 Part 3
+#else
+    // by default, all triads to check
+    triad_info.triads_selection[Col] = triad_info.triads_selection[Row] = 0x1ff | (0x1ff<<10) | (0x1ff<<20);
 #endif
 
 
@@ -1790,9 +1959,7 @@ enter:
         for (int type=1; type>=0; type--) {	// row = 0, col = 1
 
             unsigned short *triads   = type==0?row_triads:col_triads;
-#if OPT_TRIAD_RES
             unsigned short *wo_musts = type==0?triad_info.row_triads_wo_musts:triad_info.col_triads_wo_musts;
-#endif
             unsigned short *ptriads  = triads;
             __m256i pmustnt[2][3] = {mask, mask, mask, mask, mask, mask};
             __m256i tmustnt[3];
@@ -1846,7 +2013,6 @@ enter:
                 __m256i tmust1 = _mm256_or_si256(pmustnt[0][1], pmustnt[1][1]);
                 __m256i tmust2 = _mm256_or_si256(pmustnt[0][2], pmustnt[1][2]);
 
-#if OPT_TRIAD_RES
                 // tmust:
                 // add to tmusts triads that are locked (exactly 3 candidates)
                 // another side task is to put aside data identifying triad candidate sets
@@ -1875,7 +2041,7 @@ enter:
                 triadsv = _mm256_andnot_si256(tmust2, triadsv);
                 _mm_storeu_si128((__m128i*)&wo_musts[20], _mm256_castsi256_si128(triadsv));
                 *(unsigned long long*)(&wo_musts[26]) = _mm256_extract_epi64(triadsv, 2);
-#endif
+
             // i=0 (manually unrolled loop)
                 // augment peer-based tmustnt by propagating the constraint (tmusti)
                 // vertical peers
@@ -1931,8 +2097,8 @@ enter:
                     if ( verbose && debug ) {
                             char ret[32];
                             format_candidate_set(ret, to_remove);
-                            printf("%s triad update \\%-5s at [%d,%d]\n", type == 0? "row":"col",
-                                   ret, tpos/9, tpos%9 );
+                            printf("%s triad update \\%-5s at %s\n", type == 0? "row":"col",
+                                   ret, cl2txt[tpos] );
                     }
                     // tracking
                     unsigned char pcnt = _popcnt32(triads[i*10+i_rel] & ~to_remove);
@@ -2058,9 +2224,9 @@ enter:
                                     char ret[32];
                                     format_candidate_set(ret, candidates[i]);
                                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                        printf("Line %d: naked  set (row) %s at [%d,%d], count exceeded\n", line, ret, ri, i%9);
+                                        printf("Line %d: naked  set (row) %s at %s, count exceeded\n", line, ret, cl2txt[ri*9]);
                                     } else if ( debug ) {
-                                        printf("back track sets (row) %s at [%d,%d], count exceeded\n", ret, ri, i%9);
+                                        printf("back track sets (row) %s at %s, count exceeded\n", ret, cl2txt[ri*9]);
                                     }
                                 }
                                 // no need to update grid_state
@@ -2156,9 +2322,9 @@ enter:
                                         char ret[32];
                                         format_candidate_set(ret, candidates[i]);
                                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                            printf("Line %d: naked  set (%s) %s at [%d,%d], count exceeded\n", line, js[j], ret, i/9, i%9);
+                                            printf("Line %d: naked  set (%s) %s at %s, count exceeded\n", line, js[j], ret, cl2txt[i]);
                                         } else if ( debug ) {
-                                            printf("back track sets (%s) %s at [%d,%d], count exceeded\n", js[j], ret, i/9, i%9);
+                                            printf("back track sets (%s) %s at %s, count exceeded\n", js[j], ret, cl2txt[i]);
                                         }
                                     }
                                     // no need to update grid_state
@@ -2216,10 +2382,10 @@ enter:
                                             char ret[32];
                                             if ( set23_cond2 ) {
                                                 format_candidate_set(ret, complement & ~candidates[i]);
-                                                printf("hidden %s (%s): %-7s [%d,%d]\n", __popcnt16(complement)==2?"pair":"set ", js[j], ret, k/9, k%9);
+                                                printf("hidden %s (%s): %-7s %s\n", __popcnt16(complement)==2?"pair":"set ", js[j], ret, cl2txt[k]);
                                             } else {
                                                 format_candidate_set(ret, candidates[i]);
-                                                printf("naked  %s (%s): %-7s [%d,%d]\n", ss[j]==2?"pair":"set ", js[j], ret, i/9, i%9);
+                                                printf("naked  %s (%s): %-7s %s\n", ss[j]==2?"pair":"set ", js[j], ret, cl2txt[k]);
                                             }
                                         }
                                     }
@@ -2414,9 +2580,11 @@ enter:
         }
     }
 
-guess:    
+guess:
+
     // Make a guess if all that didn't work
-    grid_state = grid_state->make_guess<verbose>();
+    grid_state = grid_state->make_guess<verbose>(triad_info);
+    current_entered_count += 0x101;     // increment high byte for the new grid_state, plus one for the guess made.
     no_guess_incr = 0;
     goto start;
 
@@ -2697,7 +2865,6 @@ int main(int argc, const char *argv[]) {
         printf("%10lld  %6.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
 #endif
-
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
         }
