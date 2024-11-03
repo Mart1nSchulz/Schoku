@@ -1,3 +1,4 @@
+// This code uses AVX2 instructions...
 /*
  * Schoku
  *
@@ -7,14 +8,42 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0 (original submission by Mirage)
+ * Version 0.1 (baseline)
  *
- * Note that this version does not work on Cygwin64.
+ * Basic changes:
+ * - instruction intrinsics instead of BitScan* functions.
+ * - added missing headers.
+ * - allow 1st line to contain text instead of puzzle
+ * - copy solution before freeing grid_state
+ * - avoid back tracking from first grid_state
+ *
+ * Basic performance measurement and statistics:
+ *
+ * data: 17-clue sudoku
+ * CPU:  Ryzen 7 4700U
+ *
+ * fastss version: 0.1
+ *      49151  puzzles entered
+ *    106.1ms   2.16µs/puzzle  solving time
+ *      31355  63.79%  puzzles solved without guessing
+ *      59001   1.20/puzzle  total guesses
+ *      40009   0.81/puzzle  total back tracks
+ *     379419   7.72/puzzle  total digits entered and retracted
+ *    1402612  28.54/puzzle  total 'rounds'
+ *    2628446  53.48/puzzle  naked sets found
+ *   10865444 221.06/puzzle  naked sets searched
+ *
  */
+#include <atomic>
+#include <chrono>
 #include <stdio.h>
+#include <string.h>
+#include <ctype.h>
 #include <omp.h>
 #include <stdbool.h>
 #include <intrin.h>
+
+const char *version_string = "0.1";
 
 // lookup tables that may or may not speed things up by avoiding division
 static const unsigned char box_index[81] = {
@@ -64,6 +93,20 @@ static const unsigned char box_start[81] = {
     54, 54, 54, 57, 57, 57, 60, 60, 60,
     54, 54, 54, 57, 57, 57, 60, 60, 60
 };
+
+// stats and command line options
+int reportstats     = 0; // collect and report some statistics
+
+signed char *output;
+
+std::atomic<long> solved_count(0);          // puzzles solved
+std::atomic<long long> guesses(0);          // how many guesses did it take
+std::atomic<long long> trackbacks(0);       // how often did we back track
+std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
+std::atomic<long long> past_naked_count(0); // how often do we get past the naked single serach
+std::atomic<long long> naked_sets_searched(0); // how many naked sets did we search for
+std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
+std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
 
 static void add_column_indices(unsigned long long indices[2], unsigned char i) {
     indices[0] |= 0x8040201008040201ULL << column_index[i];
@@ -140,8 +183,6 @@ static void enter_digit(struct GridState* grid_state, signed char digit, unsigne
     }
 }
 
-static long long guesses = 0;
-
 static struct GridState* make_guess(struct GridState* grid_state) {
     // Make a guess for the cell with the least candidates. The guess will be the lowest
     // possible digit for that cell. If multiple cells have the same number of candidates, the 
@@ -154,12 +195,13 @@ static struct GridState* make_guess(struct GridState* grid_state) {
     // Find the cell with fewest possible candidates
     unsigned long long to_visit;
     unsigned long guess_index = 0;
-    unsigned long i_rel;
+    int i_rel;
     unsigned short cnt;
     unsigned short best_cnt = 16;
     
     to_visit = unlocked[0];
-    while (_BitScanForward64(&i_rel, to_visit) != 0) {
+    while (to_visit != 0 ) {
+		i_rel = _tzcnt_u64(to_visit);
         to_visit &= ~(1ULL << i_rel);
         cnt = __popcnt16(candidates[i_rel]);
         if (cnt < best_cnt) {
@@ -168,7 +210,8 @@ static struct GridState* make_guess(struct GridState* grid_state) {
         }
     }
     to_visit = unlocked[1];
-    while (_BitScanForward64(&i_rel, to_visit) != 0) {
+    while (to_visit != 0 ) {
+		i_rel = _tzcnt_u64(to_visit);
         to_visit &= ~(1ULL << i_rel);
         cnt = __popcnt16(candidates[i_rel + 64]);
         if (cnt < best_cnt) {
@@ -178,8 +221,7 @@ static struct GridState* make_guess(struct GridState* grid_state) {
     }
     
     // Find the first candidate in this cell
-    unsigned long digit;
-    _BitScanReverse(&digit, candidates[guess_index]);
+    int digit = __bsrd(candidates[guess_index]);
     
     // Create a copy of the state of the grid to make back tracking possible
     struct GridState* new_grid_state = (struct GridState*) malloc(sizeof(struct GridState));
@@ -208,14 +250,20 @@ static struct GridState* track_back(struct GridState* grid_state) {
     // Go back to the state when the last guess was made
     // This state had the guess removed as candidate from it's cell
     
-    struct GridState* old_grid_state = grid_state->prev;
-    free(grid_state);
+	if (grid_state->prev) {
+	    struct GridState* old_grid_state = grid_state->prev;
+    	free(grid_state);
+	    return old_grid_state;
+	} else {
+		// This only happens when the puzzle is not valid
+		fprintf(stderr, "No solution found!\n");
+		exit(0);
+	}
     
-    return old_grid_state;
 }
 
 
-static bool solve(signed char grid[81]) {
+static bool solve(signed char grid[81], int line) {
 
     struct GridState* grid_state = (struct GridState*) malloc(sizeof(struct GridState));
     grid_state->prev = 0;
@@ -226,6 +274,12 @@ static bool solve(signed char grid[81]) {
     unlocked[1] = 0x1ffffULL;
     updated[0] = unlocked[0];
     updated[1] = unlocked[1];
+
+    unsigned long long my_digits_entered_and_retracted = 0;
+    unsigned long long my_naked_sets_searched = 0;
+    unsigned char no_guess_incr = 1;
+
+    unsigned int my_past_naked_count = 0;
     
     {
         signed char digit;
@@ -278,7 +332,14 @@ static bool solve(signed char grid[81]) {
                 // Check if any cell has zero candidates
                 if (_mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()))) {
                     // Back track, no solutions along this path
+                    GridState *old_grid_state = grid_state;
                     grid_state = track_back(grid_state);
+                    trackbacks++;
+                    if ( reportstats ) {
+                        my_digits_entered_and_retracted += 
+                            (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                          + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                    }
                     goto start;
                 } else {
                     unsigned short m;
@@ -293,11 +354,8 @@ static bool solve(signed char grid[81]) {
                     int mask = _mm256_movemask_epi8(_mm256_and_si256(a, u));
                     
                     if (mask) {
-                        unsigned long index, digit;
-                        _BitScanForward(&index, mask);
-                        index = (index >> 1) + i;                            
-                        _BitScanReverse(&digit, candidates[index]);
-                        enter_digit(grid_state, (signed char) digit, index);
+                        int index = (_tzcnt_u32(mask)>>1) + i;
+                        enter_digit(grid_state, __bsrd(candidates[index]), index);
                         found = true;
                     }
                 }
@@ -305,13 +363,18 @@ static bool solve(signed char grid[81]) {
             if (unlocked[1] & (1ULL << (80-64))) {
                 if (candidates[80] == 0) {
                     // no solutions go back
+                    GridState *old_grid_state = grid_state;
                     grid_state = track_back(grid_state);
+                    trackbacks++;
+                    if ( reportstats ) {
+                        my_digits_entered_and_retracted += 
+                            (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                          + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                    }
                     goto start;
                 } else if (__popcnt16(candidates[80]) == 1) {
                     // Enter the digit and update candidates
-                    unsigned long digit;
-                    _BitScanReverse(&digit, candidates[80]);
-                    enter_digit(grid_state, (signed char) digit, 80);
+                    enter_digit(grid_state, __bsrd(candidates[80]), 80);
                     found = true;
                 }
             }
@@ -321,23 +384,35 @@ static bool solve(signed char grid[81]) {
     // Check if it's solved, if it ever gets solved it will be solved after looking for naked singles
     if ((unlocked[0] | unlocked[1]) == 0) {
         // Solved it
+        // Enter found digits into grid
+        for (unsigned char j = 0; j < 81; ++j) {
+            grid[j] = 49+__bsrd(candidates[j]);
+        }
+        
         // Free memory
         while (grid_state) {
             struct GridState* prev_grid_state = grid_state->prev;
+            if ( grid_state == 0 ) {
+                printf("Line %d: No solution found!\n", line);
+                return false;
+            }
+
             free(grid_state);
             grid_state = prev_grid_state;
         }
-        
-        // Enter found digits into grid
-        for (unsigned char j = 0; j < 81; ++j) {
-            unsigned long index;
-            _BitScanReverse(&index, candidates[j]);
-            grid[j] = (signed char) index + 49;
+        solved_count++;
+        no_guess_cnt += no_guess_incr;
+
+        if ( reportstats ) {
+            past_naked_count += my_past_naked_count;
+            naked_sets_searched += my_naked_sets_searched;
+            digits_entered_and_retracted += my_digits_entered_and_retracted;
         }
-        
         return true;
     }
-    
+
+    my_past_naked_count++;
+
     // Find hidden singles
     // Don't check the last column because it doesn't fit in the SSE register so it's not really worth checking
     {
@@ -365,31 +440,29 @@ static bool solve(signed char grid[81]) {
             
             // boxes aren't worth it
             
-            __m128i or_mask = _mm_or_si128(row_mask, column_mask);                
+            __m128i or_mask = _mm_or_si128(row_mask, column_mask);
             
             if (_mm_test_all_zeros(or_mask, _mm_sub_epi16(or_mask, ones))) {
-                
+
                 unsigned short m;
                 if (i < 64) {
                     m = (unsigned short) ((unlocked[0] >> i) & 0xff);
                 } else {
                     m = (unsigned short) ((unlocked[1] >> (i-64)) & 0xff);
                 }
-                
+
                 c = _mm_loadu_si128((__m128i*) &candidates[i]);
-                
+
                 __m128i a = _mm_cmpgt_epi16(_mm_and_si128(c, or_mask), _mm_setzero_si128());
                 __m128i u = _mm_cmpeq_epi16(_mm_and_si128(bit_mask, _mm_set1_epi16(m)), bit_mask);
                 int mask = _mm_movemask_epi8(_mm_and_si128(a, u));
-                
+
                 if (mask) {
-                    unsigned long index, digit;
-                    _BitScanForward(&index, mask);
+                    int index = __tzcnt_u32(mask);
                     
-                    index = index/2;
-                    
-                    int can = ((unsigned short*) &or_mask)[index];
-                    _BitScanForward(&digit, can);
+                    index >>= 1;
+
+                    int digit = __tzcnt_u16(((unsigned short*) &or_mask)[index]);
                     
                     index = index + i;
                     
@@ -399,7 +472,14 @@ static bool solve(signed char grid[81]) {
                 
             } else {
                 // no solutions go back
+                GridState *old_grid_state = grid_state;
                 grid_state = track_back(grid_state);
+                trackbacks++;
+                if ( reportstats ) {
+                    my_digits_entered_and_retracted += 
+                        (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                      + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                }
                 goto start;
             }
         }
@@ -415,8 +495,7 @@ static bool solve(signed char grid[81]) {
         
         for (unsigned char n = 0; n < 2; ++n) {
             while (to_visit_n[n]) {
-                unsigned long i_rel;
-                _BitScanForward64(&i_rel, to_visit_n[n]);
+                int i_rel = _tzcnt_u64(to_visit_n[n]);
                 
                 to_visit_n[n] ^= 1ULL << i_rel;
                 unsigned char i = (unsigned char) i_rel + 64*n;
@@ -432,10 +511,19 @@ static bool solve(signed char grid[81]) {
                     __m128i res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
                     s = __popcnt16(_mm_movemask_epi8(res)) >> 1;
                     s += candidates[i] == (candidates[i] | candidates[column_index[i]+72]);
+                    my_naked_sets_searched++;
                     if (s > cnt) {
+                        GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state);
+                        trackbacks++;
+                        if ( reportstats ) {
+                            my_digits_entered_and_retracted += 
+                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        }
                         goto start;
                     } else if (s == cnt) {
+                        naked_sets_found++;
                         add_column_indices(to_change, i);
                     }
 
@@ -444,10 +532,20 @@ static bool solve(signed char grid[81]) {
                     res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
                     s = __popcnt16(_mm_movemask_epi8(res)) >> 1;
                     s += candidates[i] == (candidates[i] | candidates[9*row_index[i]+8]);
+                    my_naked_sets_searched++;
+
                     if (s > cnt) {
+                        GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state);
+                        trackbacks++;
+                        if ( reportstats ) {
+                            my_digits_entered_and_retracted += 
+                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        }
                         goto start;
                     } else if (s == cnt) {
+                        naked_sets_found++;
                         add_row_indices(to_change, i);
                     }
                     
@@ -457,10 +555,19 @@ static bool solve(signed char grid[81]) {
                     res = _mm_cmpeq_epi16(a_i, _mm_or_si128(a_i, a_j));
                     s = __popcnt16(_mm_movemask_epi8(res)) >> 1;
                     s += candidates[i] == (candidates[i] | candidates[b+20]);
+                    my_naked_sets_searched++;
                     if (s > cnt) {
+                        GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state);
+                        trackbacks++;
+                        if ( reportstats ) {
+                            my_digits_entered_and_retracted += 
+                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
+                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        }
                         goto start;
                     } else if (s == cnt) {
+                        naked_sets_found++;
                         add_box_indices(to_change, i);
                     }
                                     
@@ -470,8 +577,7 @@ static bool solve(signed char grid[81]) {
                     // update candidates
                     for (unsigned char n = 0; n < 2; ++n) {
                         while (to_change[n]) {
-                            unsigned long j_rel;
-                            _BitScanForward64(&j_rel, to_change[n]);
+                            int j_rel = _tzcnt_u64(to_change[n]);
                             to_change[n] &= ~(1ULL << j_rel);
                             unsigned char j = (unsigned char) j_rel + 64*n;
                             
@@ -499,6 +605,7 @@ static bool solve(signed char grid[81]) {
     
     // Make a guess if all that didn't work
     grid_state = make_guess(grid_state);
+    no_guess_incr = 0;
     goto start;
     
 }
@@ -506,59 +613,108 @@ static bool solve(signed char grid[81]) {
 
 int main(int argc, char *argv[]) {
 
-    if (argc != 2) {
-        printf("Error! Pass the file name as argument\n");
-        return -1;
+    if ( argc > 0 ) {
+        argc--;
+        argv++;
+    }    
+
+    while ( argc && argv[0][0] == '-' ) {
+        if (argv[0][1] == 0) {
+            argv++; argc--;
+            break;
+        }
+        switch(argv[0][1]) {
+        case 'x':    // stats output
+             reportstats=1;
+             break;
+        }
+        argc--, argv++;
     }
     
-    FILE *f = fopen(argv[1], "rb");
+	auto starttime = std::chrono::steady_clock::now();
+
+    const char *ifn = argc > 0? argv[0] : "puzzles.txt";
+    
+    FILE *f = fopen(ifn, "rb");
     
     // test for files not existing
     if (f == 0) {
-        printf("Error! Could not open file %s\n", argv[1]);
+        fprintf(stderr, "Error! Could not open file %s\n", ifn);
         return -1;
     }
     
     // find length of file
     fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
+    size_t fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
     // deal with the part that says how many sudokus there are
-    signed char *string = malloc(fsize + 1);
+    signed char *string = (signed char *)malloc(fsize + 1);
     fread(string, 1, fsize, f);
     fclose(f);
 
-    size_t p = 0;
-    while (string[p] != 10) {
-        ++p;
-    }
-    ++p;
+// skip first line, unless it's a puzzle.
+    size_t pre = 0;
+	if ( !isdigit(string[0]) || string[81] != 10 ) {
+	    while (string[pre] != 10) {
+    	    ++pre;
+    	}
+    	++pre;
+	}
     
-    signed char *output = malloc(fsize*2 - p + 2);
-    memcpy(output, string, p);
-    
+    size_t post = 1;
+	if ( string[fsize-1] != 10 )
+		post = 0;
+
+	size_t npuzzles = (fsize - pre + (1-post))/82;
+	if ( (fsize -pre -post + 1) % 82 ) {
+		fprintf(stderr, "found %ld puzzles with %ld(start)+%ld(end) extra characters\n", (fsize - pre - post + 1)/82, pre, post);
+	}
+
+    signed char *output = (signed char *)malloc(npuzzles*2*82);
     // solve all sudokus and prepare output file
-    int i;
-    #pragma omp parallel for shared(string, output, fsize, p) schedule(dynamic)
-    for (i = fsize - p - 81; i >= 0; i-=82) {
+    size_t i;
+	signed char *string_pre = string+pre;
+
+#pragma omp parallel for shared(string_pre, npuzzles, output, fsize) schedule(dynamic)
+    for (i = 0; i < npuzzles*82; i+=82) {
         // copy unsolved grid
-        memcpy(&output[p+i*2], &string[p+i], 81);
-        memcpy(&output[p+i*2+82], &string[p+i], 81);
+        memcpy(&output[i*2], &string_pre[i], 81);
+        memcpy(&output[i*2+82], &string_pre[i], 81);
         // add comma and newline in right place
-        output[p+i*2 + 81] = ',';
-        output[p+i*2 + 163] = 10;
+        output[i*2 + 81] = ',';
+        output[i*2 + 163] = 10;
         // solve the grid in place
-        solve(&output[p+i*2+82]);
+        solve(&output[i*2+82], i/82+1);
     }
     
     // create output file
-    f = fopen("output.txt", "wb");
-    fwrite(output, 1, fsize*2 - p + 2, f);
+    const char *ofn = argc > 1? argv[1] : "solutions.txt";
+
+    f = fopen(ofn, "wb");
+    if (f == 0 && errno ) {
+        printf("Error opening output file %s: %s\n", ofn, strerror(errno));
+        exit(0);
+    }
+    fwrite(output, 1, npuzzles*2*82, f);
     fclose(f);    
 
     free(string);
     free(output);
+
+    if ( reportstats) {
+        long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
+        printf("fastss version: %s\n", version_string);
+        printf("%10ld  puzzles entered\n", npuzzles);
+		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+        printf("%10ld  %5.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
+        printf("%10lld  %5.2f/puzzle  total guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
+        printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
+        printf("%10lld  %5.2f/puzzle  total digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/(double)solved_count.load());
+        printf("%10lld  %5.2f/puzzle  total 'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
+        printf("%10lld  %5.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
+        printf("%10lld %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+    }
 
     return 0;
 }

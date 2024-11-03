@@ -2,10 +2,10 @@ TARGET  := schoku
 EXT     := cpp
 
 XFLAGS :=
-CXX := gcc
+CXX := g++
 
 # these architecture flags are required!
-TARGET_ARCH := -mavx2
+TARGET_ARCH := -mavx2 -mbmi
 
 # preprocessor options
 DFLAGS :=
@@ -29,8 +29,7 @@ CFLAGS   := $(OFLAGS) -fopenmp -pthread -Wall -Wextra $(DFLAGS) $(XFLAGS)
 # The default is -std=gnu++17 in gcc 11.4
 # The minimum required level is std=gnu++11
 # The gnu* flavour is required to find the ftruncate Posix function.
-#CXXFLAGS := -std=gnu++17 $(CFLAGS)
-CXXFLAGS := -x c $(OFLAGS)
+CXXFLAGS := -std=gnu++17 $(CFLAGS)
 LDFLAGS  := -fopenmp -pthread
 
 SOURCE := $(foreach ext, $(EXT), $(wildcard $(SRC_DIR)/*.$(ext)))
