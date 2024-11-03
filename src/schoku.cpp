@@ -8,35 +8,48 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.6  (cleanup)
+ * Version 0.7  (triads)
  *
  * Performance changes:
- * - move enter loop into solve (beware: more spaghetti logic)
- * - the enter loop detects additional naked singles
- * - add bit96_t
- *   in order to tighten GridState
- * - combined column and box in naked set search
+ * - full implementation of triad processing
+ *   both full triad set detection (with OPT_TRIAD_RES) and removal of extra triad candidates
+ * - process columns first in the hidden singles search to gain some performance.
  *
  * Functional changes:
- * - report complementary sets as 'hidden', pairs as 'pairs'
+ * - allow OPT_TRIAD_RES and OPT_SETS as compilation options
  *
  * Performance measurement and statistics:
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.6
+ * schoku version: 0.7
+ * compile options:
+ *     49151  1795772/s  puzzles solved
+ *    27.1ms    0.55µs/puzzle  solving time
+ *     37834   76.98%  puzzles solved without guessing
+ *     35124    0.71/puzzle  guesses
+ *     24508    0.50/puzzle  back tracks
+ *    338098    6.88/puzzle  digits entered and retracted
+ *   1460259   29.71/puzzle  'rounds'
+ *     22698    0.46/puzzle  triads resolved
+ *    584439   11.89/puzzle  triad updates
+ *       833  bi-value universal graves detected
+ *
+ * compile options: OPT_TRIAD_RES OPT_SETS
  *     49151  puzzles entered
- *     49151  1183663/s  puzzles solved
- *    41.5ms   0.84µs/puzzle  solving time
- *     34234   69.65%  puzzles solved without guessing
- *     38484    0.78/puzzle  guesses
- *     24011    0.49/puzzle  back tracks
- *    321296    6.54/puzzle  digits entered and retracted
- *   1526646   31.06/puzzle  'rounds'
- *     88712    1.80/puzzle  naked sets found
- *   3915828   79.67/puzzle  naked sets searched
- *       838  bi-value universal graves detected
+ *     49151  1639192/s  puzzles solved
+ *    30.0ms    0.61µs/puzzle  solving time
+ *     42079   85.61%  puzzles solved without guessing
+ *     14266    0.29/puzzle  guesses
+ *      8663    0.18/puzzle  back tracks
+ *    118220    2.41/puzzle  digits entered and retracted
+ *   1392164   28.32/puzzle  'rounds'
+ *    104475    2.13/puzzle  triads resolved
+ *    599919   12.21/puzzle  triad updates
+ *     17665    0.36/puzzle  naked sets found
+ *   1001824   20.38/puzzle  naked sets searched
+ *      1140  bi-value universal graves detected
  *
  */
 #include <atomic>
@@ -53,9 +66,23 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-const char *version_string = "0.6";
+const char *version_string = "0.7";
 
 const char *compilation_options = 
+// OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well together
+// for excellent statistics.
+#ifdef OPT_TRIAD_RES
+// Triad resolution examines all triads and if exactly three candidates are present
+// marks them as sets. A small penalty to speed but a boost to statistics overall.
+//
+"OPT_TRIAD_RES "
+#endif
+#ifdef OPT_SETS
+// Naked sets detection is a main feature.  The complement of naked sets are hidden sets,
+// which are labeled as such when they occur.
+//
+"OPT_SETS "
+#endif
 ""
 ;
 
@@ -286,6 +313,14 @@ const bit128_t box_bitmasks[9] = {
     ((bit128_t*)small_index_lut[8][Box])->u128
 };
 
+    // Mapping of the row triads processing order to canonical order (not considering the
+    // gaps every 10 elements):
+    const unsigned char row_triad_reverse_canonical_map[27] = {
+        0,  1,  2,   9, 10, 11,  18, 19, 20,
+        3,  4,  5,  12, 13, 14,  21, 22, 23,
+        6,  7,  8,  15, 16, 17,  24, 25, 26
+    };
+
 const unsigned char *row_index = index_by_kind[Row];
 const unsigned char *column_index = index_by_kind[Col];
 const unsigned char *box_index = index_by_kind[Box];
@@ -406,6 +441,8 @@ std::atomic<long long> past_naked_count(0); // how often do we get past the nake
 std::atomic<long long> naked_sets_searched(0); // how many naked sets did we search for
 std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
 std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
+std::atomic<long> triads_resolved(0);       // how many triads did we resolved
+std::atomic<long> triad_updates(0);         // how many triads did cancel candidates
 
 inline unsigned char tzcnt_and_mask(unsigned long long &mask) {
     unsigned char ret = _tzcnt_u64(mask);
@@ -565,6 +602,17 @@ inline void grid_dump(unsigned short *candidates) {
     grid_dump(candidates, stdout);
 }
 
+#ifdef OPT_TRIAD_RES
+// TriadInfo
+// for passing triad information.
+//
+typedef struct {
+    unsigned short row_triads_wo_musts[36];   //  triads minus tmusts for guessing
+    unsigned short col_triads_wo_musts[36];   //  triads minus tmusts for guessing
+
+} TriadInfo;
+#endif
+
 // The maximum levels of guesses is given by GRIDSTATE_MAX.
 // On average, the number of levels is pretty low, but we want to be 'reasonably' sure
 // that we don't bust the envelope.
@@ -589,6 +637,9 @@ public:
     bit96_t updated;                  // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
     bit128_t unlocked;                // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
     bit128_t set23_found[3];          // for keeping track of found sets of size 2 and 3
+#ifdef OPT_TRIAD_RES
+    unsigned int triads_unlocked[2];  // unlocked row and col triads (#candidates >3), 27 bits each
+#endif
 
 // GridState is normally copied for recursion
 // Here we initialize the starting state including the puzzle.
@@ -599,6 +650,9 @@ inline void initialize(signed char grid[81]) {
     updated.u64[0] = ~(unsigned long long)0;
     updated.u32[2] = 0x1ffff;
 
+#ifdef OPT_TRIAD_RES
+    triads_unlocked[0] = triads_unlocked[1] = 0x1ffLL | (0x1ffLL<<10) | (0x1ffLL<<20);
+#endif
     set23_found[0] = set23_found[1] = set23_found[2] = {__int128 {0}};
 
     stackpointer = 0;
@@ -808,6 +862,15 @@ bool solve(signed char grid[81], GridState stack[], int line) {
     unsigned long long *unlocked = grid_state->unlocked.u64;
     unsigned short* candidates;
 
+#ifdef OPT_TRIAD_RES
+    // the low byte is the real count, while
+    // the high byte is increased/decreased with each guess/back track
+    // init count of resolved cells to the size of the initial set
+    unsigned short current_entered_count = 81 - _popcnt64(unlocked[0]) - _popcnt32(unlocked[1]);
+
+    unsigned short last_entered_count_col_triads = 0;
+#endif
+
     int unique_check_mode = 0;
     bool nonunique_reported = false;
 
@@ -854,6 +917,11 @@ back:
         }
         return true;
     }
+
+#ifdef OPT_TRIAD_RES
+    current_entered_count  = ((grid_state-1)->stackpointer)<<8;        // back to previous stack.
+    current_entered_count += _popcnt64((grid_state-1)->unlocked.u64[0]) + _popcnt32((grid_state-1)->unlocked.u64[1]);
+#endif
 
     // collect some guessing stats
     if ( verbose && reportstats ) {
@@ -920,6 +988,9 @@ enter:
         }
     
         candidates[e_i] = e_digit;
+#ifdef OPT_TRIAD_RES
+        current_entered_count++;
+#endif
 
         add_and_mask_all_indices(&to_update, &grid_state->unlocked, e_i);
 
@@ -1189,12 +1260,92 @@ enter:
     // Compress to a bit vector and check against the unlocked cells. If any single was found
     // isolate it, rince and repeat.
     //
-    {
+    // Algorithm 3
+    // Definition: An intersection of row/box and col/box consisting of three cells
+    // are called "triad" in the following.
+    // There are 27 horizontal (row-based) triads and 27 vertical (col-based) triads.
+    // For each band of three aligned boxes there are nine triads.
+    // The collection of the triads data (Algorithm 3 Part 1) is intermingled with 
+    // that of algorithm 2 for speed.
+    // Triads in their own right are significant for two reasons:
+    // First, a triad that has 3 candidates is a special case of set that is easily detected.
+    // The detection occurs in part 2 of Algorithm 3 by running a popcount on the collected
+    // triad candidates.  The result is kept in form of a bitvector of 'unlocked triads'
+    // for rows and columns.  For columns, the unlocked state is determined directly from
+    // the general unlocked bit vector.  For rows, the order in which the row triads are
+    // stored is not compatible with the general unlocked bit vector.  Instead, all locked
+    // row triads are individually removed from their row unlocked bit vector.
+    // Part 2 of Algorithm 3 allows to determine which candidate value can only occur
+    // in a specific triad and not in the other triads of the row/column and box.
+    // Part 3 of Algorithm 3 is optional.
+    // It allows to fully detect all fully resolved triads.
+    // Terminology:
+    // - a "must" is a set of candidates for a triad containing those candidates that cannot occur
+    // in any other triad of the same block or row/column.
+    // - a "must not" (mustnt for short) is a set of candidates that must not occur in the given triad.
+    // For starters, the complement of the candidates that occur in the triad cells is a
+    // "must not" (not necessarily the most complete one).
+    // Trivially, in a solved Sudoku puzzle, each "must" has three candidates and all "must not"
+    // have six candidates.
+    // - the "peer" triads of a given triad share either box or the row/column with the given "triad".
+    // The following holds since each row/column or box has a set of candidates and the
+    // triads are intersections of a given row/column with the box:
+    // - given a set of three 'peered' triads for each row/column and box each triad is
+    // peered with two triads of  the same row and with two triads of the same box,
+    // - If a given candidate value does not occur in either of the peer pairs (peer-mustnt),
+    //   this triad must contain that candidate value (must).
+    // - Any candidate only occurring in a a triad (must) because if doesn't occur in
+    //   either its box peers or its row/column peers cannot occur in any of the pair of peers.
+    // - Since 3 is the upper limit of must candidates, once these three are known from
+    //   part 2 of the algorithm, these become the fixed 'must' set for the triad.
+    //   The triad is then called "resolved".
+    //
+    // We can start with the mustnt for all triads of a band of boxes, compute the intersection 
+    // pairs of peer-mustnt (horizontally and vertically) and join the two results.
+    // This is then a "must" of the given triad, and augmented by the must if the triad is resolved.
+    // Using the peers musts, their union is a "must not" for the given triad.
+    // By joining it to the orginal "must not" we obtain an equal or super set for the new "must not".
+    // This "must not" in turn can then be be applied to remove the excessive candidates from
+    // the triad.
+    //
+    // These computations are easily be implemented as SIMD operations.
+    //
+    // To recap: parts 1 - 3 of Algorithm 3 are fast and effective - espacially if the
+    // hidden single search is leveraged for the initial union of the triads' candidates.
+    //
+    // Part 2 and 3 are invoked after Algorithm 2 fails to detect any hidden single.
+    //
+    // col_triads consist of 9 triads per horizontal band (one vertical triad for each column);
+    // row_triads are captured 3 per row, 3 rows stacked vertically with the subsequent 3 rows
+    // offset by 3 (using the canonical numbering of row triads):
+    //    0,  1,  2,   9, 10, 11, 18, 19, 20, -
+    //    3,  4,  5,  12, 13, 14, 21, 22, 23, -
+    //    6,  7,  8,  15, 16, 17, 24, 25, 26
+    // SIMD Triad processing requires all triads of a given band to be positioned
+    // 3 horizontal triads side by side and 3 vertical triads in the same positions
+    // of the two other rows.  The ordering described above satisfies this requirement.
+    //
+    // For technical reasons, an (unused) 10th triad is injected between each set of 9 triads
+    // for a total of 29 triad values.
+    //
+    // various methods are used to efficiently save the triads in the processing order,
+    // which go beyond the end of the arrays normally needed.
+    unsigned short row_triads[36];   //  27 triads, in groups of 9 with a gap of 1
+    unsigned short col_triads[36];   //  27 triads, in groups of 9 with a gap of 1
+
+#ifdef OPT_TRIAD_RES
+    TriadInfo triad_info;
+#endif
         const __m256i mask9 { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ffLL, 0 };
+
+    // Algo 2 and Algo 3.1
+    {
+        const __m256i mask11hi { 0LL, 0LL, 0xffffLL<<48, ~0LL };
         const __m256i mask1ff { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL };
 
         __m256i column_or_tails[9];
         __m256i column_or_head = _mm256_setzero_si256();
+        __m256i col_triads_3, col_triads_2;
         unsigned char irow = 0;
         for (unsigned char i = 0; i < 81; i += 9, irow++) {
             // columns
@@ -1202,9 +1353,31 @@ enter:
             __m256i column_mask = _mm256_setzero_si256();
             {
                 if ( i == 0 ) {
+                    // A2 (cols)
                     // precompute 'tails' of the or'ed column_mask only once
                     // working backwords
-                    for (signed char j = 81-9; j > 0; j -= 9) {
+                    // 3 iterations, rows 8, 7 and 6.
+                    signed char j = 81-9;
+                    for ( ; j >= 54; j -= 9) {
+                        column_or_tails[j/9-1] = column_mask;
+                        column_mask = _mm256_or_si256(column_mask, *(__m256i_u*) &candidates[j]);
+                    }
+                    // A2 and A3.1.a
+                    // column_mask contains the third set of column-triads
+                    col_triads_3 = column_mask;
+                    // 3 iterations, rows 5, 4 and 3.
+                    col_triads_2 = _mm256_setzero_si256();
+                    for ( ; j >= 27; j -= 9) {
+                        column_or_tails[j/9-1] = _mm256_or_si256(col_triads_2,column_mask);
+                        col_triads_2 = _mm256_or_si256(col_triads_2, *(__m256i_u*) &candidates[j]);
+                    }
+                    // A2 and A3.1.a
+                    // col_triads_2 contains the second set of column-triads
+                    column_mask = _mm256_or_si256(col_triads_2, column_mask);
+                    // 2 iterations, rows 1 and 2.
+                    // the third set of column triads is computed below as part of the computed
+                    // 'head' or.
+                    for ( ; j > 0; j -= 9) {
                         column_or_tails[j/9-1] = column_mask;
                         column_mask = _mm256_or_si256(column_mask, *(__m256i_u*) &candidates[j]);
                     }
@@ -1265,6 +1438,16 @@ enter:
                 } else {  // i > 0
                     // leverage previously computed or'ed rows in head and tails.
                     column_or_head = column_mask = _mm256_or_si256(*(__m256i_u*) &candidates[i-9], column_or_head);
+                    if ( i == 27 ) {
+                        // A3.1.c
+                        // column_or_head now contains the or'ed rows 0-2.
+                        // Store all triads sequentially, paying attention to overlap.
+                        //
+                        _mm256_storeu_si256((__m256i *)col_triads, column_or_head);
+                        _mm256_storeu_si256((__m256i *)(col_triads+10), col_triads_2);
+                        // mask 5 hi triads to 0xffff, which will not trigger any checks
+                        _mm256_storeu_si256((__m256i *)(col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
+                    }
                     column_mask = _mm256_or_si256(column_or_tails[irow-1],column_mask);
                 }
                 // turn the or'ed rows into a mask for the singletons, if any.
@@ -1284,10 +1467,40 @@ enter:
             __m256i rowbox_or8;
             __m256i rowbox_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_box),_mm_set1_epi16(the9thcand_row));
 
+            __m256i row_triad_capture;
             {
                 __m256i c_ = c;
-                for (unsigned char j = 0; j < 7; ++j) {
-                    // rotate shift (1 2 3 4 5 6 7 8) -> (8 1 2 3 4 5 6 7)
+                // A2 and A3.1.b
+                // first lane for the row, 2nd lane for the box
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                    c_ = _mm256_alignr_epi8(c_, c_, 2);
+                    rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c_ = _mm256_alignr_epi8(c_, c_, 2);
+                rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                // triad capture, triad 3 of this row saved in pos 5
+                row_triad_capture = _mm256_or_si256(rowbox_or7, rowbox_9th);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c_ = _mm256_alignr_epi8(c_, c_, 2);
+                rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                // after three rounds we have 2 triads' candidates 0 and 1 in pos 7 and 2
+                // blend the two captured vectors to contain all three triads in pos 7 2 and 5
+                // shuffle the triads from pos 7,2,5 into pos 0,1,2
+                // spending 3 instructions on this: blend, shuffle, storeu
+                // a 'random' 4th unsigned short is overwritten by the next triad store
+                // (or is written into the gap 10th slot).
+                const unsigned char row_triads_lut[9] = {
+                       0, 10, 20, 3, 13, 23, 6, 16, 26 };
+                const __m256i shuff725to012 = _mm256_setr_epi8(14, 15,  4,  5, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,  -1, -1,
+                                                               -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+                row_triad_capture = _mm256_shuffle_epi8(_mm256_blend_epi16(rowbox_or7, row_triad_capture, 0x20),shuff725to012);
+                _mm_storeu_si64(&row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture));
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
+                    // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                     // first lane for the row, 2nd lane for the box
                     c_ = _mm256_alignr_epi8(c_, c_, 2);
                     rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
@@ -1425,9 +1638,332 @@ enter:
                 } // cand9
             }
         }   // for
+    } // Algo 2 and Algo 3.1
+
+#ifdef OPT_TRIAD_RES
+    { // Algo 3.3
+        const __m256i mask27 { -1LL, (long long int)0xffffffffffff00ffLL, (long long int)0xffffffff00ffffffLL, 0xffffffffffLL };
+
+        const __m256i low_mask  = _mm256_set1_epi8 ( 0x0f );
+        const __m256i threes    = _mm256_set1_epi8 ( 3 );
+        const __m256i word_mask = _mm256_set1_epi16 ( 0x00ff );
+        const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
+                                                   0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
+
+            // A3.2.1 (check col-triads)
+            // just a plain old popcount, but for both vectors interleaved
+            __m256i v1 = _mm256_loadu_si256((__m256i *)col_triads);
+            __m256i v2 = _mm256_loadu_si256((__m256i *)(col_triads+16));
+            __m256i lo1 = _mm256_and_si256 (v1, low_mask);
+            __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), low_mask );
+            __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
+            __m256i cnt12 = _mm256_shuffle_epi8 (lookup, hi1);
+            cnt11 = _mm256_add_epi8 (cnt11, cnt12);
+            __m256i res = _mm256_add_epi8 (cnt11, _mm256_bsrli_epi128(cnt11, 1));
+            __m256i lo2 = _mm256_and_si256 (v2, low_mask);
+            __m256i hi2 = _mm256_and_si256 (_mm256_srli_epi16 (v2, 4), low_mask );
+            __m256i cnt21 = _mm256_shuffle_epi8 (lookup, lo2);
+            __m256i cnt22 = _mm256_shuffle_epi8 (lookup, hi2);
+            cnt21 = _mm256_add_epi8 (cnt21, cnt22);
+            res = _mm256_and_si256 (res, word_mask );
+            res = _mm256_packus_epi16(res, _mm256_and_si256 (_mm256_add_epi8 (cnt21, _mm256_bsrli_epi128(cnt21, 1)), word_mask ));
+            res = _mm256_and_si256(_mm256_permute4x64_epi64(res, 0xD8), mask27);
+
+            // do this only if unlocked has been updated:
+            if ( last_entered_count_col_triads != current_entered_count) {
+                // the high byte is set to the stackpointer, so that this works
+                // across guess/backtrack
+                last_entered_count_col_triads = current_entered_count;
+                unsigned long long tr = unlocked[0];  // col triads - set if any triad cell is unlocked
+                tr |= (tr >> 9) | (tr >> 18) | (unlocked[1]<<(64-9)) | (unlocked[1]<<(64-18));
+                // mimick the pattern of col_triads, i.e. a gap of 1 after each group of 9.
+                if ( bmi2_support ) {
+                    tr = _pext_u64(tr, 0x1ffLL | (0x1ffLL<<27) | (0x1ffLL<<54));
+                    grid_state->triads_unlocked[Col] &= _pdep_u64(tr, (0x1ff)|(0x1ff<<10)|(0x1ff<<20));
+                } else {
+                    grid_state->triads_unlocked[Col] &= (tr & 0x1ff) | ((tr >> 17) & (0x1ff<<10)) | ((tr >> 34) & (0x1ff<<20));
+    }
+            }
+
+            unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
+            while (m) {
+                unsigned char tidx = tzcnt_and_mask(m);
+                unsigned short cands_triad = col_triads[tidx];
+                if ( verbose && debug ) {
+                    char ret[32];
+                    format_candidate_set(ret, cands_triad);
+                    printf("triad set (col): %-9s [%d,%d]\n", ret, tidx/10*3, tidx%10);
+                }
+                // mask off resolved triad:
+                grid_state->triads_unlocked[Col] &= ~(1LL << tidx);
+                unsigned char off = tidx%10+tidx/10*27;
+                grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
+                grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
+                triads_resolved++;
+            }
+        
+            // A3.2.2 (check row-triads)
+
+            // just a plain old popcount, but for both vectors interleaved
+            v1 = _mm256_loadu_si256((__m256i *)row_triads);
+            v2 = _mm256_loadu_si256((__m256i *)(row_triads+16));
+
+            lo1 = _mm256_and_si256 (v1, low_mask);
+            hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), low_mask );
+            cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
+            cnt12 = _mm256_shuffle_epi8 (lookup, hi1);
+            cnt11 = _mm256_add_epi8 (cnt11, cnt12);
+            res = _mm256_add_epi8 (cnt11, _mm256_bsrli_epi128(cnt11, 1));
+            lo2 = _mm256_and_si256 (v2, low_mask);
+            hi2 = _mm256_and_si256 (_mm256_srli_epi16 (v2, 4), low_mask );
+            cnt21 = _mm256_shuffle_epi8 (lookup, lo2);
+            cnt22 = _mm256_shuffle_epi8 (lookup, hi2);
+            cnt21 = _mm256_add_epi8 (cnt21, cnt22);
+            res = _mm256_and_si256 (res, word_mask );
+            res = _mm256_packus_epi16(res, _mm256_and_si256 (_mm256_add_epi8 (cnt21, _mm256_bsrli_epi128(cnt21, 1)), word_mask ));
+            res = _mm256_and_si256(_mm256_permute4x64_epi64(res, 0xD8), mask27);
+
+            m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
+
+            // the best that can be done for rows - remember that the the order of 
+            // row triads is not aligned with the order of cells.
+            bit128_t tr = grid_state->unlocked;   // for row triads - any triad cell unlocked
+
+            // to allow checking of unresolved triads
+            tr.u64[0]  |= (tr.u64[0] >> 1)  | (tr.u64[0] >> 2);
+            tr.u64[0]  |= ((tr.u64[1] & 1)  | ((tr.u64[1] & 2) >> 1))<<63; 
+            tr.u64[1]  |= (tr.u64[1] >> 1)  | (tr.u64[1] >> 2);
+
+            while (m) {
+                unsigned char tidx = tzcnt_and_mask(m);
+                unsigned char logical_tidx = tidx-tidx/10;
+                unsigned char ri  = logical_tidx/9+logical_tidx%9/3*3;
+                unsigned char tci = logical_tidx%3*3;
+                unsigned char off = ri*9+tci;
+                if ( !tr.check_indexbit(off)) {  // locked
+                    grid_state->triads_unlocked[Row] &= ~(1<<tidx);
+                    continue;
+                }
+
+                if ( verbose && debug ) {
+                    char ret[32];
+                    format_candidate_set(ret, row_triads[tidx]);
+                    printf("triad set (row): %-9s [%d,%d]\n", ret, ri, tci);
+                }
+
+                // mask off resolved triad:
+                grid_state->triads_unlocked[Row] &= ~(1LL << tidx);
+                grid_state->set23_found[Row].set_indexbits(0x7,off,3);
+                grid_state->set23_found[Box].set_indexbits(0x7,off,3);
+                triads_resolved++;
+            } // while
+    }   // Algo 3 Part 3
+#endif
+
+
+
+    {   // Algo 3 Part 2
+        // Note on nomenclature:
+        // - must / mustnt = candidates that must or must not occur in the triad.
+        // - t vs p prefix: t for triad (only applies to the triad), p for peers, i.e. what
+        //   the peers impose onto the triad. 
+        //
+        // The SIMD parallelism consists of computing tmustnt for three bands in parallel.
+        //
+        // Note that in principle, the below for-loop could be executed multiple times by
+        // using ~tmustnt in place of the col/row_triads input.
+        // 
+        const __m256i alltrue = _mm256_set1_epi16( 0xffff);
+        __m256i any_changes = _mm256_setzero_si256();
+
+        // mask for each line of 9 triad *must/*mustnt.
+        const __m256i mask = _mm256_setr_epi16( 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0, 0,
+                                                0x1ff, 0x1ff, 0x1ff, 0,     0,     0,     0, 0);
+        // rotation of groups of 3 triads *must/*mustnt.
+        const __m256i rot_hpeers = _mm256_setr_epi8( 2,3,4,5,0,1, 8, 9,10,11, 6, 7,-1,-1,-1,-1,
+                                                     2,3,4,5,0,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+        // shuffle within tmustnt to setup for aligned 9 triads.
+        const __m256i shuff_tmustnt = _mm256_setr_epi8( -1,-1,-1,-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,
+                                                        -1,-1,-1,-1, 4, 5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+
+
+        for (int type=1; type>=0; type--) {	// row = 0, col = 1
+
+            unsigned short *triads   = type==0?row_triads:col_triads;
+#if OPT_TRIAD_RES
+            unsigned short *wo_musts = type==0?triad_info.row_triads_wo_musts:triad_info.col_triads_wo_musts;
+#endif
+            unsigned short *ptriads  = triads;
+            __m256i pmustnt[2][3] = {mask, mask, mask, mask, mask, mask};
+            __m256i tmustnt[3];
+            
+            // first load triad candidates and compute peer based pmustnt
+
+            // i=0 (manually unrolled loop)
+                // tmustnt computed from all candidates in row/col_triads
+                __m256i tmustnti = _mm256_andnot_si256(_mm256_loadu2_m128i((__m128i*)&ptriads[6], (__m128i*)ptriads), mask);
+                tmustnt[0] = tmustnti;
+                // compute peer-based pmustnt
+                // vertical peers
+                pmustnt[0][1] = _mm256_and_si256(pmustnt[0][1], tmustnti);
+                pmustnt[0][2] = _mm256_and_si256(pmustnt[0][2], tmustnti);
+
+                // horizontal peers
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][0] = _mm256_and_si256(pmustnt[1][0], tmustnti);
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][0] = _mm256_and_si256(pmustnt[1][0], tmustnti);
+            // i=1
+                ptriads += 10;
+                tmustnti = _mm256_andnot_si256(_mm256_loadu2_m128i((__m128i*)&ptriads[6], (__m128i*)ptriads), mask);
+                tmustnt[1] = tmustnti;
+                // vertical peers
+                pmustnt[0][0] = _mm256_and_si256(pmustnt[0][0], tmustnti);
+                pmustnt[0][2] = _mm256_and_si256(pmustnt[0][2], tmustnti);
+
+                // horizontal peers
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][1] = _mm256_and_si256(pmustnt[1][1], tmustnti);
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][1] = _mm256_and_si256(pmustnt[1][1], tmustnti);
+            // i=2
+                ptriads += 10;
+                tmustnti = _mm256_andnot_si256(_mm256_loadu2_m128i((__m128i*)&ptriads[6], (__m128i*)ptriads), mask);
+                tmustnt[2] = tmustnti;
+                // vertical peers
+                pmustnt[0][0] = _mm256_and_si256(pmustnt[0][0], tmustnti);
+                pmustnt[0][1] = _mm256_and_si256(pmustnt[0][1], tmustnti);
+
+                // horizontal peers
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][2] = _mm256_and_si256(pmustnt[1][2], tmustnti);
+                tmustnti = _mm256_shuffle_epi8(tmustnti, rot_hpeers);
+                pmustnt[1][2] = _mm256_and_si256(pmustnt[1][2], tmustnti);
+
+            // second, compute tmust and propagate it to its peers
+            // combine the pmustnt:
+                __m256i tmust0 = _mm256_or_si256(pmustnt[0][0], pmustnt[1][0]);
+                __m256i tmust1 = _mm256_or_si256(pmustnt[0][1], pmustnt[1][1]);
+                __m256i tmust2 = _mm256_or_si256(pmustnt[0][2], pmustnt[1][2]);
+
+#if OPT_TRIAD_RES
+                // tmust:
+                // add to tmusts triads that are locked (exactly 3 candidates)
+                // another side task is to put aside data identifying triad candidate sets
+                // minus the tmusts, that will be useful for finding good guesses.
+                unsigned int tul1 = grid_state->triads_unlocked[type] & (0x3f | (0x3f<<10) | (0x3f<<20));
+                unsigned int tul2 = (grid_state->triads_unlocked[type]<<2) & (0x700 | (0x700<<10) | (0x700<<20));
+                __m256i triadsv = _mm256_loadu2_m128i((__m128i*)&triads[6], (__m128i*)triads);
+                tmust0 = _mm256_or_si256(tmust0, _mm256_andnot_si256(expand_bitvector((tul1 & 0x3f) | (tul2 & 0x700)),
+                                                 triadsv));
+                triadsv = _mm256_andnot_si256(tmust0, triadsv);
+                _mm_storeu_si128((__m128i*)wo_musts, _mm256_castsi256_si128(triadsv));
+                *(unsigned long long*)(&wo_musts[6]) = _mm256_extract_epi64(triadsv, 2);
+                tul1 >>= 10;
+                tul2 >>= 10;
+                triadsv = _mm256_loadu2_m128i((__m128i*)&triads[16], (__m128i*)&triads[10]);
+                tmust1 = _mm256_or_si256(tmust1, _mm256_andnot_si256(expand_bitvector((tul1 & 0x3f) | (tul2 & 0x700)),
+                                                     triadsv));
+                triadsv = _mm256_andnot_si256(tmust1, triadsv);
+                _mm_storeu_si128((__m128i*)&wo_musts[10], _mm256_castsi256_si128(triadsv));
+                *(unsigned long long*)(&wo_musts[16]) = _mm256_extract_epi64(triadsv, 2);
+                tul1 >>= 10;
+                tul2 >>= 10;
+                triadsv = _mm256_loadu2_m128i((__m128i*)&triads[26], (__m128i*)&triads[20]);
+                tmust2 = _mm256_or_si256(tmust2, _mm256_andnot_si256(expand_bitvector((tul1 & 0x3f) | (tul2 & 0x700)),
+                                                     triadsv));
+                triadsv = _mm256_andnot_si256(tmust2, triadsv);
+                _mm_storeu_si128((__m128i*)&wo_musts[20], _mm256_castsi256_si128(triadsv));
+                *(unsigned long long*)(&wo_musts[26]) = _mm256_extract_epi64(triadsv, 2);
+#endif
+            // i=0 (manually unrolled loop)
+                // augment peer-based tmustnt by propagating the constraint (tmusti)
+                // vertical peers
+                tmustnt[1] = _mm256_or_si256(tmustnt[1], tmust0);
+                tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust0);
+
+                // horizontal peers
+                tmust0 = _mm256_shuffle_epi8(tmust0, rot_hpeers);
+                tmustnt[0] = _mm256_or_si256(tmustnt[0], tmust0);
+                tmust0 = _mm256_shuffle_epi8(tmust0, rot_hpeers);
+                tmustnt[0] = _mm256_or_si256(tmustnt[0], tmust0);
+
+             // i=1                // vertical peers
+                tmustnt[0] = _mm256_or_si256(tmustnt[0], tmust1);
+                tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust1);
+
+                // horizontal peers
+                tmust1 = _mm256_shuffle_epi8(tmust1, rot_hpeers);
+                tmustnt[1] = _mm256_or_si256(tmustnt[1], tmust1);
+                tmust1 = _mm256_shuffle_epi8(tmust1, rot_hpeers);
+                tmustnt[1] = _mm256_or_si256(tmustnt[1], tmust1);
+
+             // i=2
+                // vertical peers
+                tmustnt[0] = _mm256_or_si256(tmustnt[0], tmust2);
+                tmustnt[1] = _mm256_or_si256(tmustnt[1], tmust2);
+
+                // horizontal peers
+                tmust2 = _mm256_shuffle_epi8(tmust2, rot_hpeers);
+                tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust2);
+                tmust2 = _mm256_shuffle_epi8(tmust2, rot_hpeers);
+                tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust2);
+
+            ptriads = triads;
+            // compare tmustnt with the triads.
+            for ( int i=0; i<3; i++, ptriads+=10) {
+                // rotate left by 4 bytes to align the 9 constraints for comparison.
+                __m256i flip = _mm256_permute2f128_si256(tmustnt[i], tmustnt[i], 1);
+                tmustnt[i]   = _mm256_shuffle_epi8(tmustnt[i], shuff_tmustnt);
+                tmustnt[i]   = _mm256_alignr_epi8(flip, tmustnt[i], 4);
+                __m256i tmp = _mm256_and_si256(_mm256_cmpgt_epi16(*(__m256i_u*)ptriads,_mm256_andnot_si256(tmustnt[i], *(__m256i_u*)ptriads)),mask9);
+                any_changes = _mm256_or_si256(any_changes,tmp);
+                if ( _mm256_testz_si256(alltrue,tmp)) {
+                    continue;
+                }
+                // remove triad candidate values that appear in tmustnt.
+                unsigned long long m = compress_epi16_boolean<true>(tmp);
+                while (m) {
+                    unsigned char i_rel = tzcnt_and_mask(m)>>1;
+                    unsigned char tindx = i*9+i_rel;
+                    unsigned char tpos  = type==0 ? row_triad_reverse_canonical_map[tindx]*3 : i*27+i_rel;
+                    unsigned short to_remove = ((__v16hu)tmustnt[i])[i_rel] & triads[i*10+i_rel];
+                    if ( verbose && debug ) {
+                            char ret[32];
+                            format_candidate_set(ret, to_remove);
+                            printf("%s triad update \\%-5s at [%d,%d]\n", type == 0? "row":"col",
+                                   ret, tpos/9, tpos%9 );
+                    }
+                    // tracking
+                    unsigned char pcnt = _popcnt32(triads[i*10+i_rel] & ~to_remove);
+                    if ( pcnt == 3 ) {
+                       if ( type == 0 ) {
+                          grid_state->set23_found[Row].set_indexbits(7,tpos,3);
+                          grid_state->set23_found[Box].set_indexbits(7,tpos,3);
+                          grid_state->updated.set_indexbits(7,tpos,3);
+                       } else {
+                          unsigned b = 1|(1<<9)|(1<<18);
+                          grid_state->set23_found[Col].set_indexbits(b,tpos,19);
+                          grid_state->set23_found[Box].set_indexbits(b,tpos,19);
+                          grid_state->updated.set_indexbits(b,tpos,3);
+                       }
+                       triads_resolved++;
+                    }
+                    for ( unsigned char k=0; k<3; k++, tpos += type==0?1:9) {
+                        candidates[tpos] &= ~to_remove;
+                        triad_updates++;
+                    }
+                }
+            }
+        } // for type (cols,rows)
+        if ( !_mm256_testz_si256(alltrue, any_changes) ) {
+            goto start;
+        }
     }
 
-// Algorithm 3 - Find naked sets
+#ifdef OPT_SETS
+
+// Algorithm 4 - Find naked sets
 // For each possible combination of candidates of size K, check for every section
 // whether there are exactly K cells that contain only this combination of candidates.
 // Back track when the number of found cells exceeds K.
@@ -1751,6 +2287,7 @@ enter:
         grid_state->updated.u64[0] = to_visit_n.u64[0];
         grid_state->updated.u32[2] = to_visit_n.u64[1];
     }
+#endif
 
     bit128_t bivalues;
     {
@@ -2154,8 +2691,12 @@ int main(int argc, const char *argv[]) {
         printf("%10lld  %6.2f/puzzle  back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
+        printf( "%10ld  %6.2f/puzzle  triads resolved\n", triads_resolved.load(), triads_resolved.load()/(double)solved_count.load());
+        printf( "%10ld  %6.2f/puzzle  triad updates\n", triad_updates.load(), triad_updates.load()/(double)solved_count.load());
+#ifdef OPT_SETS
         printf("%10lld  %6.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+#endif
 
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
