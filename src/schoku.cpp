@@ -8,45 +8,50 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.1 (baseline)
+ * Version 0.2
  *
- * Basic changes:
- * - instruction intrinsics instead of BitScan* functions.
- * - added missing headers.
- * - allow 1st line to contain text instead of puzzle
- * - copy solution before freeing grid_state
- * - avoid back tracking from first grid_state
+ * Performance changes:
+ * - memory mapped I/O
+ * - allocate GridState array once per thread
+ *   this significantly improves multi-threaded performance
+ * - precompute data for the hidden single search
  *
  * Basic performance measurement and statistics:
  *
  * data: 17-clue sudoku
  * CPU:  Ryzen 7 4700U
  *
- * fastss version: 0.1
- *      49151  puzzles entered
- *    106.1ms   2.16µs/puzzle  solving time
- *      31355  63.79%  puzzles solved without guessing
- *      59001   1.20/puzzle  total guesses
- *      40009   0.81/puzzle  total back tracks
- *     379419   7.72/puzzle  total digits entered and retracted
- *    1402612  28.54/puzzle  total 'rounds'
- *    2628446  53.48/puzzle  naked sets found
- *   10865444 221.06/puzzle  naked sets searched
+ * fastss version: 0.2
+ *     49151  puzzles entered
+ *    55.3ms   1.13µs/puzzle  solving time
+ *     31355  63.79%  puzzles solved without guessing
+ *     57149   1.16/puzzle  total guesses
+ *     38206   0.78/puzzle  total back tracks
+ *    506095  10.30/puzzle  total digits entered and retracted
+ *   1393073  28.34/puzzle  total 'rounds'
+ *   2609167  53.08/puzzle  naked sets found
+ *  10753332 218.78/puzzle  naked sets searched
  *
+ * Clearly, the naked sets are challenge.
  */
 #include <atomic>
 #include <chrono>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <assert.h>
+#include <fcntl.h>
 #include <omp.h>
 #include <stdbool.h>
 #include <intrin.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
-const char *version_string = "0.1";
+const char *version_string = "0.2";
 
 // lookup tables that may or may not speed things up by avoiding division
-static const unsigned char box_index[81] = {
+const unsigned char box_index[81] = {
     0, 0, 0, 1, 1, 1, 2, 2, 2,
     0, 0, 0, 1, 1, 1, 2, 2, 2,
     0, 0, 0, 1, 1, 1, 2, 2, 2,
@@ -58,7 +63,7 @@ static const unsigned char box_index[81] = {
     6, 6, 6, 7, 7, 7, 8, 8, 8
 };
 
-static const unsigned char column_index[81] = {
+const unsigned char column_index[81] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8,
     0, 1, 2, 3, 4, 5, 6, 7, 8,
     0, 1, 2, 3, 4, 5, 6, 7, 8,
@@ -70,7 +75,7 @@ static const unsigned char column_index[81] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8,
 };
 
-static const unsigned char row_index[81] = {
+const unsigned char row_index[81] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 1, 1, 1, 1, 1,
     2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -82,7 +87,7 @@ static const unsigned char row_index[81] = {
     8, 8, 8, 8, 8, 8, 8, 8, 8,
 };
 
-static const unsigned char box_start[81] = {
+const unsigned char box_start[81] = {
     0, 0, 0, 3, 3, 3, 6, 6, 6,
     0, 0, 0, 3, 3, 3, 6, 6, 6,
     0, 0, 0, 3, 3, 3, 6, 6, 6,
@@ -108,12 +113,12 @@ std::atomic<long long> naked_sets_searched(0); // how many naked sets did we sea
 std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
 std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
 
-static void add_column_indices(unsigned long long indices[2], unsigned char i) {
+inline void add_column_indices(unsigned long long indices[2], unsigned char i) {
     indices[0] |= 0x8040201008040201ULL << column_index[i];
     indices[1] |= 0x8040201008040201ULL >> (10-column_index[i]);
 }
 
-static void add_row_indices(unsigned long long indices[2], unsigned char i) {
+inline void add_row_indices(unsigned long long indices[2], unsigned char i) {
     switch (row_index[i]) {
         case 7:
             indices[0] |= 0x8000000000000000ULL;
@@ -127,19 +132,24 @@ static void add_row_indices(unsigned long long indices[2], unsigned char i) {
     }
 }
 
-static void add_box_indices(unsigned long long indices[2], unsigned char i) {
+inline void add_box_indices(unsigned long long indices[2], unsigned char i) {
     indices[0] |= 0x1c0e07ULL << box_start[i];
     indices[1] |= 0x0381c0e0ULL >> (60-box_start[i]);
 }
 
-struct GridState {
-    struct GridState* prev;                // last grid state before a guess was made, used for backtracking
+typedef struct {
     unsigned long long unlocked[2];        // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
     unsigned long long updated[2];        // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
     unsigned short candidates[81];        // which digits can go in this cell? Set bits correspond to possible digits
-};
+	unsigned short filler[5];
+    int	stackpointer;                     // this-1 == last grid state before a guess was made, used for backtracking
+// An array GridState[n] can use stackpointer to increment until it reaches n.
+// Similary, for back tracking, the relative GridState-1 is considered the ancestor
+// until stackpointer is 0. 
+// 
+} GridState;
 
-static void enter_digit(struct GridState* grid_state, signed char digit, unsigned char i) {
+inline void enter_digit(GridState* grid_state, unsigned short digit, unsigned char i) {
     // lock this cell and and remove this digit from the candidates in this row, column and box
     
     unsigned short* candidates = grid_state->candidates;
@@ -152,7 +162,7 @@ static void enter_digit(struct GridState* grid_state, signed char digit, unsigne
         unlocked[1] &= ~(1ULL << (i-64));
     }
     
-    candidates[i] = 1 << digit;
+    candidates[i] = digit;
     
     add_box_indices(to_update, i);
     add_column_indices(to_update, i);
@@ -183,7 +193,7 @@ static void enter_digit(struct GridState* grid_state, signed char digit, unsigne
     }
 }
 
-static struct GridState* make_guess(struct GridState* grid_state) {
+inline GridState* make_guess(GridState* grid_state) {
     // Make a guess for the cell with the least candidates. The guess will be the lowest
     // possible digit for that cell. If multiple cells have the same number of candidates, the 
     // cell with lowest index will be chosen. Also save the current grid state for tracking back
@@ -200,7 +210,7 @@ static struct GridState* make_guess(struct GridState* grid_state) {
     unsigned short best_cnt = 16;
     
     to_visit = unlocked[0];
-    while (to_visit != 0 ) {
+    while (to_visit != 0 && best_cnt > 2) {
 		i_rel = _tzcnt_u64(to_visit);
         to_visit &= ~(1ULL << i_rel);
         cnt = __popcnt16(candidates[i_rel]);
@@ -210,9 +220,9 @@ static struct GridState* make_guess(struct GridState* grid_state) {
         }
     }
     to_visit = unlocked[1];
-    while (to_visit != 0 ) {
-		i_rel = _tzcnt_u64(to_visit);
-        to_visit &= ~(1ULL << i_rel);
+    while (best_cnt > 2 && to_visit != 0 ) {
+		i_rel = _tzcnt_u32(to_visit);
+        to_visit &= ~(1UL << i_rel);
         cnt = __popcnt16(candidates[i_rel + 64]);
         if (cnt < best_cnt) {
             best_cnt = cnt;
@@ -221,16 +231,20 @@ static struct GridState* make_guess(struct GridState* grid_state) {
     }
     
     // Find the first candidate in this cell
-    int digit = __bsrd(candidates[guess_index]);
+	unsigned short digit = 1 << __bsrd(candidates[guess_index]);
     
     // Create a copy of the state of the grid to make back tracking possible
-    struct GridState* new_grid_state = (struct GridState*) malloc(sizeof(struct GridState));
-    memcpy(new_grid_state, grid_state, sizeof(struct GridState));
-    new_grid_state->prev = grid_state;
+    GridState* new_grid_state = grid_state+1;
+	if ( grid_state->stackpointer >= 31 ) {
+		fprintf(stderr, "Error: no GridState struct availabe\n");
+		exit(0);
+	}
+    memcpy(new_grid_state, grid_state, sizeof(GridState));
+	new_grid_state->stackpointer++;
     
-    // Remove the guessed candidate from the old grid because if we need to get back to the old grid
-    // we know the guess was wrong
-    grid_state->candidates[guess_index] &= ~(1 << digit);
+    // Remove the guessed candidate from the old grid
+    // when we get back here to the old grid, we know the guess was wrong
+    grid_state->candidates[guess_index] &= ~digit;
     if (guess_index < 64) {
         grid_state->updated[0] |= 1ULL << guess_index;
     } else {
@@ -238,7 +252,7 @@ static struct GridState* make_guess(struct GridState* grid_state) {
     }
     
     // Update candidates
-    enter_digit(new_grid_state, (signed char) digit, (unsigned char) guess_index);
+    enter_digit(new_grid_state, digit, (unsigned char) guess_index);
     
     guesses++;
     
@@ -246,27 +260,23 @@ static struct GridState* make_guess(struct GridState* grid_state) {
 }
 
 
-static struct GridState* track_back(struct GridState* grid_state) {
+inline GridState * track_back(GridState* grid_state, int line) {
     // Go back to the state when the last guess was made
     // This state had the guess removed as candidate from it's cell
     
-	if (grid_state->prev) {
-	    struct GridState* old_grid_state = grid_state->prev;
-    	free(grid_state);
-	    return old_grid_state;
+	if (grid_state->stackpointer) {
+	    return grid_state-1;
 	} else {
 		// This only happens when the puzzle is not valid
-		fprintf(stderr, "No solution found!\n");
+		fprintf(stderr, "Line %d: No solution found!\n", line);
 		exit(0);
 	}
     
 }
 
 
-static bool solve(signed char grid[81], int line) {
+static bool solve(signed char grid[81], GridState *grid_state, int line) {
 
-    struct GridState* grid_state = (struct GridState*) malloc(sizeof(struct GridState));
-    grid_state->prev = 0;
     unsigned long long* unlocked = grid_state->unlocked;
     unsigned long long* updated = grid_state->updated;
     unsigned short* candidates = grid_state->candidates;
@@ -333,12 +343,12 @@ static bool solve(signed char grid[81], int line) {
                 if (_mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()))) {
                     // Back track, no solutions along this path
                     GridState *old_grid_state = grid_state;
-                    grid_state = track_back(grid_state);
+                    grid_state = track_back(grid_state, line);
                     trackbacks++;
                     if ( reportstats ) {
-                        my_digits_entered_and_retracted += 
-                            (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                          + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        my_digits_entered_and_retracted +=
+                                (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                              + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                     }
                     goto start;
                 } else {
@@ -348,33 +358,38 @@ static bool solve(signed char grid[81], int line) {
                     } else {
                         m = (unsigned short) (unlocked[1] & 0xffff);
                     }                        
+                    if ( m ) {
+					    // remove least significant digit and compare to 0:
+					    // (c = c & (c-1)) == 0  => naked single
+                        __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
+						// expand m to a boolean vector:
+                        __m256i u = _mm256_cmpeq_epi16(_mm256_and_si256(bit_mask, _mm256_set1_epi16(m)), bit_mask);
+					    // mask out the locked singles:
+                        int mask = _mm256_movemask_epi8(_mm256_and_si256(a, u));
                     
-                    __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
-                    __m256i u = _mm256_cmpeq_epi16(_mm256_and_si256(bit_mask, _mm256_set1_epi16(m)), bit_mask);
-                    int mask = _mm256_movemask_epi8(_mm256_and_si256(a, u));
-                    
-                    if (mask) {
-                        int index = (_tzcnt_u32(mask)>>1) + i;
-                        enter_digit(grid_state, __bsrd(candidates[index]), index);
-                        found = true;
-                    }
+                        if (mask) {
+                            int index = (_tzcnt_u32(mask)>>1) + i;
+                            enter_digit(grid_state, candidates[index], index);
+                            found = true;
+                        }
+					}
                 }
             }
             if (unlocked[1] & (1ULL << (80-64))) {
                 if (candidates[80] == 0) {
                     // no solutions go back
                     GridState *old_grid_state = grid_state;
-                    grid_state = track_back(grid_state);
+                    grid_state = track_back(grid_state, line);
                     trackbacks++;
                     if ( reportstats ) {
                         my_digits_entered_and_retracted += 
-                            (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                          + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                            (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                          + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                     }
                     goto start;
                 } else if (__popcnt16(candidates[80]) == 1) {
                     // Enter the digit and update candidates
-                    enter_digit(grid_state, __bsrd(candidates[80]), 80);
+                    enter_digit(grid_state, candidates[80], 80);
                     found = true;
                 }
             }
@@ -388,18 +403,7 @@ static bool solve(signed char grid[81], int line) {
         for (unsigned char j = 0; j < 81; ++j) {
             grid[j] = 49+__bsrd(candidates[j]);
         }
-        
-        // Free memory
-        while (grid_state) {
-            struct GridState* prev_grid_state = grid_state->prev;
-            if ( grid_state == 0 ) {
-                printf("Line %d: No solution found!\n", line);
-                return false;
-            }
 
-            free(grid_state);
-            grid_state = prev_grid_state;
-        }
         solved_count++;
         no_guess_cnt += no_guess_incr;
 
@@ -419,6 +423,9 @@ static bool solve(signed char grid[81], int line) {
         const __m128i ones = _mm_set1_epi16(1);
         const __m128i bit_mask = _mm_setr_epi16(1<<0, 1<<1, 1<<2, 1<<3, 1<<4, 1<<5, 1<<6, 1<<7);
         const __m128i shuffle_mask = _mm_setr_epi8(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1);
+
+		__m128i column_mask_tails[8];
+
         for (unsigned char i = 0; i < 81; i += 9) {
             
             // rows
@@ -431,9 +438,17 @@ static bool solve(signed char grid[81], int line) {
             }
             
             // columns
-            __m128i column_mask = _mm_set1_epi16(0x01ff);
-            for (unsigned char j = 0; j < 81; j += 9) {
-                if (j != i) {
+			__m128i column_mask;
+            if ( i == 0 ) {
+                // keep precomputed 'tails' of column_mask around
+   	            column_mask = _mm_set1_epi16(0x01ff);
+	            for (signed char j = 81-9; j > 0; j -= 9) {
+					column_mask_tails[j/9-1] = column_mask;
+       	            column_mask = _mm_andnot_si128(_mm_loadu_si128((__m128i*) &candidates[j]), column_mask);
+                }
+            } else {
+                column_mask = column_mask_tails[i/9-1];
+                for (signed char j = 0; j < i; j += 9) {
                     column_mask = _mm_andnot_si128(_mm_loadu_si128((__m128i*) &candidates[j]), column_mask);
                 }
             }
@@ -453,32 +468,29 @@ static bool solve(signed char grid[81], int line) {
 
                 c = _mm_loadu_si128((__m128i*) &candidates[i]);
 
+				// compare the identified singles to the row:
                 __m128i a = _mm_cmpgt_epi16(_mm_and_si128(c, or_mask), _mm_setzero_si128());
+				// expand m to a boolean vector:
                 __m128i u = _mm_cmpeq_epi16(_mm_and_si128(bit_mask, _mm_set1_epi16(m)), bit_mask);
+				// mask out the locked cells:
                 int mask = _mm_movemask_epi8(_mm_and_si128(a, u));
 
                 if (mask) {
-                    int index = __tzcnt_u32(mask);
+                    int index = __tzcnt_u16(mask)>>1;
                     
-                    index >>= 1;
-
-                    int digit = __tzcnt_u16(((unsigned short*) &or_mask)[index]);
-                    
-                    index = index + i;
-                    
-                    enter_digit(grid_state, (signed char) digit, index);
+                    enter_digit(grid_state, ((__v8hu)or_mask)[index], index+i);
                     goto start;
                 }
                 
             } else {
                 // no solutions go back
                 GridState *old_grid_state = grid_state;
-                grid_state = track_back(grid_state);
+                grid_state = track_back(grid_state, line);
                 trackbacks++;
                 if ( reportstats ) {
                     my_digits_entered_and_retracted += 
-                        (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                      + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                      + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                 }
                 goto start;
             }
@@ -514,12 +526,12 @@ static bool solve(signed char grid[81], int line) {
                     my_naked_sets_searched++;
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
                         if ( reportstats ) {
                             my_digits_entered_and_retracted += 
-                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                                (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                              + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                         }
                         goto start;
                     } else if (s == cnt) {
@@ -536,12 +548,12 @@ static bool solve(signed char grid[81], int line) {
 
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
                         if ( reportstats ) {
                             my_digits_entered_and_retracted += 
-                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                                (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                              + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                         }
                         goto start;
                     } else if (s == cnt) {
@@ -558,12 +570,12 @@ static bool solve(signed char grid[81], int line) {
                     my_naked_sets_searched++;
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
                         if ( reportstats ) {
                             my_digits_entered_and_retracted += 
-                                (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                              + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                                (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                              + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                         }
                         goto start;
                     } else if (s == cnt) {
@@ -633,27 +645,31 @@ int main(int argc, char *argv[]) {
     
 	auto starttime = std::chrono::steady_clock::now();
 
-    const char *ifn = argc > 0? argv[0] : "puzzles.txt";
-    
-    FILE *f = fopen(ifn, "rb");
-    
-    // test for files not existing
-    if (f == 0) {
-        fprintf(stderr, "Error! Could not open file %s\n", ifn);
-        return -1;
-    }
-    
-    // find length of file
-    fseek(f, 0, SEEK_END);
-    size_t fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    // deal with the part that says how many sudokus there are
-    signed char *string = (signed char *)malloc(fsize + 1);
-    fread(string, 1, fsize, f);
-    fclose(f);
+	const char *ifn = argc > 0? argv[0] : "puzzles.txt";
+	int fdin = open(ifn, O_RDONLY);
+	if ( fdin == -1 ) {
+		if (errno ) {
+			fprintf(stderr, "Error: Failed to open file %s: %s\n", ifn, strerror(errno));
+			exit(0);
+		}
+	}
 
-// skip first line, unless it's a puzzle.
+    // get size of file
+	struct stat sb;
+	fstat(fdin, &sb);
+    size_t fsize = sb.st_size;
+
+	// map the input file
+	char *string = (char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
+	if ( string == MAP_FAILED ) {
+		if (errno ) {
+			printf("Error mmap of input file %s: %s\n", ifn, strerror(errno));
+			exit(0);
+		}
+	}
+	close(fdin);
+
+	// skip first line, unless it's a puzzle.
     size_t pre = 0;
 	if ( !isdigit(string[0]) || string[81] != 10 ) {
 	    while (string[pre] != 10) {
@@ -666,17 +682,44 @@ int main(int argc, char *argv[]) {
 	if ( string[fsize-1] != 10 )
 		post = 0;
 
+	// get and check the number of puzzles
 	size_t npuzzles = (fsize - pre + (1-post))/82;
+
 	if ( (fsize -pre -post + 1) % 82 ) {
 		fprintf(stderr, "found %ld puzzles with %ld(start)+%ld(end) extra characters\n", (fsize - pre - post + 1)/82, pre, post);
 	}
 
-    signed char *output = (signed char *)malloc(npuzzles*2*82);
+	const char *ofn = argc > 1? argv[1] : "solutions.txt";
+	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
+	if ( fdout == -1 ) {
+		if (errno ) {
+			printf("Error opening output file %s: %s\n", ofn, strerror(errno));
+			exit(0);
+		}
+	}
+	if ( ftruncate(fdout, (size_t)npuzzles*164) == -1 ) {
+		if (errno ) {
+			printf("Error setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+		}
+		exit(0);
+	}
+
+	// map the output file
+	output = (signed char *)mmap((void*)0, npuzzles*164, PROT_WRITE, MAP_SHARED, fdout, 0);
+	if ( output == MAP_FAILED ) {
+		if (errno ) {
+			printf("Error mmap of output file %s: %s\n", ofn, strerror(errno));
+			exit(0);
+		}
+	}
+	close(fdout);
+
     // solve all sudokus and prepare output file
     size_t i;
-	signed char *string_pre = string+pre;
+	char *string_pre = string+pre;
+	GridState *stack = 0;
 
-#pragma omp parallel for shared(string_pre, npuzzles, output, fsize) schedule(dynamic)
+#pragma omp parallel for firstprivate(stack) shared(string_pre, npuzzles, output, fsize, i) schedule(static,32)
     for (i = 0; i < npuzzles*82; i+=82) {
         // copy unsolved grid
         memcpy(&output[i*2], &string_pre[i], 81);
@@ -684,23 +727,25 @@ int main(int argc, char *argv[]) {
         // add comma and newline in right place
         output[i*2 + 81] = ',';
         output[i*2 + 163] = 10;
+		if ( stack == 0 ) {
+			stack = (GridState*)malloc(sizeof(GridState)*32);
+        }
         // solve the grid in place
-        solve(&output[i*2+82], i/82+1);
+        solve(&output[i*2+82], stack, i/82+1);
     }
     
-    // create output file
-    const char *ofn = argc > 1? argv[1] : "solutions.txt";
-
-    f = fopen(ofn, "wb");
-    if (f == 0 && errno ) {
-        printf("Error opening output file %s: %s\n", ofn, strerror(errno));
-        exit(0);
-    }
-    fwrite(output, 1, npuzzles*2*82, f);
-    fclose(f);    
-
-    free(string);
-    free(output);
+	int err = munmap(string, fsize);
+	if ( err == -1 ) {
+		if (errno ) {
+			printf("Error munmap file %s: %s\n", ifn, strerror(errno));
+		}
+	}
+	err = munmap(output, (size_t)npuzzles*164);
+	if ( err == -1 ) {
+		if (errno ) {
+			printf("Error munmap file %s: %s\n", ofn, strerror(errno));
+		}
+	}
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
