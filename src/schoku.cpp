@@ -68,8 +68,8 @@
 const char *version_string = "0.8";
 
 const char *compilation_options = 
-// OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well together
-// for excellent statistics.
+// Options OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well
+// together for excellent statistics.
 #ifdef OPT_TRIAD_RES
 // Triad resolution examines all triads and if exactly three candidates are present
 // marks them as sets. A small penalty to speed but a boost to statistics overall.
@@ -689,16 +689,11 @@ inline void grid_dump(unsigned short *candidates) {
 //
 class TriadInfo {
 public:
-    unsigned short *row_triads;               // just to pass the real row_triads
-    unsigned short *col_triads;               // just to pass the real col_triads
+    unsigned short row_triads[36];            //  27 triads, in groups of 9 with a gap of 1
+    unsigned short col_triads[36];            //  27 triads, in groups of 9 with a gap of 1
     unsigned short row_triads_wo_musts[36];   //  triads minus tmusts for guessing
     unsigned short col_triads_wo_musts[36];   //  triads minus tmusts for guessing
     unsigned int triads_selection[2];
-
-    TriadInfo(unsigned short *row_triads, unsigned short *col_triads) {
-        this->row_triads = row_triads;
-        this->col_triads = col_triads;
-    }
 };
 
 // The maximum levels of guesses is given by GRIDSTATE_MAX.
@@ -1494,10 +1489,8 @@ enter:
     //
     // various methods are used to efficiently save the triads in the processing order,
     // which go beyond the end of the arrays normally needed.
-    unsigned short row_triads[36];   //  27 triads, in groups of 9 with a gap of 1
-    unsigned short col_triads[36];   //  27 triads, in groups of 9 with a gap of 1
 
-    TriadInfo triad_info(row_triads, col_triads);
+    TriadInfo triad_info;
 
         const __m256i mask9 { 0x1ff01ff01ff01ffLL, 0x1ff01ff01ff01ffLL, 0x1ffLL, 0 };
 
@@ -1606,10 +1599,10 @@ enter:
                         // column_or_head now contains the or'ed rows 0-2.
                         // Store all triads sequentially, paying attention to overlap.
                         //
-                        _mm256_storeu_si256((__m256i *)col_triads, column_or_head);
-                        _mm256_storeu_si256((__m256i *)(col_triads+10), col_triads_2);
+                        _mm256_storeu_si256((__m256i *)triad_info.col_triads, column_or_head);
+                        _mm256_storeu_si256((__m256i *)(triad_info.col_triads+10), col_triads_2);
                         // mask 5 hi triads to 0xffff, which will not trigger any checks
-                        _mm256_storeu_si256((__m256i *)(col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
+                        _mm256_storeu_si256((__m256i *)(triad_info.col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
                     }
                     column_mask = _mm256_or_si256(column_or_tails[irow-1],column_mask);
                 }
@@ -1660,7 +1653,7 @@ enter:
                 const __m256i shuff725to012 = _mm256_setr_epi8(14, 15,  4,  5, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,  -1, -1,
                                                                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
                 row_triad_capture = _mm256_shuffle_epi8(_mm256_blend_epi16(rowbox_or7, row_triad_capture, 0x20),shuff725to012);
-                _mm_storeu_si64(&row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture));
+                _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture));
                 // continue the rotate/or routine for this row
                 for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
@@ -1816,8 +1809,8 @@ enter:
 
             // A3.2.1 (check col-triads)
             // just a plain old popcount, but for both vectors interleaved
-            __m256i v1 = _mm256_loadu_si256((__m256i *)col_triads);
-            __m256i v2 = _mm256_loadu_si256((__m256i *)(col_triads+16));
+            __m256i v1 = _mm256_loadu_si256((__m256i *)triad_info.col_triads);
+            __m256i v2 = _mm256_loadu_si256((__m256i *)(triad_info.col_triads+16));
             __m256i lo1 = _mm256_and_si256 (v1, low_mask);
             __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), low_mask );
             __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
@@ -1853,7 +1846,7 @@ enter:
             unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
             while (m) {
                 unsigned char tidx = tzcnt_and_mask(m);
-                unsigned short cands_triad = col_triads[tidx];
+                unsigned short cands_triad = triad_info.col_triads[tidx];
                 if ( verbose && debug ) {
                     char ret[32];
                     format_candidate_set(ret, cands_triad);
@@ -1870,8 +1863,8 @@ enter:
             // A3.2.2 (check row-triads)
 
             // just a plain old popcount, but for both vectors interleaved
-            v1 = _mm256_loadu_si256((__m256i *)row_triads);
-            v2 = _mm256_loadu_si256((__m256i *)(row_triads+16));
+            v1 = _mm256_loadu_si256((__m256i *)triad_info.row_triads);
+            v2 = _mm256_loadu_si256((__m256i *)(triad_info.row_triads+16));
 
             lo1 = _mm256_and_si256 (v1, low_mask);
             hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), low_mask );
@@ -1913,7 +1906,7 @@ enter:
 
                 if ( verbose && debug ) {
                     char ret[32];
-                    format_candidate_set(ret, row_triads[tidx]);
+                    format_candidate_set(ret, triad_info.row_triads[tidx]);
                     printf("triad set (row): %-9s [%d,%d]\n", ret, ri, tci);
                 }
 
@@ -1958,7 +1951,7 @@ enter:
 
         for (int type=1; type>=0; type--) {	// row = 0, col = 1
 
-            unsigned short *triads   = type==0?row_triads:col_triads;
+            unsigned short *triads   = type==0?triad_info.row_triads:triad_info.col_triads;
             unsigned short *wo_musts = type==0?triad_info.row_triads_wo_musts:triad_info.col_triads_wo_musts;
             unsigned short *ptriads  = triads;
             __m256i pmustnt[2][3] = {mask, mask, mask, mask, mask, mask};
