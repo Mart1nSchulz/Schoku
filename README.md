@@ -31,7 +31,7 @@ The guessing code did search all cells, even though it could simply pick the fir
 Throughout, I also added lookup tables where they were useful.  
 Then I integrated the entering loop (for solved cells) with the search for the next naked single.  This unfortunately involved some additional spaghetti coding techniques in form of labels and gotos.  
 I also changed the program to use memory mapped I/O (this relieves the main thread from doing nearly any computations or I/O.  
-Later I implemented a triad algorithm that finds and removes per triad candidates that are impossible.  
+Later I implemented a triad algorithm that finds and removes per triad candidates (aka LockedCandidates) that are impossible.  
 The default bi-value guessing strategy is suboptimal, as it searches guesses by preference always beginning in the same area and picks too easily pairs of bi-values that depend on each other and little else.  
 This causes the tree of guesses to grow unnecessarily.  
 I used an approach that pays off by reducing the overall number of guesses.  The key is to find 'balanced' guesses that bisect the set of possible paths.
