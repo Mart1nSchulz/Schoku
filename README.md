@@ -23,7 +23,8 @@ a 17-clue puzzle file with 49151 puzzles, where the startup uses more than 40% o
 ### Summary of Changes
 Looking at speed improvements in terms of low hanging fruit, I found that the malloc'ation of the GridState
 structures did take up too much time and replaced it by fixed stacks allocated by each thread only once.  
-I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.  
+I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.
+In particular, allocating a GridState on a different thread will cause memory thrashing (unnessary/unwanted copying between L1 cache lines).   
 The hidden single search allowed for removal of repeating calculations, which offered a welcome boost.  I also made the search cover all hidden singles.  
 I pruned the naked set search to skip already found sets and not to look at sets that provide no benefit, e.g. sets covering all of the available cells (N or N-1).  
 The guessing code did search all cells, even though it could simply pick the first cell with 2 candidates found.  
@@ -45,10 +46,11 @@ The time command reported timing varies quite a bit while the internal timings w
 I elected to collect statistics based on the multi-threaded timings througout.  
 For the later versions of Schoku the factor between multi-threading and single-threading is close to 6
 for a 4 CPU / 8 execution units processor.  
-The original code's ratio of multi- to single-threaded performance started very low at 2.15 and improved with the allocation and alignment
+The original code's ratio of multi- to single-threaded performance started very low at 2.15
+(could be specific to my setup) and improved with the allocation and alignment
 of the grid state data.
 
-I am taking timings on a Zen2 Ryzen 7 4800U processor.
+I am taking timings on a Zen2 Ryzen 7 4700U processor.
 
 
 ### Approach
