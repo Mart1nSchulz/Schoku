@@ -2104,7 +2104,7 @@ enter:
                           unsigned b = 1|(1<<9)|(1<<18);
                           grid_state->set23_found[Col].set_indexbits(b,tpos,19);
                           grid_state->set23_found[Box].set_indexbits(b,tpos,19);
-                          grid_state->updated.set_indexbits(b,tpos,3);
+                          grid_state->updated.set_indexbits(b,tpos,19);
                        }
                        triads_resolved++;
                     }
