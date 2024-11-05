@@ -32,20 +32,20 @@
  *    282418    5.75/puzzle  digits entered and retracted
  *   1464744   29.80/puzzle  'rounds'
  *     22972    0.47/puzzle  triads resolved
- *    593316   12.07/puzzle  triad updates
+ *    197772    4.02/puzzle  triad updates
  *       693  bi-value universal graves detected
  *
  * compile options: OPT_TRIAD_RES OPT_SETS
  *     49151  puzzles entered
  *     49151  1748337/s  puzzles solved
- *    28.1ms    0.57µs/puzzle  solving time
+ *    27.5ms    0.56µs/puzzle  solving time
  *     42079   85.61%  puzzles solved without guessing
  *     12428    0.25/puzzle  guesses
  *      7461    0.15/puzzle  back tracks
  *    102347    2.08/puzzle  digits entered and retracted
  *   1398095   28.44/puzzle  'rounds'
- *    106118    2.16/puzzle  triads resolved
- *    604548   12.30/puzzle  triad updates
+ *    107369    2.18/puzzle  triads resolved
+ *    203462    4.14/puzzle  triad updates
  *     17775    0.36/puzzle  naked sets found
  *    902071   18.35/puzzle  naked sets searched
  *       952  bi-value universal graves detected
@@ -575,6 +575,10 @@ inline __attribute__((always_inline))__m256i and_unless(__m256i a, __m256i b, __
 
 inline __attribute__((always_inline))__m256i and_unless(__m256i a, unsigned short b, __m256i bcond) {
     return and_unless(a, _mm256_set1_epi16(b), bcond);
+}
+
+inline __attribute__((always_inline))__m256i andnot_if(__m256i a, __m256i b, __m256i bcond) {
+    return _mm256_andnot_si256( _mm256_and_si256( b, bcond), a );
 }
 
 // combine an epi16 boolean mask and a 16-bit mask to a 16/32-bit mask.
@@ -2069,52 +2073,108 @@ enter:
                 tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust2);
 
             ptriads = triads;
+            const __m256i shuff_row_mask = _mm256_setr_epi8( 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 4, 5, 4, 5,
+                                                              4, 5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+
+            const __m256i shuff_row_mask2 = _mm256_setr_epi8( 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 8, 9, 8, 9,
+                                                              8, 9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
             // compare tmustnt with the triads.
+            unsigned int row_combo_tpos[3] {};
             for ( int i=0; i<3; i++, ptriads+=10) {
                 // rotate left by 4 bytes to align the 9 constraints for comparison.
-                __m256i flip = _mm256_permute2f128_si256(tmustnt[i], tmustnt[i], 1);
+                __m256i flip = _mm256_permute2x128_si256(tmustnt[i], tmustnt[i], 1);
                 tmustnt[i]   = _mm256_shuffle_epi8(tmustnt[i], shuff_tmustnt);
                 tmustnt[i]   = _mm256_alignr_epi8(flip, tmustnt[i], 4);
-                __m256i tmp = _mm256_and_si256(_mm256_cmpgt_epi16(*(__m256i_u*)ptriads,_mm256_andnot_si256(tmustnt[i], *(__m256i_u*)ptriads)),mask9);
+                __m256i to_remove_v = _mm256_and_si256(*(__m256i_u*)ptriads, tmustnt[i]);
+                __m256i tmp = _mm256_and_si256(_mm256_cmpgt_epi16(to_remove_v,_mm256_setzero_si256()),mask9);
                 any_changes = _mm256_or_si256(any_changes,tmp);
                 if ( _mm256_testz_si256(alltrue,tmp)) {
                     continue;
                 }
-                // remove triad candidate values that appear in tmustnt.
                 unsigned long long m = compress_epi16_boolean<true>(tmp);
-                while (m) {
-                    unsigned char i_rel = tzcnt_and_mask(m)>>1;
-                    unsigned char tindx = i*9+i_rel;
-                    unsigned char tpos  = type==0 ? row_triad_reverse_canonical_map[tindx]*3 : i*27+i_rel;
-                    unsigned short to_remove = ((__v16hu)tmustnt[i])[i_rel] & triads[i*10+i_rel];
-                    if ( verbose && debug ) {
-                            char ret[32];
-                            format_candidate_set(ret, to_remove);
-                            printf("%s triad update \\%-5s at %s\n", type == 0? "row":"col",
-                                   ret, cl2txt[tpos] );
+                unsigned int col_combo_tpos = 0;
+                // remove triad candidate values that appear in tmustnt.
+                if ( type == 0 ) {
+                    // row triad updates, row i of each band
+                    // update the cells for row triads
+                    // row i
+                    __m256i tmask;
+                    if ( m & 0x3f ) {
+                        tmask = _mm256_permute2x128_si256(tmustnt[i], tmustnt[i], 0);
+                        tmask = _mm256_shuffle_epi8(tmask, shuff_row_mask);
+                        __m256i c = andnot_if(*(__m256i_u*)&candidates[i*9], tmask, mask9);
+                        _mm_storeu_si128((__m128i_u*)&candidates[i*9], _mm256_castsi256_si128(c));
+                        candidates[8+i*9] = _mm256_extract_epi16(c, 8);
                     }
-                    // tracking
-                    unsigned char pcnt = _popcnt32(triads[i*10+i_rel] & ~to_remove);
-                    if ( pcnt == 3 ) {
+                    // row i+3
+                    if ( m & (0x3f<<6) ) {
+                        tmask = _mm256_bsrli_epi128(tmustnt[i], 6);
+                        tmask = _mm256_permute2x128_si256(tmask, tmask, 0);
+                        tmask = _mm256_shuffle_epi8(tmask, shuff_row_mask);
+                        __m256i c = andnot_if(*(__m256i_u*)&candidates[(i+3)*9], tmask, mask9);
+                        _mm_storeu_si128((__m128i_u*)&candidates[(i+3)*9], _mm256_castsi256_si128(c));
+                        candidates[8+(i+3)*9] = _mm256_extract_epi16(c, 8);
+                    }
+                    // row i+6
+                    if ( m & (0x3f<<12) ) {
+                        tmask = _mm256_permute4x64_epi64(tmustnt[i], 0x99);
+                        tmask = _mm256_shuffle_epi8(tmask, shuff_row_mask2);
+                        __m256i c = andnot_if(*(__m256i_u*)&candidates[(i+6)*9], tmask, mask9);
+                        _mm_storeu_si128((__m128i_u*)&candidates[(i+6)*9], _mm256_castsi256_si128(c));
+                        candidates[8+(i+6)*9] = _mm256_extract_epi16(c, 8);
+                    }
+                } else { // type == 1
+                    // update the bands with column triads
+                    // using directly tmustnt[i]
+                    __m256i c1 = andnot_if(*(__m256i_u*)&candidates[i*27], tmustnt[i], mask9);
+                    _mm_storeu_si128((__m128i_u*)&candidates[i*27], _mm256_castsi256_si128(c1));
+                    __m256i c2 = andnot_if(*(__m256i_u*)&candidates[9+i*27], tmustnt[i], mask9);
+                    _mm_storeu_si128((__m128i_u*)&candidates[9+i*27], _mm256_castsi256_si128(c2));
+                    __m256i c3 = andnot_if(*(__m256i_u*)&candidates[18+i*27], tmustnt[i], mask9);
+                    _mm_storeu_si128((__m128i_u*)&candidates[18+i*27], _mm256_castsi256_si128(c3));
+                    if ( m & 0x30000 ) {
+                        candidates[8+i*27]    = _mm256_extract_epi16(c1, 8);
+                        candidates[9+8+i*27]  = _mm256_extract_epi16(c2, 8);
+                        candidates[18+8+i*27] = _mm256_extract_epi16(c3, 8);
+                    }
+                }
+                unsigned long long m_ = m;
+                while (m_) {
+                    unsigned char i_rel = tzcnt_and_mask(m_)>>1;
                        if ( type == 0 ) {
-                          grid_state->set23_found[Row].set_indexbits(7,tpos,3);
-                          grid_state->set23_found[Box].set_indexbits(7,tpos,3);
-                          grid_state->updated.set_indexbits(7,tpos,3);
+                        row_combo_tpos[i_rel/3] |= 1 << (row_triad_reverse_canonical_map[i_rel]%9*3);
                        } else {
-                          unsigned b = 1|(1<<9)|(1<<18);
-                          grid_state->set23_found[Col].set_indexbits(b,tpos,19);
-                          grid_state->set23_found[Box].set_indexbits(b,tpos,19);
-                          grid_state->updated.set_indexbits(b,tpos,3);
+                        col_combo_tpos |= 1 << i_rel;
                        }
+                    if ( _popcnt32(((__v16hu)tmustnt[i])[i_rel]) == 6 ) {
                        triads_resolved++;
                     }
-                    for ( unsigned char k=0; k<3; k++, tpos += type==0?1:9) {
-                        candidates[tpos] &= ~to_remove;
-                        triad_updates++;
+                    if ( verbose && debug ) {
+                        unsigned char tpos = type==0? (row_triad_reverse_canonical_map[i*9+i_rel]*3) : (i*27+i_rel);
+                        char ret[32];
+                        format_candidate_set(ret, ((__v16hu)to_remove_v)[i_rel]);
+                        printf("%s triad update \\%-5s at %s\n", type == 0? "row":"col",
+                               ret, cl2txt[tpos] );
                     }
+                    triad_updates++;
+                }
+                if ( type == 1 ) {
+                    col_combo_tpos |= (col_combo_tpos<<9) | (col_combo_tpos<<18);
+                    grid_state->set23_found[Col].set_indexbits(col_combo_tpos, i*27, 27);
+                    grid_state->set23_found[Box].set_indexbits(col_combo_tpos, i*27, 27);
+                    grid_state->updated.set_indexbits(col_combo_tpos, i*27, 27);
+                }
+            }
+            if ( type == 0 ) {
+                for ( unsigned char k=0; k<2; k++ ) {
+                    row_combo_tpos[k] |= (row_combo_tpos[k]<<1) | (row_combo_tpos[k]<<2);
+                    grid_state->set23_found[Row].set_indexbits(row_combo_tpos[k], k*27, 27);
+                    grid_state->set23_found[Box].set_indexbits(row_combo_tpos[k], k*27, 27);
+                    grid_state->updated.set_indexbits(row_combo_tpos[k], k*27, 27);
                 }
             }
         } // for type (cols,rows)
+
         if ( !_mm256_testz_si256(alltrue, any_changes) ) {
             goto start;
         }
