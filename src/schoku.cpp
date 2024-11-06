@@ -2141,11 +2141,11 @@ enter:
                 unsigned long long m_ = m;
                 while (m_) {
                     unsigned char i_rel = tzcnt_and_mask(m_)>>1;
-                       if ( type == 0 ) {
+                    if ( type == 0 ) {
                         row_combo_tpos[i_rel/3] |= 1 << (row_triad_reverse_canonical_map[i_rel]%9*3);
-                       } else {
+                    } else {
                         col_combo_tpos |= 1 << i_rel;
-                       }
+                    }
                     if ( _popcnt32(((__v16hu)tmustnt[i])[i_rel]) == 6 ) {
                        triads_resolved++;
                     }
