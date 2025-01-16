@@ -8,20 +8,35 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.9
+ * Version 0.9.1
  *
  * Performance changes:
- * - implementation of an improved guessing algorithms, based on triads.
+ * - further optimized naked and hidden searches.
  *
  * Functional changes:
- * (none)
+ * - added algorithm for (avoidable) unique rectangles.
+ * - adjustments for more diversified puzzle sources (tdoku puzzle files)
+ * - warnings option (-w): by default the messages and warnings are muted.
+ *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
+ * - mode options (-m[STU]*) to dynamically invoke features.
+ *   Previously these features were only available as compile time options.
+ * - rules options (-r[ROM]) to either assume regular puzzles rules (single solution),
+ *   search for one solution, even if multiple solutions exist, or determine whether
+ *   two or more solutions exist.
+ * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
+ *   more than 28.
+ * - allow for multi-line comments at the start of puzzle files
+ * - disallow CR/LF (MS-DOS/Windows) line endings
+ * - fixed problem with reporting a large number of solved puzzles when each solution
+ *   was counted.
+ * - fixed problem with bi-value universal grave: multiple solutions were not recognized.
  *
  * Performance measurement and statistics:
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.9
+ * schoku version: 0.9.1
  * compile options:
  *     49151  puzzles entered
  *     49151  1955753/s  puzzles solved
@@ -65,7 +80,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-const char *version_string = "0.9";
+const char *version_string = "0.9.1";
 
 const char *compilation_options =
 // Options OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well
@@ -81,6 +96,11 @@ const char *compilation_options =
 // which are labeled as such when they are more concise to report.
 //
 "OPT_SETS "
+#endif
+#ifdef OPT_UQR
+// Detection of unique (avoidable) rectangles is a specialty feature.
+//
+"OPT_UQR "
 #endif
 ""
 ;
@@ -101,6 +121,14 @@ enum Kind {
    Box = 2,
    All = 3, // special case for look up table.
 } Kind;
+
+// return status
+typedef struct {
+   bool solved = false;
+   bool unique = true;
+   bool verified = false;
+   bool used_assumed_uniqueness = false;
+} Status;
 
 // bit128_t type
 // used for all 81-bit fields to support different access patterns.
@@ -491,9 +519,9 @@ std::atomic<long long> triads_resolved(0);  // how many triads did we resolved
 std::atomic<long long> triad_updates(0);    // how many triads did cancel candidates
 std::atomic<long long> naked_sets_searched(0); // how many naked sets did we search for
 std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
-// somehow this padding is (very) beneficial, so leave it in...
 std::atomic<long long> unique_rectangles_checked(0);   // how many unique rectangles were checked
 std::atomic<long long> unique_rectangles_avoided(0);   // how many unique rectangles were avoided
+// somehow this padding is (very) beneficial, so leave it in...
 std::atomic<long long> fishes_detected(0);  // how many unique rectangles were checked
 std::atomic<long long> fishes_specials_detected(0);    // how many unique rectangles were checked
 std::atomic<long long> fishes_updated(0);              // how many unique rectangles were avoided
@@ -508,21 +536,81 @@ std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
 std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
 std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
 
+#ifdef OPT_UQR
+    // for each set of results, nine pairs of two diagonal intersections are accessed
+    // by using the two indices for accessing 'res'.
+    const unsigned char cuqr_access[9][2] = {
+        {0,4}, {1,5}, {2,6}, {8,12}, {9,13}, {10,14}, {16,20}, {17,21}, {18,22}
+    };
+
+    // bit pattern for uqr long edge:
+    const unsigned short uqr_pattern[9] = { 0, 0b11, 0b101, 0b1001, 0b10001, 0b100001, 0b1000001, 0b10000001, 0b100000001 };
+
+    // type Uqr provides the start cells position relative to the row/col for uqrs,
+    // and the distance to the opposite cells of the uqr, along the row/col long edge.
+    // Note that the distance to the next row/col is not provided here (it can only be 1 or 2)
+    // and will be easy to find in the processing context.
+typedef struct {
+        const unsigned char start_cell;   // relative to row/col start
+        const unsigned char dist;         // 'long' edge, relative to start_cell, in row/col direction
+        const unsigned short pattern = uqr_pattern[dist]<<start_cell;
+} Uqr;
+
+// each row yields 9 cuqrs, for 3 iterations as shown below.
+// together these allow to iterate over the examing uqrs and their diagonals.
+const Uqr cuqrs[3][9] = {
+        // row 0,1 iter 0
+        {{0,3}, {1,3}, {2,3}, {0,6}, {1,6}, {2,6}, {3,3}, {4,3}, {5,3}},
+        // row 0,1 iter 1
+        {{1,2}, {2,2}, {0,5}, {1,5}, {2,5}, {0,8}, {4,2}, {5,2}, {3,5}},
+        // row 0,1 iter 2
+        {{2,1}, {0,4}, {1,4}, {2,4}, {0,7}, {1,7}, {5,1}, {3,4}, {4,4}},
+    };
+
+// a corner of a unique rectangle
+class UqrCorner {
+public:
+    bool is_pair = false;
+    bool is_single = false;
+    unsigned char indx;
+    unsigned char pair_indx=0;
+    __uint128_t *right_edge;
+};
+
+// a pair of bivalues for a unique rectangle
+class UqrPair {
+public:
+    unsigned short digits;   // digits could be a single digit, if diag is a single
+    unsigned char cnt = 0;
+    unsigned char crnrs = 0;
+};
+
+#endif
+
 bool bmi2_support = false;
 
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
 int verify          = 0; // verify solution correctness (implied otherwise)
-int unique_check    = 0; // check solution uniqueness
 int debug           = 0; // provide step by step output on the solution
 int thorough_check  = 0; // check for back tracking even if no guess was made.
 int numthreads      = 0; // if not 0, number of threads
+int warnings        = 0; // display warnings
+
+// puzzle rules
+typedef enum {
+    Regular  = 0,   // R - Default: Find solution, assuming it will be unique
+                    // (this is fastest but is not suitable for non-unique puzzles)
+    FindOne  = 1,   // O - Search for one solution
+    Multiple = 2    // M - Determine whether puzzles are non-unique
+} Rules;
+
+Rules rules;
 
 // execution modes at runtime
 bool mode_sets=false;           // 'S', see OPT_SETS
 bool mode_triad_res=false;      // 'T', see OPT_TRIAD_RES
 bool mode_uqr=false;            // 'U', see OPT_UQR
-bool mode_fish=false;			// 'F', see OPT_FSH
 
 signed char *output;
 
@@ -772,9 +860,9 @@ public:
 // On average, the number of levels is pretty low, but we want to be 'reasonably' sure
 // that we don't bust the envelope.
 // The other 'property' of the GRIDSTATE_MAX constant is to keep the L2 cache happy.
-// 28 is a good choice either way.
+// 34 is a good choice either way.
 //
-#define	GRIDSTATE_MAX 28
+#define	GRIDSTATE_MAX 34
 
 // GridState encapsulates the current state of the solver, specifically for the
 // purpose of guessing and back tracking.
@@ -845,6 +933,42 @@ inline void initialize(signed char grid[81]) {
     }
 }
 
+// remove candidate values cand from candidates according to the provided mask
+//
+inline void remove_cands(bit128_t to_update, unsigned short cands) {
+        updated.u128 |= to_update.u128;
+
+        unsigned char mini = 0xff, maxi = 0;
+
+        for (unsigned char k=0; k<4; k++) {
+            if ( to_update.u32[k] ) {
+                maxi = (k+1)<<5;
+                if ( mini == 0xff ) {
+                    mini = k<<5;
+                }
+            }
+        }
+        if ( maxi >= 96 ) {
+            maxi = 80;
+        }
+
+        if ( mini != 0xff ) {
+            const __m256i mask = _mm256_set1_epi16(~cands);
+
+            for (unsigned char j = mini; j < maxi; j += 16) {
+                // expand locked unsigned short to boolean vector
+                __m256i mlocked = expand_bitvector(~to_update.u16[j>>4]);
+                // apply mask (remove bits), preserving the locked cells
+                *(__m256i*) &candidates[j] = and_unless(*(__m256i*) &candidates[j], mask, mlocked);
+            }
+            if (unlocked.u16[5] & 1) {
+                if ((to_update.u16[5] & 1) != 0) {
+                    candidates[80] &= ~cands;
+                }
+            }
+        }
+}
+
 // Normally digits are entered by a 'goto enter;'.
 // enter_digit is not used in that case.
 // Only make_guess uses this member function.
@@ -859,7 +983,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
         printf(" %x at %s\n", _tzcnt_u32(digit)+1, cl2txt[i]);
     }
 #ifndef NDEBUG
-    if ( __popcnt16(digit) != 1 ) {
+    if ( __popcnt16(digit) != 1 && warnings != 0 ) {
         printf("error in enter_digit: %x\n", digit);
     }
 #endif
@@ -891,6 +1015,76 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 }
 
 public:
+// this form of make_guess establishes a 'contract' between the caller's lambda
+// and the creation of the new GridState.
+// Due to its overhead, it is not the fastest, but the most flexible form to make a guess.
+//
+template<bool verbose, typename F>
+inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater) {
+    // Create a copy of the state of the grid to make back tracking possible
+    GridState* new_grid_state = this+1;
+    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+        fprintf(stderr, "Error: no GridState struct availabe\n");
+        exit(0);
+    }
+    memcpy(new_grid_state, this, sizeof(GridState));
+    new_grid_state->stackpointer++;
+
+    const char *msgs[2];
+
+    // gridUpdater is a lambda, but could also be a function reference.
+    // gridUpdater receives as input:
+    // GridState & present GridState
+    // GridState & new GridState
+    // gridUpdater receives as input:
+    // const char (*)[2] two messages provided one for each GridState
+    // gridUpdater encapsulates local updates, typically to candidates of either GridState
+    // and the two messages.
+    //
+    gridUpdater(*this, *new_grid_state, msgs);
+    if ( verbose && debug ) {
+        printf("guess at level >%d< - new level >%d<\nguess %s\n", stackpointer, new_grid_state->stackpointer, msgs[0]);
+        char gridout[82];
+        if ( debug > 1 ) {
+            for (unsigned char j = 0; j < 81; ++j) {
+                if ( unlocked.check_indexbit(j) ) {
+                    gridout[j] = '0';
+                } else {
+                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
+                }
+            }
+            printf("guess at %s\nsaved grid_state level >%d<: %.81s\n",
+                   cl2txt[cell_index], stackpointer, gridout);
+        }
+        printf("saved state for level %d: %s\n",
+               stackpointer, msgs[1]);
+        if ( debug > 1 ) {
+            unsigned short *candidates = new_grid_state->candidates;
+            for (unsigned char j = 0; j < 81; ++j) {
+                if ( new_grid_state->unlocked.check_indexbit(j) ) {
+                    gridout[j] = '0';
+                } else {
+                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
+                }
+            }
+            printf("grid_state at level >%d< now: %.81s\n",
+                   new_grid_state->stackpointer, gridout);
+        }
+    }
+    guesses++;
+
+    return new_grid_state;
+}
+
+// this form of make_guess receives additional information to make a more efficient guess.
+// Efficiency for a guess is measured in terms of cells resolved until a new guess needs to be made.
+// In this form, the efficiency is provided via:
+// - identifying a suitable triad such that it will become resolved on both branches of the guess.
+// - there are exactly 2 candidates that are connected to the remaining cells of the row/col
+//   and the box and either branch of the guess will thus impact those sections.
+// - the operation is typically more balanced, in that both branches will provide similar
+//   efficiencies (at least on average).
+//
 template<bool verbose>
 inline GridState* make_guess(TriadInfo &triad_info, bit128_t bivalues) {
     // Make a guess for a triad with 4 candidate values that has 2 candidates that are not
@@ -1012,7 +1206,7 @@ found:
 // this version of make_guess is the simplest and original form of making a guess.
 //
 template<bool verbose>
-GridState* make_guess(bit128_t bivalues) {
+inline GridState* make_guess(bit128_t bivalues) {
     // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
     // Pick the candidate with the highest value as the guess.
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
@@ -1055,6 +1249,13 @@ GridState* make_guess(bit128_t bivalues) {
     // Note: using tzcnt would be equally valid; this pick is historical
     unsigned short digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
 
+    return make_guess<verbose>(guess_index, digit);
+}
+
+// this version of make_guess takes a cell index and digit for the guess
+//
+template<bool verbose>
+inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
     if ( stackpointer >= GRIDSTATE_MAX-1 ) {
@@ -1114,11 +1315,36 @@ inline unsigned char get_ul_set_search( unsigned char si) {
 };
 
 template <bool verbose>
-bool solve(signed char grid[81], GridState stack[], int line) {
+Status solve(signed char grid[81], GridState stack[], int line) {
 
     GridState *grid_state = &stack[0];
     unsigned long long *unlocked = grid_state->unlocked.u64;
     unsigned short* candidates;
+
+    Status status;
+
+#ifdef OPT_UQR
+    // make_guess accepts a lambda, which will use guess_message to pass along
+    // two strings of debug information:
+    char guess_message[2][196];
+
+    // original_locked keeps track of the presets
+    // since unique rectangles can only be invalidated by presets.
+    bit128_t original_locked;
+    original_locked.u64[0] = ~unlocked[0];
+    original_locked.u64[1] = ~unlocked[1] & 0x1ffff;
+
+    bit128_t original_locked_transposed;
+
+    unsigned short superimposed_preset_rows[3][3];    // deal with initialization later...
+    unsigned short superimposed_preset_cols[3][3];
+    bool have_superimposed_preset_rows = false;
+    bool have_superimposed_preset_cols = false;
+
+    bit128_t candidate_bits_by_value[9];
+    unsigned short last_entered_count_uqr = 0;
+    unsigned char last_band_uqr = 0;
+#endif
 
     // the low byte is the real count, while
     // the high byte is increased/decreased with each guess/back track
@@ -1134,6 +1360,7 @@ bool solve(signed char grid[81], GridState stack[], int line) {
 
     unsigned long long my_digits_entered_and_retracted = 0;
     unsigned long long my_naked_sets_searched = 0;
+    unsigned long long my_unique_rectangles_checked = 0;
     unsigned char no_guess_incr = 1;
 
     unsigned int my_past_naked_count = 0;
@@ -1164,7 +1391,9 @@ back:
         } else {
             // This only happens when the puzzle is not valid
             // Bypass the verbose check...
-            printf("Line %d: No solution found!\n", line);
+            if ( warnings != 0 ) {
+                printf("Line %d: No solution found!\n", line);
+            }
             unsolved_count++;
         }
         // cleanup and return
@@ -1172,8 +1401,12 @@ back:
             past_naked_count += my_past_naked_count;
             naked_sets_searched += my_naked_sets_searched;
             digits_entered_and_retracted += my_digits_entered_and_retracted;
+            unique_rectangles_checked += my_unique_rectangles_checked;
+            if ( status.unique == false ) {
+                non_unique_count++;
+            }
         }
-        return true;
+        return status;
     }
 
     current_entered_count  = ((grid_state-1)->stackpointer)<<8;        // back to previous stack.
@@ -1200,7 +1433,7 @@ start:
     e_digit = 0;
 
     // at start, set everything that depends on grid_state:
-    check_back = grid_state->stackpointer || thorough_check || unique_check_mode;
+    check_back = grid_state->stackpointer || thorough_check || rules != Regular || unique_check_mode;
 
     unlocked   = grid_state->unlocked.u64;
     candidates = grid_state->candidates;
@@ -1233,7 +1466,9 @@ enter:
         }
 #ifndef NDEBUG
         if ( __popcnt16(e_digit) != 1 ) {
-            printf("error in e_digit: %x\n", e_digit);
+            if ( warnings != 0 ) {
+                printf("error in e_digit: %x\n", e_digit);
+            }
         }
 #endif
 
@@ -1271,7 +1506,9 @@ enter:
                     unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
                     unsigned char pos = j+(_tzcnt_u32(mx)>>1);
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        }
                     } else if ( debug ) {
                         printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
@@ -1303,7 +1540,9 @@ enter:
                 if ( verbose ) {
                     unsigned char pos = e_i;
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        }
                     } else if ( debug ) {
                         printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
@@ -1328,7 +1567,9 @@ enter:
                         unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
                         unsigned char pos = i+(_tzcnt_u32(mx)>>1);
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                            }
                         } else if ( debug ) {
                             printf("back track - cell %s is 0\n", cl2txt[pos]);
                         }
@@ -1353,7 +1594,9 @@ enter:
             // no solutions go back
             if ( verbose ) {
                 if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                    printf("Line %d: cell[8,8] is 0\n", line);
+                    if ( warnings != 0 ) {
+                        printf("Line %d: cell %s is 0\n", line, cl2txt[80]);
+                    }
                 } else {
                     if ( debug ) {
                         printf("back track - cell [8,8] is 0\n");
@@ -1379,15 +1622,15 @@ enter:
     bool verify_one = false;
     if ( *(__uint128_t*)unlocked == 0) {
         // Solved it
-        if ( unique_check == 1 && unique_check_mode == 1 ) {
+        if ( rules == Multiple && unique_check_mode == 1 ) {
             if ( !nonunique_reported ) {
-                if ( verbose && reportstats ) {
+                if ( verbose && reportstats && warnings != 0 ) {
                     printf("Line %d: solution to puzzle is not unique\n", line);
                 }
-                non_unique_count++;
                 nonunique_reported = true;
-                verify_one = true;
             }
+            verify_one = true;
+            status.unique = false;
         }
         if ( verify || verify_one) {
             verify_one = false;
@@ -1426,6 +1669,7 @@ enter:
            res = _mm256_or_si256(res, boxx);
            res = _mm256_or_si256(res, uniq);
            if ( ~_mm256_movemask_epi8(_mm256_cmpeq_epi16(res,_mm256_setzero_si256()))) {
+                // verification failure
                 if ( unique_check_mode == 0 ) {
                     if ( verbose ) {
                            printf("Line %d: solution to puzzle failed verification\n", line);
@@ -1434,24 +1678,30 @@ enter:
                     not_verified_count++;
                 } else {     // not supposed to get here
                     if ( verbose ) {
-                        printf("unique check: not a valid solution\n");
+                        printf("Line %d: secondary puzzle solution failed verification\n", line);
                     }
                 }
             } else  if ( verbose ) {
                if ( debug ) {
                    printf("Solution found and verified\n");
                }
+               status.verified = true;
                if ( reportstats ) {
-                   solved_count++;
-                   verified_count++;
+                   if ( unique_check_mode == 0 ) {
+                       verified_count++;
+                   }
                }
            }
-        } else if ( verbose && reportstats ) {
-           solved_count++;
         }
-
+        if ( verbose && reportstats ) {
+            if ( unique_check_mode == 0 ) {
+                solved_count++;
+            }
+        }
+        
         // Enter found digits into grid (unless we already had a solution)
         if ( unique_check_mode == 0 ) {
+            status.solved = true;
             for (unsigned char j = 0; j < 81; ++j) {
                 grid[j] = 49+_tzcnt_u32(candidates[j]);
             }
@@ -1460,25 +1710,29 @@ enter:
             no_guess_cnt += no_guess_incr;
         }
 
-        if ( unique_check == 1 ) {
-            if ( grid_state->stackpointer ) {
-                if ( verbose && debug && unique_check_mode) {
+        if ( grid_state->stackpointer && rules == Multiple ) {
+            if ( verbose && debug ) {
+                if ( unique_check_mode == 1 ) {
                     printf("back track during unique check (OK)\n");
+                } else {
+                    printf("Solution: %.81s\nBack track to determine uniqueness\n", grid);
                 }
-               if ( debug && unique_check_mode == 0 ) {
-                   printf("Solution: %.81s\nBack track to determine uniqueness\n", grid);
-               }
-                unique_check_mode = 1;
-                goto back;
             }
-            // otherwise uniqueness is verified
+            unique_check_mode = 1;
+            goto back;
         }
+        // otherwise uniqueness checking is complete
+
         if ( verbose && reportstats ) {
             past_naked_count += my_past_naked_count;
             naked_sets_searched += my_naked_sets_searched;
             digits_entered_and_retracted += my_digits_entered_and_retracted;
+            unique_rectangles_checked += my_unique_rectangles_checked;
+            if ( !status.unique ) {
+                non_unique_count++;
+            }
         }
-        return true;
+        return status;
     }
 
     my_past_naked_count++;
@@ -1640,7 +1894,9 @@ enter:
                 unsigned int m = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9), _mm256_setzero_si256()));
                 int idx = __tzcnt_u32(m)>>1;
                 if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                    printf("Line %d: stack 0, back track - column %d does not contain all digits\n", line, idx);
+                    if ( warnings != 0 ) {
+                        printf("Line %d: stack 0, back track - column %d does not contain all digits\n", line, idx);
+                    }
                 } else if ( debug ) {
                     printf("back track - missing digit in column %d\n", idx);
                 }
@@ -1669,7 +1925,9 @@ enter:
                 if ( check_back && (e_digit & (e_digit-1)) ) {
                     if ( verbose ) {
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
+                            }
                         } else if ( debug ) {
                             printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
                         }
@@ -1748,7 +2006,9 @@ enter:
                             _mm256_andnot_si256(_mm256_or_si256(rowbox_9th, rowbox_or8), mask1ff)));
                             const char *row_or_box = (m & 0xffff)?"box":"row";
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: stack 0, back track - %s %d does not contain all digits\n", line, row_or_box, irow);
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - %s %d does not contain all digits\n", line, row_or_box, irow);
+                                }
                             } else if ( debug ) {
                                 printf("back track - missing digit in %s %d\n", row_or_box, irow);
                             }
@@ -1769,10 +2029,13 @@ enter:
                                          _mm256_sub_epi16(rowbox_mask, ones)), _mm256_setzero_si256()));
                         const char *row_or_box = (m & 0xffff)?"row":"box";
                         int idx = __tzcnt_u32(m)>>1;
+                        unsigned char celli = (m & 0xffff)? irow*9+idx:b+box_offset[idx&7];
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: stack 0, back track - %s cell %s does contain multiple hidden singles\n", line, row_or_box, cl2txt[irow*9+idx%8]);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - %s cell %s does contain multiple hidden singles\n", line, row_or_box, cl2txt[celli]);
+                            }
                         } else if ( debug ) {
-                            printf("back track - multiple hidden singles in %s cell %s\n", row_or_box, cl2txt[irow*9+idx%8]);
+                            printf("back track - multiple hidden singles in %s cell %s\n", row_or_box, cl2txt[celli]);
                         }
                     }
                     goto back;
@@ -1802,7 +2065,9 @@ enter:
                         unsigned int m = 0x3ffff & _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(or_mask, _mm256_sub_epi16(or_mask, ones)), _mm256_setzero_si256()));
                         int idx = __tzcnt_u32(m)>>1;
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: stack 0, back track - column and row intersection at %s containing multiple hidden singles\n", line, cl2txt[irow*9+idx]);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - column and row intersection at %s containing multiple hidden singles\n", line, cl2txt[irow*9+idx]);
+                            }
                         } else if ( debug ) {
                             printf("back track - column and row intersection at %s contains multiple hidden singles\n", cl2txt[irow*9+idx]);
                         }
@@ -1885,7 +2150,9 @@ enter:
                 if ( check_back && cand & (cand-1) ) {
                     if ( verbose ) {
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                             printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
+                            }
                         } else if ( debug ) {
                             printf("back track - multiple hidden singles in row/box cell %s\n", cl2txt[80]);
                         }
@@ -1912,7 +2179,9 @@ enter:
             if ( check_back && (cand80 & (cand80-1)) ) {
                 if ( verbose ) {
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                         printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
+                        if ( warnings != 0 ) {
+                            printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
+                        }
                     } else if ( debug ) {
                         printf("back track - multiple hidden singles in row/box cell %s\n", cl2txt[80]);
                     }
@@ -2440,7 +2709,9 @@ enter:
                                     char ret[32];
                                     format_candidate_set(ret, candidates[i]);
                                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                        printf("Line %d: naked  set (row) %s at %s, count exceeded\n", line, ret, cl2txt[ri*9]);
+                                        if ( warnings != 0 ) {
+                                            printf("Line %d: naked  set (row) %s at %s, count exceeded\n", line, ret, cl2txt[ri*9]);
+                                        }
                                     } else if ( debug ) {
                                         printf("back track sets (row) %s at %s, count exceeded\n", ret, cl2txt[ri*9]);
                                     }
@@ -2542,7 +2813,9 @@ enter:
                                         char ret[32];
                                         format_candidate_set(ret, candidates[i]);
                                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                            printf("Line %d: naked  set (%s) %s at %s, count exceeded\n", line, js[j], ret, cl2txt[i]);
+                                            if ( warnings != 0 ) {
+                                                printf("Line %d: naked  set (%s) %s at %s, count exceeded\n", line, js[j], ret, cl2txt[i]);
+                                            }
                                         } else if ( debug ) {
                                             printf("back track sets (%s) %s at %s, count exceeded\n", js[j], ret, cl2txt[i]);
                                         }
@@ -2660,7 +2933,9 @@ enter:
                     }
                     e_i = i;
                     e_digit = candidates[i];
-                    printf("found a singleton in set search... strange\n");
+                    if ( warnings != 0 ) {
+                        printf("found a singleton in set search... strange\n");
+                    }
                     goto enter;
                 }
             } // while
@@ -2723,7 +2998,7 @@ enter:
                 unsigned char target = 0;   // the index of the only cell with three candidates
 
                 // track wether there was a single cell with count > 2
-                // if there is a second such cell, goto guess
+                // if there is a second such cell, goto no_bug
                 unsigned char not_pairs = 0;
 
                 for (unsigned char i = 0; i < 2; i++) {
@@ -2734,7 +3009,7 @@ enter:
                         sum12s += pc;
                         if ( pc != 64 ) {
                             if ( pc < 63 || not_pairs++ ) {
-                                goto guess;
+                                goto no_bug;
                             }
                             target = (i<<6) + __tzcnt_u64(~m);
                         }
@@ -2744,16 +3019,13 @@ enter:
                 sum12s -= (64-17);    // only 81 possible bits, subtract 64-17 to compensate
                 if ( sum12s == 81 ) { // this means Q == 0
 
-                    if ( unique_check ) {
+                    if ( rules != Regular ) {
                         if ( verbose && debug ) {
                             if ( grid_state->stackpointer == 0 && !unique_check_mode ) {
                                 printf("Found a bi-value universal grave. This means at least two solutions exist.\n");
                             } else if ( unique_check_mode ) {
                                 printf("checking a bi-value universal grave.\n");
-                        }
-                        }
-                        if ( verbose && debug ) {
-                            printf("a bi-value universal grave means at least two solutions exist.\n");
+                            }
                         }
                         goto guess;
                     } else if ( grid_state->stackpointer ) {
@@ -2765,7 +3037,7 @@ enter:
                         if ( verbose && debug ) {
                             printf("Found a bi-value universal grave. This means at least two solutions exist.\n");
                         }
-                        non_unique_count++;
+                        status.unique = false;  // set to non-unique even under Regular rules
                         goto guess;
                     }
                 }
@@ -2792,32 +3064,1178 @@ enter:
                     }
                     if ( digit ) {
                         bug_count++;
-                        if ( verbose && debug ) {
-                            printf("bi-value universal grave pivot:");
+                        if ( rules == Regular ) {
+                            if ( verbose && debug ) {
+                                printf("bi-value universal grave pivot:");
+                            }
+                            e_i = target;
+                            e_digit = digit;
+                            goto enter;
+                        } else {
+                            if ( verbose && debug ) {
+                                printf("bi-value universal grave pivot:\n");
+                            }
+                            grid_state = grid_state->make_guess<verbose>(target, digit);
+                            goto start;
                         }
-                        e_i = target;
-                        e_digit = digit;
-                        goto enter;
                     }
                 }
         }
+        no_bug:
+        ;
     }
+
+#if defined(OPT_UQR)
+    if ( mode_uqr )
+    {
+        // compute for each digit a bit mask for the candidates:
+        const __m256i dgt_msk = _mm256_set1_epi16(0xff);
+        unsigned int *mskp = &candidate_bits_by_value[8].u32[0];
+        for (unsigned char i = 0; i < 96; i += 32, mskp += 9*4+1 ) {
+            __m256i ld1 = *(__m256i*) &candidates[i];
+            __m256i ld2 = *(__m256i*) &candidates[i+16];
+            // one off for digit 9
+            __m256i c = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_srli_epi16(ld1,1), _mm256_srli_epi16(ld2,1)), 0xD8);
+            *mskp = _mm256_movemask_epi8(c);
+            mskp -= 4;
+            c = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_and_si256(ld1, dgt_msk), _mm256_and_si256(ld2, dgt_msk)), 0xD8);
+            for (unsigned char dgt = 8; dgt > 0; dgt--, mskp -= 4) {
+                *mskp = _mm256_movemask_epi8(c);
+                c = _mm256_slli_epi16(c,1);
+            }
+        }
+        // clean up 47 extra bits
+        for (unsigned char dgt = 0; dgt < 9; dgt++) {
+            candidate_bits_by_value[dgt].u64[1] &= 0x1ffff;
+            // cannot eliminate locked cells here, as these are essential to test/filter conjugate candidates
+            // candidate_bits_by_value[dgt].u128   &= grid_state->unlocked.u128;
+        }
+    }
+#endif
+
+#if OPT_UQR
+    //
+    // Unique (Avoidable) Rectangles
+    //
+    // The theory:
+    // For each (a) retangular four cells, (b) lying in two boxes (i.e. two cells in each box)
+    // and (c) of which none is set with a preset value:
+    //   Resolving these cells such that both pairs of diagonally opposite corners have
+    //   the same value _always_ and _automatically_ will lead to at least _2_ different
+    //   solutions.
+    // Proof: In any valid solution interchanging these two pairs
+    //   will lead to a different yet equally valid solution.
+    //
+    // The main implication is that :: in a Sudoku puzzle that has exactly one solution
+    // (e.g. as part of the rules for that puzzle, as commonly is the case) ::, it is
+    // possible during the solving process to detect such patterns and remove candidates
+    // that would otherwise lead to multiple possible solutions and hence cannot be
+    // considered for a solution.
+    //
+    // In terms of wording, such a puzzle solution is called 'unique' or 'the solution'.
+    //
+    // General notes:
+    //
+    // 1. There is nothing particularly special about these rectangles.  The same
+    //    poperty of non-uniqueness applies to many several other patterns that are
+    //    'closed' in themselves.  The unique avoidable rectangle is just the simplest
+    //    of those patterns.  To witness, aligned three cells in a box, with a coresponding
+    //    matching box, a pattern {a,b},{b,c},{a,c} will do the same, as will a
+    //    transitive combination of three aligned pairs {a,b},{b,c},{a,c}.
+    //    The pattern {a,b}, {a,b}, {a,b} can bend by 90 degrees for a corner.
+    //    The pattern called 'binary universal grave', which is an end game pattern also
+    //    falls into the same category, as it implies multiple solutions.
+    //
+    // 2. It is perfectly possible to completely disregard these patterns of multiple
+    //    solutions.  Just be prepared to take a guess to find a solution.
+    //    Remember always that for a 'regular' Sudoku puzzle there will be a solution that
+    //    does not show such a pattern.  Hence the notion of 'avoidable' patterns.
+    //
+    // Special notes:
+    //
+    // 3. The definition above only describes what will eventually be true of the final
+    //    solution in the case of a non-unique rectangle.
+    //    There is no dependency on currently locked or unlocked cells other than the
+    //    preset cells of the puzzle.  In particular, unlike in most other solving
+    //    algorithms, the knowledge of the preset positions
+    //    (as opposed to resolved cells during the solving process)
+    //    is required to detect all such rectangles.
+    //
+    // 4. Having resolved one or more or even all cells of such a unique rectangle to
+    //    candidates that correspond to the (possible) pattern does not affect the
+    //    non-uniqueness of the solution.  Remember that these unique
+    //    rectangles are sought out to be avoided - therefore it is possible that cells of
+    //    the rectangle are resolved but the rectangle itself is yet to be avoided.
+    //
+    // Solution strategy:
+    //
+    // 5. A solving algorithm for these patterns, once detected, needs to consider:
+    //    a) if the detected pattern cannot be avoided in a regular puzzle:
+    //       - if a guess was made: back track!
+    //       - if no guess was made: either the puzzle has no single solution, or a bug occurred.
+    //    b) if the detected pattern still can be avoided:
+    //       - determine which candidate(s) to remove (if any) assuming a single solution.
+    //
+    // 6. For a puzzle solving algorithm that includes proof of uniqueness _and_ back tracking:
+    //       The avoidance of unique rectangles presumes that only a single solution exists.
+    //       Uniqueness checking presumes no such thing, and therefore needs to allow for the
+    //       unique rectangle to form.  Either prevent UQR detection altogether when
+    //       checking for uniqueness, or choose avoidandance of the unique rectangle as the
+    //       primary path of a guess.
+    //
+    // Terminology:
+    // The smallest cell number of all rectangle corners: start cell
+    // A side of the rectangle accross 2 boxes: long edge
+    // A side od the rectangle within the same box: base edge
+    // All cells are connected to a base edge and a long edge.
+    // The cells are numbered in clockwise manner from 0 to 3.
+    // Each cell is associated to its clockwise right edge.
+    // Each long/base edge has an long/base opposite edge.
+    // Each cell of the rectangle has a diagonally opposite cell.
+    //
+    // Unique rectangle types, homegrown notation (aliases where given curtesy of sudokowiki.org):
+    // UR-3S
+    // - 3 cells with singles, of which 2 have the same value.
+    // - action: in the only corner with >1 candidates, eliminate (if it is present)
+    //   the candidate that would otherwise complete the UR.
+    // Note:
+    // This is the only scenario where there is no need for a pair.
+    // Therefore in the order of eliminations of possible URs, it needs to be checked before
+    // the possible URs are filtered by bivalues.
+    //
+    // UR-3P - three pairs (aka Type 1):
+    // - 3 cells with the same pair
+    // - precondition: 4th cell contains one or more candidates of the pair
+    // - action: remove the pair candidates from the 4th cell
+    //
+    // UR-2P-I with direct elimination of UR candidates
+    // (I for immediate) (no alias, Hodoku type 6):
+    // - two cells contain the same pair of candidates.
+    //   These cells can be adjacent or on a diagonal.
+    //   If the two cells are adjacent, they from conjugate pair and share an edge as a strong link.
+    //   Note: for the diagonal, the candidate is removed from the diagonal cells (!).
+    // - precondition: the other corners contain two candidates from the pair
+    //   and other candidates.
+    // - precondition 2: one of the start cell candidates x does not appear in either
+    //   of 2 parallel edges other than the UR corners (x is a conjugate for these edges).
+    //   action: remove y (the other candidate from the pair) from the other cells of the UR,
+    //   or in the case of a diagonal, from both ends of the diagonal.
+    // Note: if just one edge from one of the pair cells meets precondition 2,
+    //   y can only be removed from the other cell not on that edge (does not apply to diagonal).
+    // Note 2: UR-2P-(B,L,D) also apply independantly.
+    //
+    // UR-2P-(B,L,D) with elimination of required candidates present in the corners outside of the UR
+    // B: base edge, L: long edge, D: diagonal
+    // UR-2P-B (aka Type 2):
+    // - base edge corners contain the same pair of candidates (could also both be resolved
+    //   but not preset)
+    // - precondition: opposite edge corners contain two candidates from the pair
+    // - precondition 2: there are other candidates present (in both corners) A of the
+    //   other (non-pair) cells
+    // - action: consider the size of A: N
+    //   N==1: simply remove the extra candidate in A from all cells visible from the non-pair cells
+    //   except the two corner cells.
+    //   N>1: for each section S shared by the non-pair cells:
+    //   examine S for a naked set T of A. If size(T) == N-1:
+    //   remove the extra candidates of A from the cells of S that are in T and not corners cells.
+    //
+    // UR-2P-L (aka Type 2B):
+    // - long edge corners contain the same pair of candidates
+    // preconditions and actions are the same as for UR-2P-B
+    //
+    // UR-2P-D (aka Type 2C):
+    // - diagonal corners contain the same pair of candidates
+    // - precondition: opposite diagonal corners contain the two candidates from the pair
+    // - precondition 2: there is a single other candidate present (in both opposite diagonal corners)
+    // - action: remove extra candidate from other cells of the triads visible from the corners of the opposite diagonal.
+    // Note:
+    //   UR-2P-D is quite rare, probably because most likely UR-1P will be detected beforehand
+    //   and remove the triggers for detection.
+    //
+    // UR-1P (no alias, Hodoku: Hidden Rectangle):
+    // - one cell (1st cell) contains a pair of candidates, x and y. Select y.
+    // - precondition: all other cells of the UR contain candidates of the same pair plus some other
+    //   candidates.
+    // - precondition 2: the diagonal opposite corner cell, when set to y, will force the other
+    //   diagonal's cells both to be set to x.
+    //   action: the candidate y can be removed from the cell diagonally opposite to the start cell.
+    //   Notes:
+    //   1. UR-1P can be easily applied and visualized:
+    //   look at the 1st cell and identify the four corners. For one of the 1st cell's
+    //   candidates x, if the UR in question provides all the candidate locations in the
+    //   opposite edge and the other long edge (i.e. strongly linked).  This is sufficient.
+    //
+    // Summary of additional preconditions:
+    // UR-3P unique rectangle
+    //    None
+    //
+    // UR-1P unique rectangle
+    //    conjugate pairs on the same digit (in row/col or box), for the opposite base and opposite long edge.
+    //
+    // UR-2P-I
+    //    pair of opposite strong edges.
+    //    a single strong edge on one side eliminates a single candidate on the other side.
+    //
+    // UR-2P-* unique rectangle
+    //    one or multiple 'extra' cell candidates present in both other cells
+    //    in the case of a diagonal, only one 'extra' candidate can be present
+    //
+    // Data structures and algorithm:
+    // The data to process UQRs comes from differernt sources:
+    // 1. preset cell locations (captured on entry and pre-processed at first use)
+    //    this allows skipping 50% or more of all possible unique rectangles
+    // 2. bivalues as bit pattern (this data is shared with other algorithms,
+    //    e.g. binary universal grave plus one).
+    //    This can be leveraged to skip a good percentage of UQRs.
+    // 3. SIMD grid processing to collect information on UQRs (diagonal intersection)
+    //    as information for further processing.
+    //    Once collected for a pair of rows of a band, UQRs can be further
+    //    qualified and classified.
+    //
+
+// When getting here, bivalues are already in place to be examined.
+// Prepare per-digit bit masks
+// These that can be leveraged for querying rows/cols to check for additional candidates
+// beyond the uqr corners.
+// For further algorithms, these bitmasks can be leveraged as well: x-wing,
+// sword-fish, jelly-fish and variants.
+
+if ( mode_uqr )
+{
+    // compute just in time the superimposed preset rows by band and rc_pair:
+    if ( !have_superimposed_preset_rows ) {
+        have_superimposed_preset_rows = true;
+        for ( int i=0; i<3; i++ ) {
+            unsigned short idx[3];
+            idx[0] = original_locked.get_indexbits(27*i, 9);
+            idx[1] = original_locked.get_indexbits(27*i+9, 9);
+            idx[2] = original_locked.get_indexbits(27*i+18, 9);
+            superimposed_preset_rows[i][0] = idx[0] | idx[1];
+            superimposed_preset_rows[i][1] = idx[0] | idx[2];
+            superimposed_preset_rows[i][2] = idx[1] | idx[2];
+        }
+    }
+
+    // shuffle per row/col:  0,1,2,3,4,5,6,7,8 -> 0,1,2,-,3,4,5,-  0,1,2,-,6,7,8,-
+    const __m256i lineshuffle = _mm256_setr_epi8(0,1,2,3,4,5,-1,-1,6,7,8,9,10,11,-1,-1,
+                                                0,1,2,3,4,5,-1,-1,6,7,8,9,10,11,-1,-1);
+    const __m256i linerotate[2] = {
+          // line[0]: rotate first/third group clockwise
+          _mm256_setr_epi8(2,3,4,5,0,1,-1,-1,8,9,10,11,12,13,-1,-1,
+                           2,3,4,5,0,1,-1,-1,8,9,10,11,12,13,-1,-1),
+          // line[1]: rotate second/fourth group clockwise
+          _mm256_setr_epi8(0,1,2,3,4,5,-1,-1,10,11,12,13,8,9,-1,-1,
+                           0,1,2,3,4,5,-1,-1,10,11,12,13,8,9,-1,-1) };
+    // row combos: 0,1  0,2  1,2
+    const unsigned char row_combos[3][2] = { {0,1}, {0,2}, {1,2} };
+
+    __m256i dgt_msk = _mm256_set1_epi16(0xff);
+
+    const bit128_t vband = { ((const bit128_t*)&small_index_lut[3][Col])->u128
+                           | ((const bit128_t*)&small_index_lut[3+1][Col])->u128
+                           | ((const bit128_t*)&small_index_lut[3+2][Col])->u128 };
+
+    // Process uqrs by band
+    unsigned char band = 0;
+    if ( last_entered_count_uqr != current_entered_count) {
+        // the high byte is set to the stackpointer, so that this works
+        // across guess/backtrack
+        last_entered_count_uqr = current_entered_count;
+    } else {
+        band = last_band_uqr;
+    }
+    for ( ; band<6; band++) {
+        bool found_update = false;
+        bool rowband = band<3?true:false;
+        unsigned char rc_band = band%3;
+        last_band_uqr = band;
+
+        unsigned int bandbits = ((bit128_t*)unlocked)->get_indexbits(27, 27*3);
+        if ( rowband ) {
+            if ( bandbits == 0 ) {  // questionable
+                continue;
+            }
+        } else {
+            // once per puzzle:
+            // initialize transposed presets and superimposed columns
+            if ( !have_superimposed_preset_cols ) {
+                have_superimposed_preset_cols = true;
+
+                // first transpose original_locked
+                // start by extracting the 9 bits corresponding to each row
+                unsigned long long ol64[2] = { original_locked.u64[0] & 0x7fffffffffffffff, (original_locked.u64[0]>>63) | (original_locked.u64[1]<<1) };
+                unsigned short ol[16] = { (unsigned short)ol64[0], (unsigned short)(ol64[0]>>9), (unsigned short)(ol64[0]>>18), (unsigned short)(ol64[0]>>27),
+                                          (unsigned short)(ol64[0]>>36), (unsigned short)(ol64[0]>>45), (unsigned short)(ol64[0]>>54),
+                                          (unsigned short)ol64[1], (unsigned short)(ol64[1]>>9), 0, 0, 0, 0, 0, 0, 0 };
+
+                // one off for digit 9
+                __m256i c = _mm256_and_si256(_mm256_set1_epi16(0x01ff), *(__m256i_u*) &ol[0]);
+                __m256i c2 = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_srli_epi16(c,1), _mm256_setzero_si256()), 0xD8);
+                original_locked_transposed.u64[1] = _mm256_movemask_epi8(c2) << 8;
+                c = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_and_si256(c, dgt_msk), _mm256_setzero_si256()), 0xD8);
+                unsigned short tmp = _mm256_movemask_epi8(c);
+                original_locked_transposed.u64[0]  = (tmp & 1LL)<<63;
+                original_locked_transposed.u64[1]  |= tmp >> 1;
+                for ( short off=54; off>=0; off -= 9 ) {
+                    c = _mm256_slli_epi16(c,1);
+                    original_locked_transposed.u64[0] |= (unsigned long long)_mm256_movemask_epi8(c)<<off;
+                }
+
+                // second, superimpose the transposed columns
+                for ( int i=0; i<3; i++ ) {
+                    unsigned short idx[3];
+                    idx[0] = original_locked_transposed.get_indexbits(27*i, 9);
+                    idx[1] = original_locked_transposed.get_indexbits(27*i+9, 9);
+                    idx[2] = original_locked_transposed.get_indexbits(27*i+18, 9);
+                    superimposed_preset_cols[i][0] = idx[0] | idx[1];
+                    superimposed_preset_cols[i][1] = idx[0] | idx[2];
+                    superimposed_preset_cols[i][2] = idx[1] | idx[2];
+                }
+            }
+
+            if ( (((bit128_t*)unlocked)->u128 & (vband.u128>>(rc_band*3))) == (__uint128_t)0 ) {
+                continue;
+            }
+        }
+
+        // load band data as follows:
+        __m256i rc_v[3];
+
+        unsigned short __attribute__ ((aligned(64))) res_data[24]; // contains result data of res
+
+        if ( rowband ) {
+            unsigned char rc_indx_ = rc_band*27;
+
+            rc_v[0] = _mm256_loadu2_m128i((__m128i*)&candidates[rc_indx_+6],(__m128i*)&candidates[rc_indx_]);
+            rc_v[0] = _mm256_shuffle_epi8(rc_v[0], lineshuffle);
+            rc_indx_+=9;
+            rc_v[1] = _mm256_loadu2_m128i((__m128i*)&candidates[rc_indx_+6],(__m128i*)&candidates[rc_indx_]);
+            rc_v[1] = _mm256_shuffle_epi8(rc_v[1], lineshuffle);
+            rc_indx_+=9;
+            rc_v[2] = _mm256_loadu2_m128i((__m128i*)&candidates[rc_indx_+6], (__m128i*)&candidates[rc_indx_]);
+            rc_v[2] = _mm256_shuffle_epi8(rc_v[2], lineshuffle);
+        } else {
+            unsigned short *cp = &candidates[rc_band*3];
+
+            rc_v[0] = _mm256_setr_epi16(cp[0], cp[9], cp[18], 0, cp[27], cp[36], cp[45], 0,
+                                        cp[54], cp[63], cp[72], 0, 0, 0, 0, 0);
+            cp += 1;
+            rc_v[1] = _mm256_setr_epi16(cp[0], cp[9], cp[18], 0, cp[27], cp[36], cp[45], 0,
+                                        cp[54], cp[63], cp[72], 0, 0, 0, 0, 0);
+            cp += 1;
+            rc_v[2] = _mm256_setr_epi16(cp[0], cp[9], cp[18], 0, cp[27], cp[36], cp[45], 0,
+                                        cp[54], cp[63], cp[72], 0, 0, 0, 0, 0);
+        }
+
+        for ( unsigned char rc_pair = 0; rc_pair < 3; rc_pair++ ) {
+
+            // for linev[0]: swap quads to [0, 1, 0, 2]
+            // for linev[1]: swap quads to [1, 0, 2, 0]
+            // for linev[2]: swap linev[0] quads to [1,3,x2,x3]
+            // for linev[3]: swap linev[1] quads to [2,0,x2,x3]
+            __m256i linev[4] = { _mm256_permute4x64_epi64(rc_v[row_combos[rc_pair][0]], 0x84),
+                                 _mm256_permute4x64_epi64(rc_v[row_combos[rc_pair][1]], 0x21),
+                                 _mm256_permute4x64_epi64(linev[0], 0xED),
+                                 _mm256_permute4x64_epi64(linev[1], 0xE2) };
+            for ( unsigned char perm = 0; perm<3; perm++ ) {
+                *(__m256i_u*)&res_data = _mm256_and_si256(linev[0], linev[1]);
+                // result (for first iteration):
+                // 0.0&1.3, 0.1&1.4, 0.2&1.5, - 0.3&1.0, 4.1&r1.1, 0.5&r1.2, -
+                // 0.0&1.6, 0.1&1.7, 0.2&1.8, - 0.6&1.0, 7.1&r1.1, 0.8&r1.2, -
+
+                // Check for UQRs between box 1 and 2
+                 *(__m128i_u*)&res_data[16] = _mm256_castsi256_si128(_mm256_and_si256(linev[2], linev[3]));
+
+                // evaluate permutated row/column results for valid uqrs:
+                // - if the uqr contains a preset, it is eliminated.
+                // - check diag1, diag2 both to be not 0, and at the same, eliminate single uqr candidates in the opposite diagonal.
+                // - check that there is at least one bivalue (unless there are 3 single cands)
+
+                const Uqr *permp = cuqrs[perm];
+                unsigned char dist2 = rc_pair == 1 ? 2:1;
+                unsigned short preset_test;
+                unsigned char start_row_indx = 0;
+                unsigned char start_col_indx = 0;
+                if ( rowband ) {
+                    start_row_indx = (rc_band*3 + row_combos[rc_pair][0])*9;
+                    preset_test = superimposed_preset_rows[rc_band][rc_pair];
+                } else {
+                    start_col_indx = rc_band*3 + row_combos[rc_pair][0];
+                    preset_test = superimposed_preset_cols[rc_band][rc_pair];
+                }
+                for (unsigned char uqr_cnt=0; uqr_cnt<9; uqr_cnt++, permp++) {
+                    if ( preset_test & permp->pattern ) {
+                        continue;
+                    }
+                    const unsigned char *cuqr_accessp = cuqr_access[uqr_cnt];
+                    unsigned short diag[2] = { res_data[cuqr_accessp[0]],
+                                               res_data[cuqr_accessp[1]] };
+
+                    // cross elimination based on diagonal info
+                    if (__popcnt16(diag[0]) == 1 ) {
+                        diag[1] &= ~diag[0];
+                    } else if (__popcnt16(diag[1]) == 1 ) {
+                        diag[0] &= ~diag[1];
+                    }
+
+                    if (diag[0] == 0 || diag[1] == 0 ) {
+                        continue;
+                    }
+
+                    // before eliminating other rectangles based on bivalues,
+                    // check for 3 singles with 2 of them the same (these will always
+                    // form a diagonal).
+                    // remove the other single from the fourth corner to avoid a unique
+                    // rectangle from forming.
+                    UqrCorner uqr_corners[4];
+                    UqrPair uqr_pairs[3];
+                    unsigned short uqr_singles = 0;
+                    unsigned short uqr_singles_cnt = 0;
+                    unsigned char start_cell = rowband ? permp->start_cell +  start_row_indx : (permp->start_cell*9 + start_col_indx);
+                    unsigned char dist1    = permp->dist;
+
+                    // clockwise urq corners
+                    uqr_corners[0].indx = start_cell;
+                    if ( rowband ) {
+                        uqr_corners[1].indx = start_cell+dist1;
+                        uqr_corners[2].indx = start_cell+dist1+9*dist2;
+                        uqr_corners[3].indx = start_cell+9*dist2;
+                    } else {
+                        // in the vertical band, dist1 and dist2 are transposed
+                        uqr_corners[1].indx = start_cell+dist2;
+                        uqr_corners[2].indx = start_cell+9*dist1+dist2;
+                        uqr_corners[3].indx = start_cell+9*dist1;
+                    }
+
+                    // identify any corner with a bivalue or single
+                    unsigned short all_digits = 0;
+                    unsigned char not_singles = 0;
+                    for ( int i=0; i<4; i++ ) {
+                        unsigned short dgts = candidates[uqr_corners[i].indx];
+                        all_digits |= dgts;
+                        unsigned char cnt = __popcnt16(dgts);
+                        if ( cnt == 1 ) {
+                            uqr_singles |= dgts;
+                            uqr_singles_cnt++;
+                        } else {
+                            not_singles |= 1<<i;
+                        }
+                    }
+
+                    // Pattern UR-3S
+                    if ( __popcnt16(uqr_singles) == 2 && uqr_singles_cnt == 3 ) {
+                        unsigned char ix = __tzcnt_u16(not_singles);
+                        char ret[32];
+                        format_candidate_set(ret, uqr_singles);
+                        unsigned char celli = uqr_corners[ix].indx;
+                        unsigned short single = candidates[uqr_corners[(ix+2)&3].indx];
+                        if ( (candidates[celli] & single) && __popcnt16(candidates[celli]) > 1 ) {
+                            unique_rectangles_avoided++;
+                            grid_state->updated.set_indexbit(celli);
+                            // unless under 'Regular' rules, capture the avoidable UQR as a guess
+                            // provide 'resolution' in form of a guess
+                            if ( rules != Regular ) {
+                                if ( verbose && debug ) {
+                                    snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        3 singles pattern: remove candidate %d from cell %s",
+                                            ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                            1+__tzcnt_u16(single), cl2txt[celli]);
+                                    snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        3 singles pattern: set %d at %s",
+                                            ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                            1+__tzcnt_u16(single), cl2txt[celli]);
+                                }
+                                // call make_guess using a lambda
+                                grid_state = grid_state->make_guess<verbose>(
+                                    celli,
+                                    [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                    // this is the avoidance side of the UQR resolution
+                                    // the GridState to continue with:
+                                    newgs.candidates[celli] &= ~single;
+                                    msg[0] = guess_message[0];
+                                    // this is to provoke the UQR
+                                    // the GridState to back track to:
+                                    oldgs.candidates[celli]  &= ~newgs.candidates[celli];
+                                    msg[1] = guess_message[1];
+                                });
+                                goto guess_made_with_incr;
+                            }
+                            // otherwise simply avoid the UQR:
+                            candidates[celli] &= ~single;
+                            if ( verbose && debug ) {
+                                printf("avoiding unique rectangle: %s %s - %s\n3 singles pattern: remove candidate %d from cell %s\n",
+                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                    1+__tzcnt_u16(single), cl2txt[celli]);
+                            }
+                            if ( (candidates[celli] & (candidates[celli]-1)) ) {
+                                goto enter;
+                            }
+                            found_update = true;
+                        }
+                    }
+
+                    // if all corners together contain the same 2 digits, a unique rectangle has been found.
+                    if ( check_back && not_singles && __popcnt16(all_digits) == 2 ) {
+                        if ( grid_state->stackpointer && rules == Regular ) {
+                            if ( verbose && debug ) {
+                                char ret[32];
+                                if ( verbose && debug ) {
+                                    format_candidate_set(ret, all_digits);
+                                }
+                                printf("back track - found a completed unique rectangle %s at %s %s\n", ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
+                            }
+                            goto back;
+                        } else {
+                            // there's no point doing anything here... except:
+                            if ( grid_state->stackpointer == 0 ) {
+                                status.unique = false;
+                            }
+                            // not even:
+                            // printf("consciously ignoring a completed unique rectangle at %s %s\n", cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
+                        }
+                    }
+
+                    bit128_t corner_bits {};
+                    if ( rowband ) {
+                        corner_bits.set_indexbits( permp->pattern, start_row_indx, 9);
+                        corner_bits.set_indexbits( permp->pattern, start_row_indx+9*dist2, 9);
+                    } else {
+                        for ( unsigned char k=0; k<4; k++ ) {
+                            corner_bits.set_indexbit(uqr_corners[k].indx);
+                        }
+                    }
+
+                    if ( (bivalues & corner_bits) == (__uint128_t)0 ) {
+                        continue;
+                    }
+
+                    my_unique_rectangles_checked++;
+
+                    // complete corner infos, including edges and uqr_pairs infos
+                    for ( int i=0; i<4; i++ ) {
+                        unsigned short dgts = candidates[uqr_corners[i].indx];
+                        unsigned char cnt = __popcnt16(dgts);
+                        if ( cnt == 1 ) {
+                            uqr_corners[i].is_single = true;
+                        } else if ( cnt == 2 ) {
+                            unsigned char pi = 0;
+                            // search for pair
+                            for ( ; pi<3; pi++) {
+                                if ( uqr_pairs[pi].cnt == 0 ) {
+                                    uqr_pairs[pi].digits = dgts;
+                                    break;
+                                } else if ( uqr_pairs[pi].digits == dgts ) {
+                                    break;
+                                }
+                            }
+                            if ( pi<3 ) {
+                                uqr_pairs[pi].cnt++;
+                                uqr_pairs[pi].crnrs |= 1<<i;
+                            }
+                            uqr_corners[i].pair_indx = pi;
+                            uqr_corners[i].is_pair = true;
+                        }
+                        if ( i & 1 ) {
+                            uqr_corners[i].right_edge = (__uint128_t*)small_index_lut[uqr_corners[i].indx%9][Col];
+                        } else {
+                            uqr_corners[i].right_edge = (__uint128_t*)small_index_lut[uqr_corners[i].indx/9][Row];
+                        }
+                    }
+
+                    // based on pairs count, process the different scenarios
+                    for ( int pi=0; pi<3; pi++ ) {
+                        if ( uqr_pairs[pi].cnt == 0 ) {
+                            // no pairs (cannot happen)
+                            break;
+                        }
+                        switch ( uqr_pairs[pi].cnt ) {
+                        case 3:  // UR-3P (aka Type 1):
+                        {
+                            // find the 4th corner
+                            unsigned char corner4_index = uqr_corners[__tzcnt_u16(~uqr_pairs[pi].crnrs)].indx;
+                            unsigned short pair = uqr_pairs[pi].digits;
+                            if ( candidates[corner4_index] != pair ) {
+                                // unless under 'Regular' rules, provide 'resolution' in form of a guess
+                                unique_rectangles_avoided++;
+                                if ( rules != Regular ) {
+                                    unsigned short other_cands = candidates[corner4_index] & ~pair;
+                                    if ( verbose && debug ) {
+                                        char ret[32];
+                                        char ret2[32];
+                                        format_candidate_set(ret, pair);
+                                        format_candidate_set(ret2, other_cands);
+                                        snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        3 pairs pattern: remove candidates %s from %s",
+                                                 ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                 ret, cl2txt[corner4_index]);
+                                        snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        3 pairs pattern: remove candidates %s from %s",
+                                                 ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                 ret2, cl2txt[corner4_index]);
+                                    }
+                                    // call make_guess using a lambda
+                                    grid_state = grid_state->make_guess<verbose>(
+                                        corner4_index,
+                                        [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                        // this is the avoidance side of the UQR resolution
+                                        // the GridState to continue with:
+                                        newgs.candidates[corner4_index] = other_cands;
+                                        msg[0] = guess_message[0];
+                                        // this is to provoke the UQR
+                                        // the GridState to back track to:
+                                        oldgs.candidates[corner4_index]  &= ~other_cands;
+                                        msg[1] = guess_message[1];
+                                    });
+                                    goto guess_made_with_incr;
+                                }
+                                // simply avoid the UQR
+                                candidates[corner4_index] &= ~pair;
+                                if ( verbose && debug ) {
+                                    char ret[32];
+                                    format_candidate_set(ret, pair);
+                                    printf("avoiding unique rectangle: %s %s - %s\n3 pairs pattern: remove candidates %s from %s\n",
+                                            ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                            ret, cl2txt[corner4_index]);
+                                }
+                                grid_state->updated.set_indexbit(corner4_index);
+                                if ( (candidates[corner4_index] & (candidates[corner4_index]-1)) ) {
+                                    goto enter;
+                                }
+                                found_update = true;
+                            }
+                            break;
+                        }
+                        case 2:  // UR-2P-I and UR-2P-BLD
+                        {
+                            // Two pairs of candidates is fairly common.
+                            // We have two cells, c1 and c2, which both contain the same
+                            // pair (a and b).
+                            // For x=a or x=b we examine the cells diagonally opposite of
+                            // c1 and c2, o1 and o2.
+                            // We call y the other candidate of a or b so that x != y.
+                            // (not to get confused, c1 and c2 can by diagonally
+                            // opposite of each other, in which case o1=c1 and o2=c2)
+                            // What are the conditions to effect, if y is chosen in o1 or o2
+                            // that we obtain the unique rectangle x y x y.
+                            // That condition is simple:
+                            // - if in any pair of opposing edges, x is conjugate with
+                            //   the x in the other corner on that edge, then
+                            //   y must not be chosen in either o1 or o2 or a unique rectangle forms.
+                            //   Hence we should deselect y in o1 and o2.
+                            //   if c1 and c2 are adjacent (not diagonal), and the link between c1
+                            //   and o1 is weak, but between o2 and c2 it is strong, then y can
+                            //   only be eliminated from o1.
+                            // Note: there is a part 2 to this procedure.
+                            // We can form the set of extra candidates of o1 and o2 if they are
+                            // adjacent, and try to find a set in the row or col that contains these
+                            // candidates (as they are required they form a virtual set of candidates)
+                            // and if a set can be found, its candidates can be eliminated elsewhere
+                            // in the row/col.
+
+                            // uqr_cand: the tentative value of x
+                            unsigned short uqr_cand = _blsi_u32(uqr_pairs[pi].digits);
+                            // all the cells containing that candidate:
+                            __uint128_t *cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                            // either opposite pair will do for both diagonal and side by side
+                            // conjugate pairs.
+                            // setup the opposing edges without the corners:
+                            __uint128_t uqr_opp_edges[2] = {corner_bits,corner_bits};
+                            uqr_opp_edges[0] ^= *uqr_corners[0].right_edge | *uqr_corners[2].right_edge;
+                            uqr_opp_edges[1] ^= *uqr_corners[1].right_edge | *uqr_corners[3].right_edge;
+                            // determine strong edge:
+                            unsigned int strong_edge = 0;
+                            bool is_diag = false;
+                            switch ( uqr_pairs[pi].crnrs ) {
+                            case 0b101:
+                            case 0b1010:
+                                is_diag = true;
+                                break;
+                            case 0b1001:
+                                strong_edge = 3;
+                                break;
+                            case 0b1100:
+                                strong_edge = 2;
+                                break;
+                            case 0b110:
+                                strong_edge = 1;
+                                break;
+                            default:
+                                break;
+                            }
+                            unsigned short weak_corner = 0xff;
+                            unsigned short weak_corner_y = 0xff;
+                            int i=0;
+                            for ( ; i<2; i++ ) {
+                                if (    (uqr_opp_edges[0] & *cbbv) == (__uint128_t)0
+                                     || (uqr_opp_edges[1] & *cbbv) == (__uint128_t)0 ) {
+                                    // found x
+                                    // try for the other candidate too as special case:
+                                    // This is a back track scenario, as both candidates
+                                    // when selected each cause a completed UR.
+                                    // Quite rare as well.
+                                    if ( check_back && uqr_cand != uqr_pairs[pi].digits ) {
+                                        cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand ^ uqr_pairs[pi].digits)].u128;
+                                        if (    (uqr_opp_edges[0] & *cbbv) == (__uint128_t)0
+                                             || (uqr_opp_edges[1] & *cbbv) == (__uint128_t)0 ) {
+
+                                            // find a corner with both digits
+                                            unsigned short pair_digits = uqr_pairs[pi].digits;
+                                            char ret[32];
+                                            if ( verbose && debug ) {
+                                                format_candidate_set(ret, pair_digits);
+                                            }
+                                            if ( grid_state->stackpointer && rules == Regular ) {
+                                                if ( verbose && debug ) {
+                                                    printf("back track - found an unavoidable unique rectangle %s at %s %s\n", ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
+                                                }
+                                                goto back;
+                                            } else {
+                                                // there's no point doing anything here...
+                                                // not even:
+                                                // printf("consciously ignoring a completed unique rectangle at %s %s\n", cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                } else if ( !is_diag ) {
+                                    // strong set is the index of uqr_opp_edges containing the strong link provided by the pair (not for diagonal).
+                                    unsigned int strong_set =  (strong_edge & 1) ? 1:0;
+                                    // try both sides for weak set...
+                                    if ( (((corner_bits & *uqr_corners[(strong_set+3)&3].right_edge) ^ *uqr_corners[(strong_set+3)&3].right_edge) & *cbbv) == 0 ) {
+                                        weak_corner = strong_set+1;
+                                    } else if ( (((corner_bits & *uqr_corners[strong_set+1].right_edge) ^ *uqr_corners[strong_set+1].right_edge) & *cbbv) == 0 ) {
+                                        weak_corner = (strong_set+3)&3;
+                                    }
+                                    if ( weak_corner != 0xff ) {
+                                        unsigned char weak_corner_indx =
+                                              uqr_pairs[pi].crnrs & (1<<weak_corner) ?
+                                              uqr_corners[(weak_corner+1)&3].indx :
+                                              uqr_corners[weak_corner].indx;
+                                        weak_corner_y =  uqr_cand ^ uqr_pairs[pi].digits;
+                                        if ( (candidates[weak_corner_indx] & weak_corner_y) ) {
+                                            grid_state->updated.set_indexbit(weak_corner_indx);
+                                            unique_rectangles_avoided++;
+                                            // unless under 'Regular' rules, capture the avoidable UQR
+                                            // provide 'resolution' in form of a guess
+                                            char ret[32];
+                                            if ( verbose && debug ) {
+                                                format_candidate_set(ret, uqr_pairs[pi].digits);
+                                            }
+                                            if ( rules != Regular ) {
+                                                if ( verbose && debug ) {
+                                                    snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s",
+                                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                             1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                                    snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: set %d at %s",
+                                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                             1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                                }
+                                                // call make_guess using a lambda
+                                                grid_state = grid_state->make_guess<verbose>(
+                                                    weak_corner_indx,
+                                                    [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                                    // this is the avoidance side of the UQR resolution
+                                                    // the GridState to continue with:
+                                                    newgs.candidates[weak_corner_indx] &= ~weak_corner_y;
+                                                    msg[0] = guess_message[0];
+                                                    // this is to provoke the UQR
+                                                    // the GridState to back track to:
+                                                    oldgs.candidates[weak_corner_indx] = weak_corner_y;
+                                                    msg[1] = guess_message[1];
+                                                });
+                                                goto guess_made_with_incr;
+                                            }
+                                            // simply avoid the UQR
+                                            candidates[weak_corner_indx] &= ~weak_corner_y;
+                                            if ( verbose && debug ) {
+                                                printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d at %s\n",
+                                                       ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                       1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                            }
+                                            if ( (candidates[weak_corner_indx] & (candidates[weak_corner_indx]-1)) == 0 ) {
+                                                goto enter;
+                                            }
+                                            found_update = true;
+                                        }
+                                    }
+                                }
+                                // set x to the other candidate
+                                uqr_cand ^= uqr_pairs[pi].digits;
+                                if ( uqr_cand == 0 ) {  // nothing to find
+                                    i=2;
+                                    break;
+                                }
+                                weak_corner = 0xff;
+                                cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                            }
+                            if ( i<2 ) {
+                                // select the diagonally opposite corners:
+                                // rotate bits in the nibble by 2:
+                                unsigned short ix = 0xf & (uqr_pairs[pi].crnrs | uqr_pairs[pi].crnrs<<4)>>2;
+                                // from x and the pair of digits, determine y:
+
+                                if ( uqr_cand != uqr_pairs[pi].digits ) {
+                                    uqr_cand ^= uqr_pairs[pi].digits;
+                                }
+                                unsigned char indx2upd[2];
+                                for ( int k=0; k<2; k++ ) {
+                                    unsigned char indx = __tzcnt_u16(ix);
+                                    indx2upd[k] = uqr_corners[indx].indx;
+                                    ix &= ~(1<<indx);
+                                }
+                                if (    candidates[indx2upd[0]] != uqr_cand
+                                     || candidates[indx2upd[1]] != uqr_cand ) {
+                                    char ret[32];
+                                    if ( verbose && debug ) {
+                                        format_candidate_set(ret, uqr_pairs[pi].digits);
+                                    }
+                                    found_update = true;
+                                    unique_rectangles_avoided++;
+                                    if ( rules == Regular ) {
+                                        candidates[indx2upd[0]] &= ~uqr_cand;
+                                        candidates[indx2upd[1]] &= ~uqr_cand;
+                                        if ( verbose && debug ) {
+                                            printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d from cells %s %s\n",
+                                                   ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                   1+__tzcnt_u16(uqr_cand),
+                                                   cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                        }
+                                        if (    (candidates[indx2upd[0]] & (candidates[indx2upd[0]] - 1)) == 0
+                                             || (candidates[indx2upd[1]] & (candidates[indx2upd[1]] - 1)) == 0 ) {
+                                            goto enter;
+                                        }
+                                    } else {
+                                        if ( is_diag ) {
+                                            unsigned short other_cand = uqr_cand ^ uqr_pairs[pi].digits;
+                                            if ( verbose && debug ) {
+                                                snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s and %s",
+                                                         ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                         1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                                snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: remove candidate %d at %s and %s",
+                                                        ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                        1+__tzcnt_u16(other_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                            }
+                                            // call make_guess using a lambda
+                                            grid_state = grid_state->make_guess<verbose>(
+                                                        indx2upd[0],
+                                                        [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                                            // this is the avoidance side of the UQR resolution
+                                                            // the GridState to continue with:
+                                                            newgs.candidates[indx2upd[0]] &= ~uqr_cand;
+                                                            newgs.candidates[indx2upd[1]] &= ~uqr_cand;
+                                                            msg[0] = guess_message[0];
+                                                            // this is to provoke the UQR
+                                                            // the GridState to back track to:
+                                                            oldgs.candidates[indx2upd[0]] &= ~other_cand;
+                                                            oldgs.candidates[indx2upd[1]] &= ~other_cand;
+                                                            msg[1] = guess_message[1];
+                                                        });
+                                             goto guess_made_with_incr;
+                                        } else {
+                                            if ( verbose && debug ) {
+
+                                                snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s and %s",
+                                                            ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                            1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                                snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: set candidate %d at %s",
+                                                            ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                            1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]]);
+                                            }
+                                            // call make_guess using a lambda
+                                            grid_state = grid_state->make_guess<verbose>(
+                                                        indx2upd[0],
+                                                        [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                                            // this is the avoidance side of the UQR resolution
+                                                            // the GridState to continue with:
+                                                            newgs.candidates[indx2upd[0]] &= ~uqr_cand;
+                                                            newgs.candidates[indx2upd[1]] &= ~uqr_cand;
+                                                            msg[0] = guess_message[0];
+                                                            // this is to provoke the UQR
+                                                            // the GridState to back track to:
+                                                            oldgs.candidates[indx2upd[0]] = uqr_cand;
+                                                            msg[1] = guess_message[1];
+                                                        });
+                                             goto guess_made_with_incr;
+                                        }
+                                    }
+                                }
+                            } // for
+
+                            // continuing with UR-P2-BLD pattern
+                            unsigned char pat = uqr_pairs[pi].crnrs;
+                            unsigned short non_uqr_cands = 0;
+                            unsigned char non_pairs_celli[2];
+                            unsigned char cl = 0;
+                            for ( unsigned char i=0; i<2; i++, cl++, pat >>= 1 ) {
+                                while ( (pat & 1) ) {
+                                    pat >>= 1;
+                                    cl++;
+                                }
+                                non_pairs_celli[i] = uqr_corners[cl].indx;
+                                non_uqr_cands |= candidates[non_pairs_celli[i]];
+                            }
+                            // remove the UR candidates to avoid:
+                            non_uqr_cands &= ~uqr_pairs[pi].digits;
+                            unsigned char non_uqr_cands_cnt = __popcnt16(non_uqr_cands);
+
+                            // continuing with UR-P2-BLD patterns (only for Regular rules)
+                            //
+                            if ( rules == Regular ) {
+                                // build the intersection from:
+                                // - 2 cell visibilities
+                                // - candidate digits pattern
+                                // - minus the 4 UR cells
+                                bit128_t cand_removal_indx {};
+
+                                bool check_set = false;
+                                if ( non_uqr_cands_cnt == 1 ) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+                                    cand_removal_indx.u128 = *(const __uint128_t*)&big_index_lut[non_pairs_celli[0]][All];
+                                    cand_removal_indx.u128 &= *(const __uint128_t*)&big_index_lut[non_pairs_celli[1]][All];
+                                    cand_removal_indx.u128 &= candidate_bits_by_value[__tzcnt_u16(non_uqr_cands)].u128;
+#pragma GCC diagnostic pop
+                                    check_set = true;
+                                } else if ( !is_diag ) {   // exclude UR-2P-D pattern
+                                    unsigned short non_uqr_cands_ = non_uqr_cands;
+                                    while ( non_uqr_cands_ ) {
+                                        unsigned char cand_ = __tzcnt_u16(non_uqr_cands_);
+                                        non_uqr_cands_ = _blsr_u32(non_uqr_cands_);
+                                        cand_removal_indx.u128 |= candidate_bits_by_value[cand_].u128;
+                                    }
+
+                                    if ( (candidates[non_pairs_celli[0]] & ~non_uqr_cands) && (candidates[non_pairs_celli[1]] & ~non_uqr_cands) ) {
+                                        unsigned int m = 0;
+                                        __m256i a = _mm256_set1_epi16(non_uqr_cands);
+                                        bool is_row = (non_pairs_celli[1] - non_pairs_celli[0])%9;
+
+                                        if ( is_row ) {
+                                            // row based
+                                            unsigned short row = non_pairs_celli[0]/9;
+                                            __m256i res = _mm256_cmpeq_epi16(a, _mm256_or_si256(a, *(__m256i_u*) &candidates[9*row]));
+                                            m = compress_epi16_boolean<true>(res);
+                                        } else {
+                                            // column based
+                                            unsigned short ci = non_pairs_celli[0]%9;
+                                            __m256i c = _mm256_set_epi16(0,0,0,0,0,0,0,candidates[ci+72], candidates[ci+63], candidates[ci+54], candidates[ci+45], candidates[ci+36], candidates[ci+27], candidates[ci+18], candidates[ci+9], candidates[ci]);
+                                            m = compress_epi16_boolean<true>(_mm256_cmpeq_epi16(a, _mm256_or_si256(a, c)));
+                                        }
+                                        bit128_t cand_visibility_indx {};
+                                        if ( _popcnt32(m & 0x3ffff)>>1 == non_uqr_cands_cnt-1 ) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+                                            cand_visibility_indx.u128 = *(const __uint128_t*)&big_index_lut[non_pairs_celli[0]][is_row?Row:Col];
+#pragma GCC diagnostic pop
+                                            check_set = true;
+                                        }
+
+                                        // box based
+                                        unsigned short b = box_start[non_pairs_celli[0]];
+                                        if ( b == box_start[non_pairs_celli[1]] ) {
+                                            __m256i c = _mm256_set_epi16(0,0,0,0,0,0,0,candidates[b+20], candidates[b+19], candidates[b+18], candidates[b+11], candidates[b+10], candidates[b+9], candidates[b+2], candidates[b+1], candidates[b]);
+                                            m = compress_epi16_boolean<true>(_mm256_cmpeq_epi16(a, _mm256_or_si256(a, c)));
+                                            if ( (_popcnt32(m & 0x3ffff)>>1) == (non_uqr_cands_cnt-1) ) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+                                                cand_visibility_indx.u128 |= *(const __uint128_t*)&big_index_lut[non_pairs_celli[0]][Box];
+#pragma GCC diagnostic pop
+                                                check_set = true;
+                                            }
+                                        }
+                                        cand_removal_indx.u128 &= cand_visibility_indx.u128;
+                                    }
+                                }
+
+                                cand_removal_indx.u128 &= ~corner_bits;
+
+                                // double check to avoid multiple hits
+                                if ( check_set && cand_removal_indx != (__uint128_t)0 ) {
+                                    for ( int k=0;  k<2; k++ ) {
+                                        unsigned long long cindx = cand_removal_indx.u64[k];
+                                        while ( cindx ) {
+                                            unsigned char j_rel = tzcnt_and_mask(cindx);
+                                            unsigned char j = j_rel + (k<<6);
+
+                                            // check for set members, must not remove
+                                            // check also for locations where there is nothing to remove
+                                            if ( check_set && (    (candidates[j] & ~non_uqr_cands) == 0
+                                                                || (candidates[j] &  non_uqr_cands) == 0 ) ) {
+                                                cand_removal_indx.unset_indexbit(j);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // iterate over cells and remove the candidate to avoid
+                                if ( check_set && cand_removal_indx != (__uint128_t)0 ) {
+                                    unique_rectangles_avoided++;
+                                    found_update = true;
+                                    if ( verbose && debug ) {
+                                        char ret[32];
+                                        char ret2[32];
+                                        format_candidate_set(ret, uqr_pairs[pi].digits);
+                                        format_candidate_set(ret2, non_uqr_cands);
+                                        printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidates %s from cells outside UR at: ",
+                                               ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                               ret2);
+                                    }
+                                    bool got_single = false;
+                                    for ( int k=0;  k<2; k++ ) {
+                                        unsigned long long cindx = cand_removal_indx.u64[k];
+                                        const char *cma = "";
+                                        while ( cindx ) {
+                                            unsigned char j_rel = tzcnt_and_mask(cindx);
+                                            unsigned char j = j_rel + (k<<6);
+                                            unsigned short cj = candidates[j] & ~non_uqr_cands;
+                                            if ( cj ) {
+                                                candidates[j] = cj;
+                                                if ( (cj & (cj-1)) == 0 ) {
+                                                    got_single = true;
+                                                }
+                                                grid_state->updated.set_indexbit(j);
+                                                if ( verbose && debug ) {
+                                                    printf("%s%s", cma, cl2txt[j]);
+                                                    cma = ",";
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if ( verbose && debug ) {
+                                        printf("\n");
+                                    }
+                                    if ( got_single ) {
+                                        goto enter;
+                                    }
+                                }
+                            } else {
+                                // same as above, but as a lambda guess
+                                // ... just too tedious
+                            }
+                            break;
+                        }
+                        case 1:
+                        {
+                            // uqr_cand: the tentative value of x
+                            unsigned short uqr_cand = _blsi_u32(uqr_pairs[pi].digits);
+                            int j=0;
+                            unsigned char crnr_indx = (__tzcnt_u16(uqr_pairs[pi].crnrs)+2)&3;
+                            unsigned char indx = uqr_corners[crnr_indx].indx;
+                            __uint128_t uqr_crnr_edges = *uqr_corners[crnr_indx].right_edge | *uqr_corners[(crnr_indx+3)&3].right_edge;
+                            __uint128_t *cbbv;
+                            unsigned short uqr_alt_cand;
+                            for ( ; j<2; j++ ) {
+                                uqr_alt_cand = uqr_cand ^ uqr_pairs[pi].digits;
+                                // check whether there is anyting to remove:
+                                if ( candidates[indx] & uqr_alt_cand ) {
+                                    // all the cells containing that candidate:
+                                    cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                                    if ( ((uqr_crnr_edges & *cbbv) | corner_bits) == corner_bits ) {
+                                        // found x
+                                        break;
+                                    }
+                                }
+                                // switch to the other candidate
+                                uqr_cand = uqr_alt_cand;
+                                if ( uqr_cand == 0 ) {  // nothing to find
+                                    j=2;
+                                    break;
+                                }
+                            }
+                            if ( j<2 ) {
+                                // y: uqr_alt_cand
+                                // simply eliminate y from the opposite corner
+
+                                if ( candidates[indx] & uqr_alt_cand ) {
+                                    unique_rectangles_avoided++;
+                                    grid_state->updated.set_indexbit(indx);
+                                    // unless under 'Regular' rules, capture the avoidable UQR
+                                    // provide 'resolution' in form of a guess
+                                    if ( rules == Regular ) {
+                                        // simply avoid the UQR
+                                        candidates[indx] &= ~uqr_alt_cand;
+                                        if ( verbose && debug ) {
+                                            char ret[32];
+                                            format_candidate_set(ret, uqr_pairs[pi].digits);
+                                            printf("avoiding unique rectangle: %s %s - %s\n1 pair pattern: remove candidate %d from cell %s\n",
+                                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                        }
+                                        found_update = true;
+                                        if ( (candidates[indx] & (candidates[indx]-1)) == 0 ) {
+                                            goto enter;
+                                        }
+                                    } else {
+                                        if ( verbose && debug ) {
+                                            char ret[32];
+                                            format_candidate_set(ret, uqr_pairs[pi].digits);
+                                            snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        1 pair pattern: remove candidate %d at %s",
+                                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                            snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        1 pair pattern: set %d at %s",
+                                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
+                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                        }
+                                        // call make_guess using a lambda
+                                        grid_state = grid_state->make_guess<verbose>(
+                                                indx,
+                                                [=] (GridState &oldgs, GridState &newgs, const char *msg[]) {
+                                                    // this is the avoidance side of the UQR resolution
+                                                    // the GridState to continue with:
+                                                    newgs.candidates[indx] &= ~uqr_alt_cand;
+                                                    msg[0] = guess_message[0];
+                                                    // this is to provoke the UQR
+                                                    // the GridState to back track to:
+                                                    oldgs.candidates[indx] = uqr_alt_cand;
+                                                    msg[1] = guess_message[1];
+                                                });
+                                        goto guess_made_with_incr;
+                                    }
+                                }
+                            }
+                            break;
+                        } // case 1
+                        } // switch
+                    } // for pairs
+                } // for 6 uqrs
+
+                // finally rotate positions for next group of 9 UQRs
+                // for line 0 and 2 rotate first and third group clockwise by 1,
+                // for line 1 and 3 rotate second and fourth group clockwise by 1
+                linev[0] = _mm256_shuffle_epi8(linev[0], linerotate[0]);
+                linev[1] = _mm256_shuffle_epi8(linev[1], linerotate[1]);
+                linev[2] = _mm256_shuffle_epi8(linev[2], linerotate[0]);
+                linev[3] = _mm256_shuffle_epi8(linev[3], linerotate[1]);
+            }
+        }
+        if ( found_update ) {
+            last_band_uqr = (band+1)%6;
+            goto enter;
+        };
+    }
+}
+#endif
 
 guess:
     // Make a guess if all that didn't work
     grid_state = grid_state->make_guess<verbose>(triad_info, bivalues);
-    current_entered_count += 0x101;     // increment high byte for the new grid_state, plus one for the guess made.
+    current_entered_count++;            // increment by one for the guess made.
+    // guess_made: when the guess was 'made' in some other way.
+    // That should include a change to grid_state and paired changes to this and the previous
+    // grid_states.
+// guess_made:
     no_guess_incr = 0;
+#ifdef OPT_UQR
+// if the guess was made solely to allow for checking uniqueness, still count the solution
+// as direct solve
+guess_made_with_incr:
+#endif
+    current_entered_count += 0x100;     // increment high byte for the new grid_state, plus one for the guess made.
     goto start;
 
 }
 
 void print_help() {
-        printf("fastss version: %s\ncompile options: %s\n", version_string, compilation_options);
+        printf("schoku version: %s\n", version_string);
         printf(R"(Synopsis:
-fastss [options] [puzzles] [solutions]
-\t [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
-\t [solutions] names the output file with solutions. Default is 'solutions.txt'.
+schoku [options] [puzzles] [solutions]
+	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
+	 [solutions] names the output file with solutions. Default is 'solutions.txt'.
 
 Command line options:
     -c  check for back tracking even when no guess was made (e.g. if puzzles might have no solution)
@@ -2825,10 +4243,16 @@ Command line options:
         add a 2 for even more detail.
     -h  help information (this text)
     -l# solve a single line from the puzzle.
-    -m[ST]* execution modes (sets, triads)
+    -m[STU] execution modes (sets, triads, unique rectangles)
+    -r[ROM] puzzle rules:
+        R  for regular puzzles (unique solution exists)
+           not suitable for puzzles that have multiple solutions
+        O  find just one solution
+           this will find the first of multiple solutions and stop looking
+        M  determine whether multiple solutions exist beyond the first found
     -t# set the number of threads
-    -u  check the solution for uniqueness
     -v  verify the solution
+    -w  display warning (mostly unexpected solving details for regular puzzles)
     -x  provide some statistics
     -#1 change base for row and column reporting from 0 to 1
 
@@ -2844,11 +4268,10 @@ int main(int argc, const char *argv[]) {
         argv++;
     }
 
-    printf("command options: ");
+    char opts[80] = { 0 };
     for (int i = 0; i < argc; i++) {
-        printf("%s ", argv[i]);
+        sprintf(opts+strlen(opts), "%s ", argv[i]);
     }
-    printf("\n");
 
     while ( argc && argv[0][0] == '-' ) {
         if (argv[0][1] == 0) {
@@ -2869,6 +4292,9 @@ int main(int argc, const char *argv[]) {
              print_help();
              exit(0);
              break;
+        case 'l':    // line of puzzle to solve
+             sscanf(argv[0]+2, "%d", &line_to_solve);
+             break;
         case 'm':
              for ( unsigned char p=2; argv[0][p] && p<6; p++) {
                  switch (toupper(argv[0][p])) {
@@ -2882,22 +4308,35 @@ int main(int argc, const char *argv[]) {
                     mode_triad_res = true;
                     break;
 #endif
+#ifdef OPT_UQR
+                case 'U':        // see OPT_UQR
+                    mode_uqr = true;
+                    break;
+#endif
                  default:
                     printf("invalid mode %c\n", argv[0][p]);
                  }
              }
              break;
-        case 'u':    // verify uniqueness, check for multiple solutions
-             unique_check=1;
-             break;
-        case 'v':    // verify
-             verify=1;
-             break;
-        case 'x':    // stats output
-             reportstats=1;
-             break;
-        case 'l':    // line of puzzle to solve
-             sscanf(argv[0]+2, "%d", &line_to_solve);
+        case 'r':    // rules
+             if ( argv[0][2] ) {
+                switch (toupper(argv[0][2])) {
+                case 'R':        // defaul rules (fastest):
+                                 // assume regular puzzle with a unique solution
+                                 // not suitable for puzzles with multiple solutions
+                    rules = Regular;
+                    break;
+                case 'O':        // find one solution without making assumptions
+                    rules = FindOne;
+                    break;
+                case 'M':        // check for multiple solutions
+                    rules = Multiple;
+                    break;
+                 default:
+                    printf("invalid puzzle rules option %c\n", argv[0][2]);
+                    break;
+                 }
+             }
              break;
         case 't':    // set number of threads
              if ( argv[0][2] && isdigit(argv[0][2]) ) {
@@ -2906,6 +4345,15 @@ int main(int argc, const char *argv[]) {
                      omp_set_num_threads(numthreads);
                  }
              }
+             break;
+        case 'v':    // verify
+             verify=1;
+             break;
+        case 'w':    // display warnings
+             warnings = 1;
+             break;
+        case 'x':    // stats output
+             reportstats=1;
              break;
         case '#':    // row/col numbering base
              if ( argv[0][2] && isdigit(argv[0][2]) ) {
@@ -2918,8 +4366,21 @@ int main(int argc, const char *argv[]) {
                      }
                  }
              }
+             break;
+
+        default:
+             printf("invalid option: %s\n", argv[0]);
+             break;
         }
         argc--, argv++;
+    }
+    // suppress uqr mode if unique checking is requested,
+    // avoiding severe complications in the code.
+    if ( rules != Regular ) {
+        if ( mode_uqr && warnings != 0 ) {
+            printf("uqr checking mode ( -mU ) disabled when checking when not under default Regular rules\n");
+        }
+        mode_uqr = false;
     }
 
     assert((sizeof(GridState) & 0x3f) == 0);
@@ -2927,12 +4388,12 @@ int main(int argc, const char *argv[]) {
    // sort out the CPU and OMP settings
 
    if ( !__builtin_cpu_supports("avx2") ) {
-        printf("This program requires a CPU with the AVX2 instruction set.\n");
+        fprintf(stderr, "This program requires a CPU with the AVX2 instruction set.\n");
         exit(0);
     }
     // lacking BMI support? unlikely!
-    if ( !__builtin_cpu_supports("bmi") ) {
-        printf("This program requires a CPU with the BMI instructions (such as blsr)\n");
+    if ( !__builtin_cpu_supports("bmi")  ) {
+        fprintf(stderr, "This program requires a CPU with the BMI instructions (such as blsr)\n");
         exit(0);
     }
 
@@ -2967,7 +4428,7 @@ int main(int argc, const char *argv[]) {
     signed char *string = (signed char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
 	if ( string == MAP_FAILED ) {
 		if (errno ) {
-			printf("Error mmap of input file %s: %s\n", ifn, strerror(errno));
+			fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
 			exit(0);
 		}
 	}
@@ -2975,12 +4436,16 @@ int main(int argc, const char *argv[]) {
 
 	// skip first line, unless it's a puzzle.
     size_t pre = 0;
-    if ( !(isdigit((int)string[0]) || string[0] != '.' || string[81] != 10) ) {
+    while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
 	    while (string[pre] != 10) {
     	    ++pre;
     	}
     	++pre;
 	}
+    if ( string[pre+81] == 13 ) {
+        fprintf(stderr, "Error: input file line ending in CR/LF\n");
+		exit(0);
+    }
 
     size_t post = 1;
 	if ( string[fsize-1] != 10 )
@@ -3002,13 +4467,13 @@ int main(int argc, const char *argv[]) {
 	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
 	if ( fdout == -1 ) {
 		if (errno ) {
-			printf("Error opening output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
 			exit(0);
 		}
 	}
     if ( ftruncate(fdout, (size_t)outnpuzzles*164) == -1 ) {
 		if (errno ) {
-			printf("Error setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
 		}
 		exit(0);
 	}
@@ -3092,28 +4557,28 @@ int main(int argc, const char *argv[]) {
 	int err = munmap(string, fsize);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ifn, strerror(errno));
+			fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
 		}
 	}
 	err = munmap(output, (size_t)npuzzles*164);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
 		}
 	}
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("schoku version: %s\ncompile options: %s\n", version_string, compilation_options);
+        printf("schoku version: %s\ncommand options: %s\ncompile options: %s\n", version_string, opts, compilation_options);
         printf("%10ld  puzzles entered\n", npuzzles);
         unsigned long solved_cnt = solved_count.load();
         printf("%10ld  %.0lf/s  puzzles solved\n", solved_cnt, (double)solved_cnt/((double)duration/1000000000LL));
 		printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
-        if ( unsolved_count.load()) {
+        if ( unsolved_count.load() && rules != Regular) {
             printf("%10ld  puzzles had no solution\n", unsolved_count.load());
         }
-        if ( unique_check ) {
-            printf("%10ld  puzzles had a unique solution\n", solved_count.load() - non_unique_count.load());
+        if ( rules == Multiple ) {
+            printf("%10ld  puzzles had multiple solutions\n", non_unique_count.load());
         }
         if ( verify ) {
             printf("%10ld  puzzle solutions were verified\n", verified_count.load());
@@ -3131,12 +4596,18 @@ int main(int argc, const char *argv[]) {
             printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), (double)naked_sets_searched.load()/solved_cnt);
         }
 #endif
+#ifdef OPT_UQR
+        if ( mode_uqr ) {
+            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", unique_rectangles_avoided.load(), (double)unique_rectangles_avoided.load()/solved_cnt);
+            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", unique_rectangles_checked.load(), (double)unique_rectangles_checked.load()/solved_cnt);
+        }
+#endif
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
         }
     }
 
-    if ( unique_check && non_unique_count.load()) {
+    if ( !reportstats && rules == Multiple && non_unique_count.load()) {
         printf("%10ld  puzzles had more than one solution\n", non_unique_count.load());
     }
     if ( verify && not_verified_count.load()) {
