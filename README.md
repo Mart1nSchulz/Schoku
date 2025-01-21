@@ -12,26 +12,28 @@ This repository represents a plausible and logical line of evolution of that pro
 
 ### Abstract
 By direct comparison on my test computer, I found that my fastest version of Schoku
-runs up to 4 times faster than the original (internal clock measurement, multi-threaded).
-In single-threaded mode the factor is much smaller at 1.74, due to the original program's
-low multi-threading performance.  
+runs up to 4.5 times faster than the original (internal clock measurement, multi-threaded),
+due to the original program's low multi-threading performance.
+In single-threaded mode the factor sits at 2.  
 When measuring using the time command, the factors are reduced substantially on
 a 17-clue puzzle file with 49151 puzzles, where the startup uses more than 40% of the execution time.
 
 ![Schoku performance](Schoku_Performance.png "Schoku performance")
 
+Benchmark results for Schoku can be found [here](https://pastebin.com/jtU5qddQ).
+
 ### Summary of Changes
 Looking at speed improvements in terms of low hanging fruit, I found that the malloc'ation of the GridState
 structures did take up too much time and replaced it by fixed stacks allocated by each thread only once.  
-I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.
-In particular, allocating a GridState on a different thread will cause memory thrashing (unnessary/unwanted copying between L1 cache lines).   
-The hidden single search allowed for removal of repeating calculations, which offered a welcome boost.  I also made the search cover all hidden singles.  
+I later learned that the allocation and placement of the GridState data affected primarily the multi-threading performance.  
+The hidden single search allowed for removal of repeating calculations, which offered a welcome boost.  I also made the hidden single search cover boxes.  
 I pruned the naked set search to skip already found sets and not to look at sets that provide no benefit, e.g. sets covering all of the available cells (N or N-1).  
 The guessing code did search all cells, even though it could simply pick the first cell with 2 candidates found.  
 Throughout, I also added lookup tables where they were useful.  
 Then I integrated the entering loop (for solved cells) with the search for the next naked single.  This unfortunately involved some additional spaghetti coding techniques in form of labels and gotos.  
 I also changed the program to use memory mapped I/O (this relieves the main thread from doing nearly any computations or I/O.  
-Later I implemented a triad algorithm that finds and removes per triad candidates (aka LockedCandidates) that are impossible.  
+Later I implemented a triad algorithm that finds and removes per triad candidates that are impossible.
+(This is also commonly known as 'locked candidates').
 The default bi-value guessing strategy is suboptimal, as it searches guesses by preference always beginning in the same area and picks too easily pairs of bi-values that depend on each other and little else.  
 This causes the tree of guesses to grow unnecessarily.  
 I used an approach that pays off by reducing the overall number of guesses.  The key is to find 'balanced' guesses that bisect the set of possible paths.
@@ -40,17 +42,18 @@ I used an approach that pays off by reducing the overall number of guesses.  The
 The program self-measures accurately internally the execution time of the program
 minus the loading and startup sequence and the final reporting.  This approach is
 precise and justifiable.  
-The startup of this program on a specific OS may vary,
+The startup overhead of this program on a specific OS may vary,
 But I found on Cygwin64 the overhead to be very close to 20ms.  
+
 The time command reported timing varies quite a bit while the internal timings were more stable.  
 I elected to collect statistics based on the multi-threaded timings througout.  
-For the later versions of Schoku the factor between multi-threading and single-threading is close to 6
-for a 4 CPU / 8 execution units processor.  
-The original code's ratio of multi- to single-threaded performance started very low at 2.15
-(could be specific to my setup) and improved with the allocation and alignment
+For the later versions of Schoku the factor between multi-threading and single-threading is approaching 6
+for a 4 CPU / 8 core processor.  
+The original code's ratio of multi- to single-threaded performance was very low at 2.15 and gradually improved with my allocation and alignment
 of the grid state data.
 
-I am taking timings on a Zen2 Ryzen 7 4700U processor.
+I am taking timings on a Zen2 Ryzen 7 4700U processor which operates at around
+3.3GHz in multithreaded mode. For single threaded execution is above 4GHz.
 
 
 ### Approach
@@ -59,16 +62,15 @@ For a cell-based Sudoku solver, the order of business is the same as for human u
 - find a naked single,  enter it and repeat from the beginning
 - find a hidden single, enter it and repeat from the beginning
 
-Iterestingly, for the programmer as well as the human player, the next step is not
-obvious at all.  It goes as follows:
+Interestingly, for the programmer as well as the human player, the next step is not
+necessarily obvious.  It goes as follows:
 - look at triads (three cells in the intersection of a row or column with a box)
 - check whether any of the candidates present in the triad are _not_ present in
   either: the rest of the row/column _or_ the rest of the box (these are the 'peers' of the triad).
 - if there are, these candidates cannot be present in any of the cells of _all_ the peers;
   they can therefore be removed.
 
-This technique is often stated to human solvers as 'pointing candidates' with the variants pointing and claiming,
-which is exactly the same thing.  
+This technique is often called 'locked candidates claiming/pointing'
 Mathematically it is as simple as the intersection of two (unique) sets;
 what is in the intersection cannot be also outside.
 
@@ -83,17 +85,17 @@ easily than other sets.
 But we are not done yet:
 - look for naked sets (as set of N cells that overall contains exactly N candidates and
   no other candidates) in any row, column or box.
-
 Really any size is possible, a naked set of 1 being a naked single, and a naked set of 9 filling
 all of the row.
+  Note that this algorithm might not be present in all versions.
 
-* consequences of finding a naked set:
-  * no other cell in that section can contain these N candidates.
-  This leaves us with another set (the complementary set).
-  * the complementary set cells can therefore be purged of the N candidates found.
-  The complementary set is usually a hidden set. 
+- consequences of finding a naked set:   
+  no other cell in that section can contain these N candidates. 
+  This leaves us with another set (the complementary set).   
+  the complementary set cells can therefore be purged of the N candidates found.
+  The complementary set is a hidden set, therefore naked set search covers hidden set search as well. 
 
-* once more, after removing the extra candidates from the hidden set, repeat from the beginning.
+- once more, after removing the extra candidates from the hidden set, repeat from the beginning.
 
 With these 4 algorithms, we have covered the basics.
 
@@ -110,18 +112,20 @@ What else?  A lot.
   just ideally set up is crucial.
 
 ### The puzzles
-There are different difficulty levels at which the program operates.
+There are different difficulty levels at which the program has to operate.
 - Some puzzles are quickly solved without even guessing once.
 - Others are specially selected or even constructed to defeat the simple algorithms
   we throw at them.  By guessing we have to drill down to a level where the puzzles
   offers more information to those algorithms.
-- If the collecion of puzzles is biased one way or the other, different choices
+- If the collection of puzzles is biased one way or the other, different choices
   in the program influence the performance.
-
+- Sometimes puzzles are incorrect or have multiple solutions.  It is important to have
+  ways to cope with these situations.
+  
 Many other details will play a role.  The order and implementation of the algorithms is 
 obviously a factor and it is hard to tell which decisions impact the larger picture.  
 It is relatively simple to leave out some of the parts above and still achieve good performance.
-In fact, incorrect or suboptimal implementations often do not result in performance
+In fact, incorrect or incomplete implementations often do not result in performance
 degradation but rather in changes of one statistic or another.
 
 There are additional algorithms that may be beneficial, in fact some are implemented
@@ -150,6 +154,8 @@ To name a few:
 - options to control the number of threads
 - optionally provide statistics and timing information
 - optionally solve a single puzzle from a puzzle file
+- feature selection
+- options for puzzles that may have none or multiple solutions or are incorrect from the start 
 
 Also, some adaptivity is welcome, e.g. when faster and/or specialized instructions
 may or may not be available.
@@ -161,21 +167,21 @@ may or may not be available.
   are present in those processors that have AVX2.  
   The compiler required is gcc/g++.  
   I found that the original program was in a strange way owing to a function created by
-  Microsoft and ported to gcc, where it is nigh impossible to use it in portable
-  fashion on version of gcc that implements long int as 64 bit.  
+  Microsoft and ported to gcc, where it is nigh impossible to use it portably
+  on version of gcc that implements long int as 64 bit.
   That is the reason why version 0 of the programs does not compile/work on Cygwin64 as is.
 - __structured programming__  
   Honestly, the solving function is an order of magnitude too long and uses labels/gotos.
 - __pure C++__  
   While using many features of C++, the code is also in no way pure C++ and does in many
-  places not follow best practice when it comes to solving performance issues.
-  For example, unions are used throguhout to imply/suggest simple operations
+  places not follow best practices, especially when it comes to solving performance issues.
+  For example, unions are used throughout to speed up and simplify operations
   based on overloaded data types. This relies heavily on the precise layout of
   memory and endianness.
 - __ease of debugging__  
   Luckily gcc has a performant optimizer.  Unfortunately the same optimizer makes it
   extremely hard to debug this program (AVX2 data types, passing 32-byte aligned
-  data on the stack and just plain unwillingness to stop a crucial lines).
+  data on the stack and just plain unwillingness to stop at crucial lines).
   Not to mention that Cygwin can be a development environment, but not a flexible
   or powerful one.  The Linux compatibility has limits.  Performance is not
   guaranteed to be on a par 1-1.
@@ -183,3 +189,8 @@ may or may not be available.
   E.g. using Agner Fog's VCL, which I have used for training wheels.
   That will have to wait for another time. 
 
+### Acknowledgements
+- The stackoverflow community.  Just to name one of many many people: Peter Cordes
+  for his prolific, precise and readable writing.
+- Agner Fog for his X86 timing tables and the VCL
+- The free software community at large
