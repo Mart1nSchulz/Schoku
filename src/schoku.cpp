@@ -4,6 +4,12 @@
  *
  * A high speed sudoku solver by M. Schulz
  *
+ * Copyright 2024 Martin Schulz
+ *
+ * This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
  * Based on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
@@ -20,6 +26,22 @@
  * Functional changes:
  * - full set of command line options
  *   correctness, uniqueness, puzzle validation, step-by-step progress
+ * - added a consistency check on initialization (double occupation with same digit)
+ * - backported adjustments for more diversified puzzle sources (tdoku puzzle files)
+ * - warnings option (-w): by default the messages and warnings are muted.
+ *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
+ * - mode option (-m[S]*) to dynamically invoke set searching.
+ * - rules options (-r[ROM]) to either assume regular puzzles rules (single solution),
+ *   search for one solution, even if multiple solutions exist, or determine whether
+ *   two or more solutions exist.
+ * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
+ *   more than 28.
+ * - allow for multi-line comments at the start of puzzle files
+ * - disallow CR/LF (MS-DOS/Windows) line endings
+ * - fixed problem with reporting a large number of solved puzzles when each solution
+ *   was counted.
+ * - fixed problem with bi-value universal grave: multiple solutions were not recognized.
+
  *
  * Performance measurement and statistics:
  *
@@ -59,10 +81,6 @@ const char *version_string = "0.5";
 const char *compilation_options = 
 ""
 ;
-
-
-bool bmi2_support = false;
-
 
 // using type v16us for the built-in vector of unsigned short[16] 
 using v16us  = __v16hu;
@@ -347,9 +365,26 @@ unsigned char fit_delta = 2;
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
 int verify          = 0; // verify solution correctness (implied otherwise)
-int unique_check    = 0; // check solution uniqueness
 int debug           = 0; // provide step by step output on the solution
 int thorough_check  = 0; // check for back tracking even if no guess was made.
+int numthreads      = 0; // if not 0, number of threads
+int warnings        = 0; // display warnings
+
+// puzzle rules
+typedef enum {
+    Regular  = 0,   // R - Default: Find solution, assuming it will be unique
+                    // (this is fastest but is not suitable for non-unique puzzles)
+    FindOne  = 1,   // O - Search for one solution
+    Multiple = 2    // M - Determine whether puzzles are non-unique
+} Rules;
+
+Rules rules;
+
+bool bmi2_support = false;
+// execution modes at runtime
+bool mode_sets=false;
+
+signed char *output;
 
 std::atomic<long> solved_count(0);          // puzzles solved
 std::atomic<long> unsolved_count = 0;       // puzzles unsolved (no solution exists)
@@ -364,8 +399,6 @@ std::atomic<long long> past_naked_count(0); // how often do we get past the nake
 std::atomic<long long> naked_sets_searched(0); // how many naked sets did we search for
 std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
 std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
-
-signed char *output;
 
 inline __m128i expand_bitvector128(unsigned char m) {
     const __m128i bit_mask = _mm_setr_epi16(1<<0, 1<<1, 1<<2, 1<<3, 1<<4, 1<<5, 1<<6, 1<<7);
@@ -404,14 +437,10 @@ inline __attribute__((always_inline)) unsigned int compress_epi16_boolean(__m256
 template<bool doubledbits=false>
 inline __attribute__((always_inline)) unsigned long long compress_epi16_boolean(__m256i b1, __m256i b2) {
     if (doubledbits) {
-        return (unsigned long long)_mm256_movemask_epi8(b2) | _mm256_movemask_epi8(b1);
+        return (((unsigned long long)_mm256_movemask_epi8(b2))<<32) | _mm256_movemask_epi8(b1);
     }
-    if ( bmi2_support ) {
-        return _pext_u64((unsigned long long)_mm256_movemask_epi8(b2) | _mm256_movemask_epi8(b1),0x5555555555555555ull);
-    } else {
         return _mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(b1,b2), 0xD8));
     }
-}
 
 inline __attribute__((always_inline))__m256i and_unless(__m256i a, __m256i b, __m256i bcond) {
     return _mm256_and_si256( a, _mm256_or_si256( b, bcond) );
@@ -424,13 +453,11 @@ inline __attribute__((always_inline))__m256i and_unless(__m256i a, unsigned shor
 // combine an epi16 boolean mask and a 16-bit mask to a 16/32-bit mask.
 // Two pathways:
 // 1. compress the wide boolean, then combine. (BMI2 instructions required)
-//    Complication: the ep16 op boolean gives two bits for each element.
+//    Complication: the epi16 op boolean gives two bits for each element.
 //    compress the wide boolean to 2 or 1 bits as desired
 //    and with the bitvector modified to doubled bits if desired
 //    using template parameter doubledbits.
 //    Performance: pdep/pext are expensive on AMD Zen2, but good when available elsewhere.
-//    If you want to run this on a AMD Zen2 computer, define NO_ZEN2_BMI2 to prevent
-//    use of the offending pext/pdep instructions, or just don't compile for BMI2.
 // 2. expand the compressed boolean, and then compress again to 1 or 2 bits
 //    using template parameter doubledbits.
 //    (the old way, pure AVX/AVX2)
@@ -472,8 +499,8 @@ inline __attribute__((always_inline)) unsigned short and_compress_masks128(__m12
     }
 }
 
-// for the 9 aligned cells of a box as a vector (given by the index of the box),
-// return the corresponding masking bits from indices (i.e. unlocked)
+// for the 9 cells of a box (given by the index of the box),
+// return the corresponding masking bits as a contiguous bit vector
 inline unsigned int get_box_unlocked_mask(unsigned long long indices[2], int boxi) {
 
     // step 1, and-combine the indices with const bitmask for the box
@@ -512,7 +539,7 @@ inline void add_and_mask_all_indices(bit128_t *indices, bit128_t *mask, unsigned
 }
 
 template<Kind kind>
-inline void and_indices(bit128_t *indices, unsigned char i) {
+inline void add_indices(bit128_t *indices, unsigned char i) {
 	indices->u128 |= *(const __uint128_t *)&big_index_lut[i][kind][0];
 }
 #pragma GCC diagnostic pop
@@ -535,50 +562,98 @@ inline void format_candidate_set(char *ret, unsigned short digits) {
                                     buff[5], buff[6], buff[7], buff[8], buff[9]);
 }
 
-#define	GRIDSTATE_MAX 28
+// The maximum levels of guesses is given by GRIDSTATE_MAX.
+// On average, the number of levels is pretty low, but we want to be 'reasonably' sure
+// that we don't bust the envelope.
+// The other 'property' of the GRIDSTATE_MAX constant is to keep the L2 cache happy.
+// 34 is a good choice either way.
+// 
+#define	GRIDSTATE_MAX 34
 
-class __attribute__ ((aligned(32))) GridState
-{
-public:
-    bit128_t unlocked;           // for keeping track of which cells don't need to be looked at anymore. Set bits correspond to cells that still have multiple possibilities
-    bit128_t updated;            // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
-    unsigned short candidates[81];        // which digits can go in this cell? Set bits correspond to possible digits
-    bit128_t set23_found[3];     // for keeping track of found sets of size 2 and 3
-    short stackpointer;                   // this-1 == last grid state before a guess was made, used for backtracking
-// An array GridState[n] can use stackpointer to increment until it reaches n.
-// Similary, for back tracking, the relative GridState-1 is considered the ancestor
-// until stackpointer is 0.
+// GridState encapsulates the current state of the solver, specifically for the
+// purpose of guessing and back tracking.
 //
+// An array of size GRIDSTATE_MAX is used and stackpointer is incremented when a
+// guess is made and decremented when back tracking.
+//
+// To match cache line boundaries, align on 64 bytes.
+//
+class __attribute__ ((aligned(64))) GridState
+{
+
+public:
+class InitStatus {
+        public:
+        unsigned char celli;
+        unsigned digit;
+        bool success;
+};
+
+    unsigned short candidates[81];    // which digits can go in this cell? Set bits correspond to possible digits
+    short stackpointer;               // this-1 == last grid state before a guess was made, used for backtracking
+    unsigned int triads_unlocked[2];  // unlocked row and col triads (#candidates >3), 27 bits each
+    unsigned int filler[1];           // align on 16 bytes
+    bit128_t unlocked;                // for keeping track of which cells still need to be resolved. Set bits correspond to cells that still have multiple possibilities
+    bit128_t updated;                 // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
+    bit128_t set23_found[3];          // for keeping track of found sets of size 2 and 3
+
 // GridState is normally copied for recursion
 // Here we initialize the starting state including the puzzle.
 //
-inline void initialize(signed char grid[81]) {
+template<bool thorough_check>
+inline void initialize(signed char grid[81], InitStatus &is) {
     // 0x1ffffffffffffffffffffULLL is (0x1ULL << 81) - 1
-    updated.u128 = unlocked.u128 = (((__uint128_t)1)<<81)-1;
+    unlocked.u128 = (((__uint128_t)1)<<81)-1;
+    updated.u128  = (((__uint128_t)1)<<81)-1;
 
     set23_found[0] = set23_found[1] = set23_found[2] = {__int128 {0}};
 
     stackpointer = 0;
 
     signed short digit;
-    unsigned short columns[9] = {0};
-    unsigned short rows[9]    = {0};
-    unsigned short boxes[9]   = {0};
+    unsigned short columns[9] {};
+    unsigned short rows[9]    {};
+    unsigned short boxes[9]   {};
 
         for (unsigned char i = 0; i < 64; ++i) {
             digit = grid[i] - 49;
+
             if (digit >= 0) {
                 digit = 1 << digit;
+                if ( thorough_check ) {
+                    is.success = true;
+                    if (    ( columns[column_index[i]] & digit )
+                         || ( rows[row_index[i]] & digit )
+                         || ( boxes[box_index[i]] & digit ) ) {
+                        is.success = false;
+                        is.celli = i;
+                        is.digit = grid[i] - 49;
+                        return;
+                    }
+                }
+
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
                 unlocked.u64[0] &= ~(1ULL << i);
             }
         }
+
         for (unsigned char i = 64; i < 81; ++i) {
             digit = grid[i] - 49;
             if (digit >= 0) {
                 digit = 1 << digit;
+                if ( thorough_check ) {
+                    is.success = true;
+                    if (    ( columns[column_index[i]] & digit )
+                         || ( rows[row_index[i]] & digit )
+                         || ( boxes[box_index[i]] & digit ) ) {
+                        is.success = false;
+                        is.celli = i;
+                        is.digit = grid[i] - 49;
+                        return;
+                    }
+                }
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
@@ -591,7 +666,6 @@ inline void initialize(signed char grid[81]) {
             candidates[i] = 0x01ff ^ (rows[row_index[i]] | columns[column_index[i]] | boxes[box_index[i]]);         
         } else {
             candidates[i] = 1 << (grid[i]-49);
-
         }
     }
 }
@@ -603,10 +677,10 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
     bit128_t to_update = {0};
 
     if ( verbose && debug ) {
-        printf(" %x found at [%d,%d]\n", _tzcnt_u32(digit)+1, i/9, i%9);
+        printf(" %x at [%d,%d]\n", _tzcnt_u32(digit)+1, i/9, i%9);
     }
 #ifndef NDEBUG
-    if ( __popcnt16(digit) != 1 ) {
+    if ( __popcnt16(digit) != 1 && warnings != 0 ) {
         printf("error in enter_digit: %x\n", digit);
     }
 #endif
@@ -637,7 +711,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
     }
 }
 
-
+public:
 template<bool verbose>
 GridState* make_guess() {
     // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
@@ -676,6 +750,13 @@ GridState* make_guess() {
     // Find the first candidate in this cell
 	unsigned short digit = 1 << __bsrd(candidates[guess_index]);
     
+    return make_guess<verbose>(guess_index, digit);
+}
+
+// this version of make_guess takes a cell index and digit for the guess
+//
+template<bool verbose>
+inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
     if ( stackpointer >= GRIDSTATE_MAX-1 ) {
@@ -731,61 +812,6 @@ GridState* make_guess() {
     return new_grid_state;
 }
 
-template<bool verbose>
-GridState* make_guess(unsigned short digit, unsigned char guess_index) {
-    // This is for an educated guess only.
-
-    GridState* new_grid_state = this+1;
-
-    if ( verbose && (debug > 1) ) {
-        char gridout[82];
-        for (unsigned char j = 0; j < 81; ++j) {
-            if ( (candidates[j] & (candidates[j]-1)) ) {
-                gridout[j] = '0';
-            } else {
-                gridout[j] = 49+__bsrd(candidates[j]);
-            }
-        }
-        printf("educated guess at [%d,%d]\nsaved grid_state level >%d<: %.81s\n",
-               guess_index/9, guess_index%9, stackpointer, gridout);
-    }
-    
-    memcpy(new_grid_state, this, sizeof(GridState));
-    new_grid_state->stackpointer++;
-
-    // Remove the guessed candidate from the old grid
-    // when we get back here to the old grid, we know the guess was wrong
-    candidates[guess_index] &= ~digit;
-    if (guess_index < 64) {
-        updated.u64[0] |= 1ULL << guess_index;
-    } else {
-        updated.u64[1] |= 1ULL << (guess_index-64);
-    }
-
-    // Update candidates
-    if ( verbose && debug ) {
-        printf("educated guess at level >%d< - new level >%d<\nguess", stackpointer, new_grid_state->stackpointer);
-    }
-    
-    new_grid_state->enter_digit<verbose>( digit, guess_index);
-    guesses++;
-
-    if ( verbose && (debug > 1) ) {
-        unsigned short *candidates = new_grid_state->candidates;
-        char gridout[82];
-        for (unsigned char j = 0; j < 81; ++j) {
-            if ( (candidates[j] & (candidates[j]-1)) ) {
-                gridout[j] = '0';
-            } else {
-                gridout[j] = 49+__bsrd(candidates[j]);
-            }
-        }
-    printf("grid_state at level >%d< now: %s\n",
-               new_grid_state->stackpointer, gridout);
-    }    
-    return new_grid_state;
-}
-
 template<Kind kind>
 inline unsigned char get_ul_set_search( bool &fitm1, unsigned char cnt, unsigned char si) {
     unsigned char ret = (kind == Row) ? 9-get_section_index_cnt<kind>(set23_found[Row].u64, si) : get_section_index_cnt<kind>(unlocked.u64, si);
@@ -796,7 +822,7 @@ inline unsigned char get_ul_set_search( bool &fitm1, unsigned char cnt, unsigned
 
 // The pair of functions below can be used to iteratively isolate all distinct bit values
 // and determine whether popcnt(X) == N is true for the input vector elements using movemask
-// at each iteration of interest.
+// at each interation of interest.
 // For small N, this is faster than a full popcnt.
 //
 
@@ -820,17 +846,19 @@ bool solve(signed char grid[81], GridState stack[], int line) {
     GridState *grid_state = &stack[0];
 
     int unique_check_mode = 0;
-    bool unique_check_reported = false;
+    bool nonunique_reported = false;
 
    unsigned long long my_digits_entered_and_retracted = 0;
    unsigned long long my_naked_sets_searched = 0;
    unsigned char no_guess_incr = 1;
 
     unsigned int my_past_naked_count = 0;
+ 
     if ( verbose && debug ) {
         printf("Line %d: %.81s\n", line, grid);
     }
 
+    bool check_back = thorough_check;
     goto start;
 
     back:
@@ -848,12 +876,15 @@ bool solve(signed char grid[81], GridState stack[], int line) {
         } else {
             // This only happens when the puzzle is not valid
             // Bypass the verbose check...
-            printf("Line %d: No solution found!\n", line);
+            if ( warnings != 0 ) {
+                printf("Line %d: No solution found!\n", line);
+            }
             unsolved_count++;
         }
         // cleanup and return
         if ( verbose && reportstats ) {
             past_naked_count += my_past_naked_count;
+            naked_sets_searched += my_naked_sets_searched;
             digits_entered_and_retracted += my_digits_entered_and_retracted;
         }
         return true;
@@ -877,7 +908,7 @@ bool solve(signed char grid[81], GridState stack[], int line) {
 
 start:
 
-    bool check_back = grid_state->stackpointer || thorough_check || unique_check_mode;
+    check_back = grid_state->stackpointer || rules!=Regular || thorough_check || unique_check_mode;
 
     unsigned long long *unlocked = grid_state->unlocked.u64;
     unsigned short* candidates = grid_state->candidates;
@@ -900,7 +931,9 @@ start:
                             unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
                             unsigned char pos = i+(_tzcnt_u32(mx)>>1);
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                            if ( warnings != 0 ) {
                                 printf("Line %d: cell [%d,%d] is 0\n", line, pos/9, pos%9);
+                            }
                             } else if ( debug ) {
                                 printf("back track - cell [%d,%d] is 0\n", pos/9, pos%9);
                             }
@@ -908,7 +941,7 @@ start:
                         goto back;
                     } else {
                         // remove least significant digit and compare to 0:
-                        // (c = c & (c-1)) == 0  => naked single
+                        // (c & (c-1)) == 0  => naked single
                         __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
                         unsigned int mask = and_compress_masks<true>(a,m);
                         while (mask) {     // note that the mask has two bits set for each detected single
@@ -941,7 +974,9 @@ start:
                     // no solutions go back
                     if ( verbose ) {
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: cell[8,8] is 0\n", line);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: cell[8,8] is 0\n", line);
+                            }
                         } else {
                             if ( debug ) {
                                 printf("back track - cell [8,8] is 0\n");
@@ -962,16 +997,21 @@ start:
         } while (found);
     }
     
+    // The solving algorithm ends when there are no remaining unlocked cell.
+    // The finishing tasks include verifying the solution and/or confirming
+    // its uniqueness, if requested.
+    //
+
     // Check if it's solved, if it ever gets solved it will be solved after looking for naked singles
     if ( *(__uint128_t*)unlocked == 0) {
         // Solved it
-        if ( unique_check == 1 && unique_check_mode == 1 ) {
-            if ( !unique_check_reported ) {
-                if ( verbose && reportstats ) {
+        if ( rules == Multiple && unique_check_mode == 1 ) {
+            if ( !nonunique_reported ) {
+                if ( verbose && reportstats && warnings != 0 ) {
                     printf("Line %d: solution to puzzle is not unique\n", line);
                 }
                 non_unique_count++;
-                unique_check_reported = true;
+                nonunique_reported = true;
             }
         }
         if ( verify ) {
@@ -981,9 +1021,10 @@ start:
 
             const __m256i mask9 { -1LL, -1LL, 0xffffLL, 0 };
             const __m256i ones = _mm256_and_si256(_mm256_set1_epi16(1), mask9);
-            __m256i rowx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
-            __m256i colx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
-            __m256i boxx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
+            __m256i rowx;
+            __m256i colx;
+            __m256i boxx;
+            boxx = colx = rowx = _mm256_and_si256(_mm256_set1_epi16(0x1ff),mask9);
             __m256i uniq = _mm256_setzero_si256();
 
             for (unsigned char i = 0; i < 9; i++) {
@@ -993,7 +1034,7 @@ start:
                 rowx = _mm256_xor_si256(rowx,row);
 
                 // load element i of 9 columns
-                __m256i col = _mm256_and_si256(_mm256_loadu_si256((__m256i_u*) &candidates[i*9]),mask9);
+                __m256i col = _mm256_and_si256(*(__m256i_u*) &candidates[i*9], mask9);
                 colx = _mm256_xor_si256(colx,col);
 
                 uniq = _mm256_or_si256(_mm256_and_si256(col, _mm256_sub_epi16(col, ones)),uniq);
@@ -1009,6 +1050,7 @@ start:
            res = _mm256_or_si256(res, boxx);
            res = _mm256_or_si256(res, uniq);
            if ( ~_mm256_movemask_epi8(_mm256_cmpeq_epi16(res,_mm256_setzero_si256()))) {
+                // verification failure
                 if ( unique_check_mode == 0 ) {
                     if ( verbose ) {
                            printf("Line %d: solution to puzzle failed verification\n", line);
@@ -1025,13 +1067,17 @@ start:
                    printf("Solution found and verified\n");
                }
                if ( reportstats ) {
-                   solved_count++;
-                   verified_count++;
+                   if ( unique_check_mode == 0 ) {
+                       verified_count++;
+                   }
                }
            }
-        } else if ( verbose && reportstats ) {
-           solved_count++;
         }
+        if ( verbose && reportstats ) {
+            if ( unique_check_mode == 0 ) {
+                solved_count++;
+            }
+         }
 
         // Enter found digits into grid (unless we already had a solution)
         if ( unique_check_mode == 0 ) {
@@ -1043,18 +1089,15 @@ start:
             no_guess_cnt += no_guess_incr;
         }
 
-        if ( unique_check == 1 ) {
+        if ( rules == Multiple && unique_check_mode == 0 ) {
             if ( grid_state->stackpointer ) {
-                if ( verbose && debug && unique_check_mode) {
-                    printf("back track during unique check (OK)\n");
-                }
-               if ( debug && unique_check_mode == 0 ) {
+                if ( verbose && debug ) {
                    printf("Solution: %.81s\nBack track to determine uniqueness\n", grid);
-               }
+                }
                 unique_check_mode = 1;
                 goto back;
             }
-            // otherwise uniqueness is verified
+            // otherwise uniqueness checking is complete
         }
         if ( verbose && reportstats ) {
             past_naked_count += my_past_naked_count;
@@ -1105,7 +1148,7 @@ start:
                     // working backwords
                     for (signed char j = 81-9; j > 0; j -= 9) {
                         column_or_tails[j/9-1] = column_mask;
-                        column_mask = _mm256_or_si256(column_mask, _mm256_loadu_si256((__m256i_u*) &candidates[j]));
+                        column_mask = _mm256_or_si256(column_mask, *(__m256i_u*) &candidates[j]);
                     }
                     // or in row 0 and check whether all digits or covered
                     if ( check_back && !_mm256_testz_si256(mask9,_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9)) ) {
@@ -1114,7 +1157,9 @@ start:
                             unsigned int m = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9), _mm256_setzero_si256()));
                             int idx = __tzcnt_u32(m)>>1;
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: stack 0, back track - column %d does not contain all digits\n", line, idx);
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - column %d does not contain all digits\n", line, idx);
+                                }
                             } else if ( debug ) {
                                 printf("back track - missing digit in column %d\n", idx);
                             }
@@ -1123,7 +1168,7 @@ start:
                     }
                 } else {
                     // leverage previously computed or'ed rows in head and tails.
-                    column_or_head = column_mask = _mm256_or_si256(_mm256_loadu_si256((__m256i_u*) &candidates[i-9]), column_or_head);
+                    column_or_head = column_mask = _mm256_or_si256(*(__m256i_u*) &candidates[i-9], column_or_head);
                     column_mask = _mm256_or_si256(column_or_tails[irow-1],column_mask);
                 }
                 // turn the or'ed rows into a mask for the singletons, if any.
@@ -1162,7 +1207,9 @@ start:
                             _mm256_andnot_si256(_mm256_or_si256(rowbox_9th, rowbox_or8), mask1ff)));
                             const char *row_or_box = (m & 0xffff)?"box":"row";
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: stack 0, back track - %s %d does not contain all digits\n", line, row_or_box, irow);
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - %s %d does not contain all digits\n", line, row_or_box, irow);
+                                }
                             } else if ( debug ) {
                                 printf("back track - missing digit in %s %d\n", row_or_box, irow);
                             }
@@ -1183,10 +1230,13 @@ start:
                                          _mm256_sub_epi16(rowbox_mask, ones)), _mm256_setzero_si256()));
                         const char *row_or_box = (m & 0xffff)?"row":"box";
                         int idx = __tzcnt_u32(m)>>1;
+                        unsigned char celli = (m & 0xffff)? irow*9+idx:b+box_offset[idx&7];
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: stack 0, back track - %s cell [%d,%d] does contain multiple hidden singles\n", line, row_or_box, irow, idx%8);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - %s cell [%d,%d] does contain multiple hidden singles\n", line, row_or_box, celli/9, celli%9);
+                            }
                         } else if ( debug ) {
-                            printf("back track - multiple hidden singles in %s cell [%d,%d]\n", row_or_box, irow, idx%8);
+                            printf("back track - multiple hidden singles in %s cell [%d,%d]\n", row_or_box, celli/9, celli%9);
                         }
                     }
                     goto back;
@@ -1214,7 +1264,9 @@ start:
                         unsigned int m = 0x3ffff & _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(or_mask, _mm256_sub_epi16(or_mask, ones)), _mm256_setzero_si256()));
                         int idx = __tzcnt_u32(m)>>1;
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            printf("Line %d: stack 0, back track - column and row intersection at [%d,%d] containing multiple hidden singles\n", line, irow, idx);
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - column and row intersection at [%d,%d] containing multiple hidden singles\n", line, irow, idx);
+                            }
                         } else if ( debug ) {
                             printf("back track - column and row intersection at [%d,%d] contains multiple hidden singles\n", irow, idx);
                         }
@@ -1270,7 +1322,9 @@ start:
                     if ( cand9_box & (cand9_box-1) ) {
                         if ( verbose ) {
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                printf("Line %d: stack 0, multiple hidden singles in box cell at [%d,%d]\n", line, idx/9, idx%9);
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, multiple hidden singles in box cell at [%d,%d]\n", line, idx/9, idx%9);
+                                }
                             } else if ( debug ) {
                                 printf("back track - multiple hidden singles in box cell at [%d,%d]\n", idx/9, idx%9);
                             }
@@ -1285,7 +1339,7 @@ start:
                 } // cand9
             }
         }   // for
-    }   // box
+    }
 
 // Find naked sets, up to MAX_SET
 
@@ -1299,15 +1353,16 @@ start:
 // common), which will then be detected only with N<7. On the other hand, since this
 // algorithm is hit repeatedly, they will eventually resolve too.
 //
-// The other thing that is achieved, and not to be neglected, is the ability to detect back
+// The other important accomplishment is the ability to detect back
 // track scenarios if the discovered set is impossibly large.  This is quite important
-// for performance as a last chance to kill of bad guesses.
+// for performance as a chance to kill off bad guesses.
 //
 // Note that this search has it's own built-in heuristic to tackle only recently updated cells.
 // The algorithm will keep that list to revisit later, which is fine of course.
-// The number of cells to visit is expectedly pretty high.
-//  We could try other tricks around this area of 'work avoidance'.
-//
+// The number of cells to visit can be high (e.g. in the beginning).
+// Additional tracking mechanisms are used to reduce the number of searches:
+// - previously found sets (and their complements) as well as found triads
+    if ( mode_sets )
     {
         bool can_backtrack = (grid_state->stackpointer != 0);
 
@@ -1335,9 +1390,9 @@ start:
                 if (cnt <= MAX_SET && cnt > 1) {
                     // Note: this algorithm will never detect a naked set of the shape:
                     // {a,b},{a,c},{b,c} as all starting points are 2 bits only.
-                    // same situation is possible for 4 set members.
+                    // The same situation is possible for 4 set members.
                     //
-                    unsigned long long to_change[2] = {0};
+                    unsigned long long to_change[2] {};
 
                     __m128i a_i = _mm_set1_epi16(candidates[i]);
                     __m128i a_j;
@@ -1371,7 +1426,9 @@ start:
                                 char ret[32];
                                 format_candidate_set(ret, candidates[i]);
                                 if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    printf("Line %d: naked  set (row) %s at [%d,%d], count exceeded\n", line, ret, ri, i%9);
+                                    if ( warnings != 0 ) {
+                                        printf("Line %d: naked  set (row) %s at [%d,%d], count exceeded\n", line, ret, ri, i%9);
+                                    }
                                 } else if ( debug ) {
                                     printf("back track sets (row) %s at [%d,%d], count exceeded\n", ret, ri, i%9);
                                 }
@@ -1388,7 +1445,7 @@ start:
                                 format_candidate_set(ret, candidates[i]);
                                 printf("naked  set (row): %s [%d,%d]\n", ret, ri, i%9);
                             }
-                            and_indices<Row>((bit128_t*)to_change, i);
+                            add_indices<Row>((bit128_t*)to_change, i);
                         }
                     }
                   }
@@ -1419,7 +1476,9 @@ start:
                                     char ret[32];
                                     format_candidate_set(ret, candidates[i]);
                                 if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                    if ( warnings != 0 ) {
                                         printf("Line %d: naked  set (col) %s at [%d,%d], count exceeded\n", line, ret, i/9, i%9);
+                                    }
                                 } else if ( debug ) {
                                         printf("back track sets (col) %s at [%d,%d], count exceeded\n", ret, i/9, i%9);
                                 }
@@ -1438,7 +1497,7 @@ start:
                                 format_candidate_set(ret, candidates[i]);
                                 printf("naked  set (col): %s [%d,%d]\n", ret, i/9, i%9);
                             }
-                            and_indices<Col>((bit128_t*)to_change, i);
+                            add_indices<Col>((bit128_t*)to_change, i);
                         }
                     }
                   }
@@ -1472,7 +1531,9 @@ start:
                         if (s > cnt) {
                             if ( verbose ) {
                                 if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    printf("Line %d: naked set box, count exceeded\n", line);
+                                    if ( warnings != 0 ) {
+                                        printf("Line %d: naked set box, count exceeded\n", line);
+                                    }
                                 } else if ( debug ) {
                                     printf("back track sets (box)\n");
                                 }
@@ -1489,7 +1550,7 @@ start:
                             if ( s <= 3 ) {
                                 grid_state->set23_found[Box].il_set_section_indexbits<doubledbits>(m,bi);
                             }
-                            and_indices<Box>((bit128_t*)to_change, i);
+                            add_indices<Box>((bit128_t*)to_change, i);
                         }
                     }
                   }
@@ -1527,14 +1588,16 @@ start:
                         printf("naked  (sets) ");
                     }
                     grid_state->enter_digit<verbose>( candidates[i], i);
-                    printf("found a singleton in set search... strange\n");
+                    if ( warnings != 0 ) {
+                        printf("found a singleton in set search... strange\n");
+                    }
                     goto start;
                 }
             }
         }
     }
 
-    bit128_t bivalues {0};
+    bit128_t bivalues;
     {
         __m256i c;
         for (unsigned char i = 0; i < 64; i += 32) {
@@ -1564,16 +1627,16 @@ start:
                                  _mm256_cmpeq_epi16(lsb,c)));
 
         bivalues.u16[5] = (__popcnt16(candidates[80]) == 2)?1:0;
-        // now bivalues is now set for subsequent steps
+        // bivalues is now set for subsequent steps
     }
 
     {
         // Before making a guess,
-        // check for a 'universal grave', which is an end-game move.
+        // check for a 'universal grave'+1, which is an end-game move.
         // First get a count of unlocked.
         // With around 22 or less unresolved cells (N), accumulate a popcount of all cells.
         // Count the cells with a candidate count 2 (P). 81 - N - P = Q.
-        // If Q is 0, track back, if a guess was made before. without guess to track back to,
+        // If Q is 0, back track, if a guess was made before. without guess to back track to,
         // take note as duplicate solution, but carry on with a guess.
         // If Q > 1, go with a guess.
         // If Q == 1, identify the only cell which does not have a 2 candidate count.
@@ -1583,8 +1646,8 @@ start:
 
         unsigned char N = _popcnt64(unlocked[0]) + _popcnt32(unlocked[1]);
         if ( N < 23 ) {
-                unsigned char sum12s = 0;
-                unsigned char target = 0;
+                unsigned char sum12s = 0;   // count P, the number of bi-values + the number of locked cells
+                unsigned char target = 0;   // the index of the only cell with three candidates
 
                 unsigned char not_pairs = 0;
 
@@ -1596,7 +1659,7 @@ start:
                         sum12s += pc;
                         if ( pc != 64 ) {
                             if ( pc < 63 || not_pairs++ ) {
-                                goto guess;
+                                goto no_bug;
                             }
                             target = (i<<6) + __tzcnt_u64(~m);
                         }
@@ -1604,8 +1667,9 @@ start:
                 }
                 // sum12s is the total of 128 bits minus the ones that are neither 1 or 2
                 sum12s -= (64-17);    // only 81 possible bits, subtract 64-17 to compensate
-                if ( sum12s == 81 ) {
-                    if ( unique_check ) {
+                if ( sum12s == 81 ) { // this means Q == 0
+
+                    if ( rules != Regular ) {
                         if ( verbose && debug ) {
                             printf("bi-value universal grave means at least two solutions exist.\n");
                         }
@@ -1618,7 +1682,6 @@ start:
                     } else {
                         if ( verbose && debug ) {
                             printf("bi-value universal grave means at least two solutions exist.\n");
-                            non_unique_count++;
                         }
                         goto guess;
                     }
@@ -1649,11 +1712,17 @@ start:
                         if ( verbose && debug ) {
                             printf("bi-value universal grave pivot:");
                         }
-                        grid_state->enter_digit<verbose>(digit, target);
-                        goto start;
+                        if ( rules == Regular ) {
+                            grid_state->enter_digit<verbose>(digit, target);
+                            goto start;
+                        } else {
+                            grid_state = grid_state->make_guess<verbose>(target, digit);
+                        } 
                     }
                 }
         }
+        no_bug:
+        ;
     }
 
 guess:    
@@ -1665,11 +1734,11 @@ guess:
 }
 
 void print_help() {
-        printf("fastss version: %s\ncompile options: %s\n", version_string, compilation_options);
+        printf("schoku version: %s\n", version_string);
         printf(R"(Synopsis:
-fastss [options] [puzzles] [solutions]
-\t [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
-\t [solutions] names the output file with solutions. Default is 'solutions.txt'.
+schoku [options] [puzzles] [solutions]
+	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
+	 [solutions] names the output file with solutions. Default is 'solutions.txt'.
 
 Command line options:
     -c  check for back tracking even when no guess was made (e.g. if puzzles might have no solution)
@@ -1677,8 +1746,16 @@ Command line options:
         add a 2 for even more detail.
     -h  help information (this text)
     -l# solve a single line from the puzzle.
-    -u  check the solution for uniqueness
+    -m[S]* execution modes (sets)
+    -r[ROM] puzzle rules:
+        R  for regular puzzles (unique solution exists)
+           not suitable for puzzles that have multiple solutions
+        O  find just one solution
+           this will find the first of multiple solutions and stop looking
+        M  determine whether multiple solutions exist beyond the first found
+    -t# set the number of threads
     -v  verify the solution
+    -w  display warning (mostly unexpected solving details for regular puzzles)
     -x  provide some statistics
 
 )");
@@ -1692,6 +1769,11 @@ int main(int argc, const char *argv[]) {
         argc--;
         argv++;
     }    
+
+    char opts[80];
+    for (int i = 0; i < argc; i++) {
+        sprintf(opts+strlen(opts), "%s ", argv[i]);
+    }
 
     while ( argc && argv[0][0] == '-' ) {
         if (argv[0][1] == 0) {
@@ -1712,17 +1794,58 @@ int main(int argc, const char *argv[]) {
              print_help();
              exit(0);
              break;
-        case 'u':    // verify uniqueness, check for multiple solutions
-             unique_check=1;
+        case 'l':    // line of puzzle to solve
+             sscanf(argv[0]+2, "%d", &line_to_solve);
+             break;
+        case 'm':
+             switch (toupper(argv[0][2])) {
+             case 'S':
+                 mode_sets = true;
+                 break;
+             default:
+                 printf("invalid mode %c\n", argv[0][2]);
+                 break;
+             }
+             break;
+        case 'r':    // rules
+             if ( argv[0][2] ) {
+                switch (toupper(argv[0][2])) {
+                case 'R':        // defaul rules (fastest):
+                                 // assume regular puzzle with a unique solution
+                                 // not suitable for puzzles with multiple solutions
+                    rules = Regular;
+                    break;
+                case 'O':        // find one solution without making assumptions
+                    rules = FindOne;
+                    break;
+                case 'M':        // check for multiple solutions
+                    rules = Multiple;
+                    break;
+                 default:
+                    printf("invalid puzzle rules option %c\n", argv[0][2]);
+                    break;
+                 }
+             }
+             break;
+        case 't':    // set number of threads
+             if ( argv[0][2] && isdigit(argv[0][2]) ) {
+                 sscanf(&argv[0][2], "%d", &numthreads);
+                 if ( numthreads != 0 ) {
+                     omp_set_num_threads(numthreads);
+                 }
+             }
              break;
         case 'v':    // verify
              verify=1;
              break;
+        case 'w':    // display warnings
+             warnings = 1;
+             break;
         case 'x':    // stats output
              reportstats=1;
              break;
-        case 'l':    // line of puzzle to solve
-             sscanf(argv[0]+2, "%d", &line_to_solve);
+        default:
+             printf("invalid option: %s\n", argv[0]);
              break;
         }
         argc--, argv++;
@@ -1733,12 +1856,12 @@ int main(int argc, const char *argv[]) {
    // sort out the CPU and OMP settings
 
    if ( !__builtin_cpu_supports("avx2") ) {
-        printf("This program requires a CPU with the AVX2 instruction set.\n");
+        fprintf(stderr, "This program requires a CPU with the AVX2 instruction set.\n");
         exit(0);
     }
     // lacking BMI support? unlikely!
     if ( !__builtin_cpu_supports("bmi") ) {
-        printf("This program requires a CPU with the BMI instructions (such as blsr)\n");
+        fprintf(stderr, "This program requires a CPU with the BMI instructions (such as blsr)\n");
         exit(0);
     }
 
@@ -1747,6 +1870,7 @@ int main(int argc, const char *argv[]) {
     if ( debug ) {
          omp_set_num_threads(1);
          printf("debug mode requires restriction of the number of threads to 1\n");
+
          printf("BMI2 instructions %s %s\n",
                __builtin_cpu_supports("bmi2") ? "found" : "not found",
                bmi2_support? "and enabled" : __builtin_cpu_is("znver2")? "but use of pdep/pext instructions disabled":"");
@@ -1772,7 +1896,7 @@ int main(int argc, const char *argv[]) {
     signed char *string = (signed char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
 	if ( string == MAP_FAILED ) {
 		if (errno ) {
-			printf("Error mmap of input file %s: %s\n", ifn, strerror(errno));
+			fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
 			exit(0);
 		}
 	}
@@ -1780,12 +1904,16 @@ int main(int argc, const char *argv[]) {
 
 	// skip first line, unless it's a puzzle.
     size_t pre = 0;
-    if ( !(isdigit((int)string[0]) || string[0] != '.' || string[81] != 10) ) {
+    while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
 	    while (string[pre] != 10) {
     	    ++pre;
     	}
     	++pre;
 	}
+    if ( string[pre+81] == 13 ) {
+        fprintf(stderr, "Error: input file line ending in CR/LF\n");
+		exit(0);
+    }
     
     size_t post = 1;
 	if ( string[fsize-1] != 10 )
@@ -1793,6 +1921,10 @@ int main(int argc, const char *argv[]) {
 
 	// get and check the number of puzzles
 	size_t npuzzles = (fsize - pre + (1-post))/82;
+    if ( line_to_solve < 0 || npuzzles < (unsigned long)line_to_solve ) {
+		fprintf(stderr, "Ignoring the given line number\nthe input file %s contains %ld puzzles, the given line number %d is not between 1 and %ld\n", ifn, npuzzles, line_to_solve, npuzzles);
+        line_to_solve = 0;
+    }
     size_t outnpuzzles = line_to_solve ? 1 : npuzzles;
 
 	if ( (fsize -pre -post + 1) % 82 ) {
@@ -1803,13 +1935,13 @@ int main(int argc, const char *argv[]) {
 	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
 	if ( fdout == -1 ) {
 		if (errno ) {
-			printf("Error opening output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
 			exit(0);
 		}
 	}
     if ( ftruncate(fdout, (size_t)outnpuzzles*164) == -1 ) {
 		if (errno ) {
-			printf("Error setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
 		}
 		exit(0);
 	}
@@ -1848,12 +1980,25 @@ int main(int argc, const char *argv[]) {
 
         signed char *grid = &output[82];
 
-        stack[0].initialize(grid);
+        GridState::InitStatus is {};
 
-        if ( reportstats !=0 || debug != 0) {
-            solve<true>(grid, stack, line_to_solve);
+        if ( thorough_check ) {
+            stack[0].initialize<true>(grid, is);
         } else {
-            solve<false>(grid, stack, line_to_solve);
+            stack[0].initialize<false>(grid, is);
+        }
+
+        if ( thorough_check && !is.success ) {
+            if ( warnings ) {
+                printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line_to_solve, is.celli/9, is.celli%9, is.digit+1);
+            }
+            unsolved_count++;
+        } else {
+            if ( reportstats !=0 || debug != 0) {
+                solve<true>(grid, stack, line_to_solve);
+            } else {
+                solve<false>(grid, stack, line_to_solve);
+            }
         }
     } else {
 
@@ -1881,39 +2026,53 @@ int main(int argc, const char *argv[]) {
                 stack = (GridState*) (~0x3fll & ((unsigned long long) malloc(sizeof(GridState)*GRIDSTATE_MAX+0x40)+0x40));
             }
 
-            stack[0].initialize(&output[i*2+82]);
-            if ( reportstats !=0 || debug != 0) {
-                solve<true>(grid, stack, i/82+1);
+            GridState::InitStatus is {};
+
+            if ( thorough_check ) {
+                stack[0].initialize<true>(&output[i*2+82], is);
             } else {
-                solve<false>(grid, stack, i/82+1);
+                stack[0].initialize<false>(&output[i*2+82], is);
+            }
+
+            if ( thorough_check && !is.success ) {
+                if ( warnings ) {
+                    printf("Line %ld: puzzle is unsolvable: [%d,%d] = %d\n", i/82+1, is.celli/9, is.celli%9, is.digit+1);
+                }
+                unsolved_count++;
+            } else {
+                if ( reportstats !=0 || debug != 0) {
+                    solve<true>(grid, stack, i/82+1);
+                } else {
+                    solve<false>(grid, stack, i/82+1);
+                }
             }
         }
-    }
 
-	int err = munmap(string, fsize);
-	if ( err == -1 ) {
-		if (errno ) {
-			printf("Error munmap file %s: %s\n", ifn, strerror(errno));
-		}
-	}
-	err = munmap(output, (size_t)npuzzles*164);
-	if ( err == -1 ) {
-		if (errno ) {
-			printf("Error munmap file %s: %s\n", ofn, strerror(errno));
-		}
-	}
+	    int err = munmap(string, fsize);
+	    if ( err == -1 ) {
+	    	if (errno ) {
+	    		fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
+	    	}
+	    }
+	    err = munmap(output, (size_t)npuzzles*164);
+	    if ( err == -1 ) {
+	    	if (errno ) {
+	    		fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
+	    	}
+	    }
+    }
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("schoku version: %s\ncompile options: %s\n", version_string, compilation_options);
+        printf("schoku version: %s\ncommand options: %s\n", version_string, opts);
         printf("%10ld  puzzles entered\n", npuzzles);
+        printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
 		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
-        printf("%10ld  puzzles solved\n", solved_count.load());
-        if ( unsolved_count.load()) {
+        if ( unsolved_count.load() && rules != Regular) {
             printf("%10ld  puzzles had no solution\n", unsolved_count.load());
         }
-        if ( unique_check ) {
-            printf("%10ld  puzzles had a unique solution\n", solved_count.load() - non_unique_count.load());
+        if ( rules == Multiple ) {
+            printf("%10ld  puzzles had multiple solutions\n", non_unique_count.load());
         }
         if ( verify ) {
             printf("%10ld  puzzle solutions were verified\n", verified_count.load());
@@ -1923,13 +2082,16 @@ int main(int argc, const char *argv[]) {
         printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  total digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  total 'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
-        printf("%10lld  %5.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
-        printf("%10lld %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+        if ( mode_sets ) {
+            printf("%10lld  %5.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
+            printf("%10lld %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+        }
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
         }
     }
-    if ( unique_check && non_unique_count.load()) {
+
+    if ( !reportstats && rules == Multiple && non_unique_count.load()) {
         printf("%10ld  puzzles had more than one solution\n", non_unique_count.load());
     }
     if ( verify && not_verified_count.load()) {
