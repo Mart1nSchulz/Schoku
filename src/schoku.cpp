@@ -4,6 +4,12 @@
  *
  * A high speed sudoku solver by M. Schulz
  *
+ * Copyright 2024 Martin Schulz
+ *
+ * This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
  * Based on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
@@ -17,8 +23,19 @@
  * - factored out inline functions
  *
  * Functional changes:
- * - -l# option to solve a single line
  *
+ * - added -t# option to control number of threads 
+ * - added a consistency check on initialization (double occupation with same digit)
+ * - backported adjustments for more diversified puzzle sources (tdoku puzzle files)
+ * - warnings option (-w): by default the messages and warnings are muted.
+ *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
+ * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
+ *   more than 28.
+ * - allow for multi-line comments at the start of puzzle files
+ * - disallow CR/LF (MS-DOS/Windows) line endings
+ * - fixed problem with reporting a large number of solved puzzles when each solution
+ *   was counted.
+
  * Basic performance measurement and statistics:
  *
  * data: 17-clue sudoku
@@ -196,8 +213,20 @@ const unsigned long long big_index_lut[81][4][2] = {
 
 // stats and command line options
 bool reportstats     = false; // collect and report some statistics
+int thorough_check  = 0; // check for back tracking even if no guess was made.
+int numthreads      = 0; // if not 0, number of threads
+int warnings        = 0; // display warnings
 
+// puzzle rules
+typedef enum {
+    Regular  = 0,   // R - Default: Find solution, assuming it will be unique
+                    // (this is fastest but is not suitable for non-unique puzzles)
+    FindOne  = 1,   // O - Search for one solution
+    Multiple = 2    // M - Determine whether puzzles are non-unique
+} Rules;
+Rules rules;
 std::atomic<long> solved_count(0);          // puzzles solved
+std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exists)
 std::atomic<long long> guesses(0);          // how many guesses did it take
 std::atomic<long long> trackbacks(0);       // how often did we back track
 std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
@@ -260,7 +289,7 @@ inline __attribute__((always_inline))__m256i and_unless(__m256i a, unsigned shor
 // combine an epi16 boolean mask and a 16-bit mask to a 16/32-bit mask.
 // Two pathways:
 // 1. compress the wide boolean, then combine. (BMI2 instructions required)
-//    Complication: the ep16 op boolean gives two bits for each element.
+//    Complication: the epi16 op boolean gives two bits for each element.
 //    compress the wide boolean to 2 or 1 bits as desired
 //    and with the bitvector modified to doubled bits if desired
 //    using template parameter doubledbits.
@@ -330,7 +359,7 @@ inline void add_indices(unsigned long long indices[2], unsigned char i) {
     }
 }
 
-#define	GRIDSTATE_MAX 28
+#define	GRIDSTATE_MAX 34
 
 class __attribute__ ((aligned(32))) GridState
 {
@@ -404,17 +433,20 @@ inline GridState * track_back(int line) {
         return this-1;
     } else {
         // This only happens when the puzzle is not valid
-        fprintf(stderr, "Line %d: No solution found!\n", line);
-        exit(0);
+        if ( warnings ) {
+            fprintf(stderr, "Line %d: No solution found!\n", line);
+        }
+        unsolved_count++;
+        return 0;
     }
     
 }
 
 GridState* make_guess() {
-    // Make a guess for the cell with the least candidates. The guess will be the lowest
-    // possible digit for that cell. If multiple cells have the same number of candidates, the 
-    // cell with lowest index will be chosen. Also save the current grid state for tracking back
-    // in case the guess is wrong. No cell has less than two candidates.
+    // Make a guess for the cell with the least candidates.
+    // The first cell with 2 candidates will suffice.
+    // The guess will be the highest possible digit for that cell.
+    // Save the current grid state for tracking back.
 
     // Find the cell with fewest possible candidates
     unsigned long long to_visit;
@@ -448,10 +480,16 @@ GridState* make_guess() {
     // Find the first candidate in this cell
 	unsigned short digit = 1 << __bsrd(candidates[guess_index]);
     
+    return make_guess(guess_index, digit);
+}
+
+// this version of make_guess takes a cell index and digit for the guess
+//
+inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
     if ( stackpointer >= GRIDSTATE_MAX-1 ) {
-        fprintf(stderr, "Error: no GridState struct availabe\n");
+        fprintf(stderr, "Error: no GridState object availabe\n");
         exit(0);
     }
     memcpy(new_grid_state, this, sizeof(GridState));
@@ -508,6 +546,17 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
             digit = grid[i] - 49;
             if (digit >= 0) {
                 digit = 1 << digit;
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & digit )
+                         || ( rows[row_index[i]] & digit )
+                         || ( boxes[box_index[i]] & digit ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
@@ -518,6 +567,17 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
             digit = grid[i] - 49;
             if (digit >= 0) {
                 digit = 1 << digit;
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & digit )
+                         || ( rows[row_index[i]] & digit )
+                         || ( boxes[box_index[i]] & digit ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= digit;
                 rows[row_index[i]]       |= digit;
                 boxes[box_index[i]]      |= digit;
@@ -539,6 +599,9 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
     unsigned char test_column9_flip = 1;
     
     start:
+     if ( grid_state == 0 ) {
+         return false;
+     }
      test_column9_flip ^= 1;
 
     unlocked = grid_state->unlocked;
@@ -693,26 +756,14 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
 // common), which will then be detected only with N<7. On the other hand, since this
 // algorithm is hit repeatedly, they will eventually resolve too.
 //
-// The other thing that is achieved, and not to be neglected, is the ability to detect back
-// track scenarios if the dicovered set is impossibly large.  This is quite important
-// for performance as an early killer of bad guesses.
-//
-// The other consideration is that triads play a major role in this space, as they allow
-// in a largely orthogonal manner to reduce the number of candidates, as well as detect many
-// pairs and triplets.
-//
-// With MAX_SET of 4, the efficiency goes down to 30879 from 32508, which is substantial.
-// Consider a possible addition of a search for any duplicate solutions, and you can appreciate
-// what this means.  MAX_SET 3 sits at 27722 and MAX_SET 2 at 16776.
-// From my explorations I know that a 'perfect' search for singles and triad resolution will
-// give you 38671 solutions out of 49151 without guessing.  So there's a lot of room for improvement
-// yet improvements in terms of raw speed may be pretty hard to get.
+// The other important accomplishment is the ability to detect back
+// track scenarios if the discovered set is impossibly large.  This is quite important
+// for performance as a chance to kill off bad guesses.
 //
 // Note that this search has it's own built-in heuristic to tackle only recently updated cells.
 // The algorithm will keep that list to revisit later, which is fine of course.
-// The number of cells to visit is expectedly pretty high.  We could try other tricks around
-// this area of 'work avoidance'.
-//
+// The number of cells to visit can be high (e.g. in the beginning).
+// Additional tracking mechanisms are to be used to reduce the number of searches.
     {
         bool can_backtrack = (grid_state->stackpointer != 0);
 
@@ -817,7 +868,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                         while (to_change[n]) {
                             int j_rel = _tzcnt_u64(to_change[n]);
                             to_change[n] &= ~(1ULL << j_rel);
-                            unsigned char j = (unsigned char) j_rel + 64*n;
+                            unsigned char j = (unsigned char) j_rel + (n<<6);
                             
                             // if this cell is not part of our set
                             if ((candidates[j] | candidates[i]) != candidates[i]) {
@@ -839,7 +890,9 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                 } else if ( cnt == 1 ) {
                     // this is not possible, but just to eliminate cnt == 1:
                     grid_state->enter_digit( candidates[i], i);
-                    printf("found a singleton in set search... strange\n");
+                    if ( warnings != 0 ) {
+                        printf("found a singleton in set search... strange\n");
+                    }
                     goto start;
                 }
             }
@@ -855,6 +908,23 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
     
 }
 
+void print_help() {
+        printf("schoku version: %s\n", version_string);
+        printf(R"(Synopsis:
+schoku [options] [puzzles] [solutions]
+	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
+	 [solutions] names the output file with solutions. Default is 'solutions.txt'.
+
+Command line options:
+    -h  help information (this text)
+    -l# solve a single line from the puzzle.
+    -t# set the number of threads
+    -v  verify the solution
+    -w  display warning (mostly unexpected solving details for regular puzzles)
+    -x  provide some statistics
+
+)");
+}
 
 int main(int argc, const char *argv[]) {
 
@@ -864,18 +934,45 @@ int main(int argc, const char *argv[]) {
         argv++;
     }    
 
+    char opts[80] = { 0 };
+    for (int i = 0; i < argc; i++) {
+        sprintf(opts+strlen(opts), "%s ", argv[i]);
+    }
+
     while ( argc && argv[0][0] == '-' ) {
         if (argv[0][1] == 0) {
             argv++; argc--;
             break;
         }
         switch(argv[0][1]) {
-        case 'x':    // stats output
-             reportstats=true;
+        case 'c':
+             thorough_check=1;
+             break;
+        case 'h':
+             print_help();
+             exit(0);
              break;
         case 'l':    // line of puzzle to solve
              sscanf(argv[0]+2, "%d", &line_to_solve);
              break;
+        case 't':    // set number of threads
+             if ( argv[0][2] && isdigit(argv[0][2]) ) {
+                 sscanf(&argv[0][2], "%d", &numthreads);
+                 if ( numthreads != 0 ) {
+                     omp_set_num_threads(numthreads);
+                 }
+             }
+             break;
+        case 'w':    // display warnings
+             warnings = 1;
+             break;
+        case 'x':    // stats output
+             reportstats=true;
+             break;
+        default:
+             printf("invalid option: %s\n", argv[0]);
+             break;
+
         }
         argc--, argv++;
     }
@@ -897,10 +994,10 @@ int main(int argc, const char *argv[]) {
     size_t fsize = sb.st_size;
 
 	// map the input file
-	char *string = (char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
+    signed char *string = (signed char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
 	if ( string == MAP_FAILED ) {
 		if (errno ) {
-			printf("Error mmap of input file %s: %s\n", ifn, strerror(errno));
+			fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
 			exit(0);
 		}
 	}
@@ -908,12 +1005,16 @@ int main(int argc, const char *argv[]) {
 
 	// skip first line, unless it's a puzzle.
     size_t pre = 0;
-    if ( !isdigit((int)string[0]) || string[81] != 10 ) {
+    while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
 	    while (string[pre] != 10) {
     	    ++pre;
     	}
     	++pre;
 	}
+    if ( string[pre+81] == 13 ) {
+        fprintf(stderr, "Error: input file line ending in CR/LF\n");
+		exit(0);
+    }
     
     size_t post = 1;
 	if ( string[fsize-1] != 10 )
@@ -921,6 +1022,10 @@ int main(int argc, const char *argv[]) {
 
 	// get and check the number of puzzles
 	size_t npuzzles = (fsize - pre + (1-post))/82;
+    if ( line_to_solve < 0 || npuzzles < (unsigned long)line_to_solve ) {
+		fprintf(stderr, "Ignoring the given line number\nthe input file %s contains %ld puzzles, the given line number %d is not between 1 and %ld\n", ifn, npuzzles, line_to_solve, npuzzles);
+        line_to_solve = 0;
+    }
     size_t outnpuzzles = line_to_solve ? 1 : npuzzles;
 
 	if ( (fsize -pre -post + 1) % 82 ) {
@@ -931,13 +1036,13 @@ int main(int argc, const char *argv[]) {
 	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
 	if ( fdout == -1 ) {
 		if (errno ) {
-			printf("Error opening output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
 			exit(0);
 		}
 	}
     if ( ftruncate(fdout, (size_t)outnpuzzles*164) == -1 ) {
 		if (errno ) {
-			printf("Error setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
 		}
 		exit(0);
 	}
@@ -956,7 +1061,7 @@ int main(int argc, const char *argv[]) {
     size_t i;
     size_t imax = npuzzles*82;
 
-	char *string_pre = string+pre;
+    signed char *string_pre = string+pre;
 	GridState *stack = 0;
 
     if ( line_to_solve ) {
@@ -1003,21 +1108,26 @@ int main(int argc, const char *argv[]) {
 	int err = munmap(string, fsize);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ifn, strerror(errno));
+	    		fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
 		}
 	}
 	err = munmap(output, (size_t)npuzzles*164);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ofn, strerror(errno));
+            fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
 		}
 	}
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("schoku version: %s\n", version_string);
+        printf("schoku version: %s\ncommand options: %s\n", version_string, opts);
         printf("%10ld  puzzles entered\n", npuzzles);
+        printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
 		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+        if ( unsolved_count.load()) {
+            printf("%10ld  puzzles had no solution\n", unsolved_count.load());
+        }
+
         printf("%10ld  %5.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
         printf("%10lld  %5.2f/puzzle  total guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());

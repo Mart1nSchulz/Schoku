@@ -15,7 +15,6 @@ DFLAGS :=
 OFLAGS := -O3
 #OFLAGS := -O2
 #OFLAGS := -g -Og
-#OFLAGS := -pg -O
 # asm output options
 SFLAGS := -masm=intel
 
@@ -27,7 +26,7 @@ CPPFLAGS1  = -MMD -MP -MF $(@:$(OBJ_DIR)/%.o=$(DEP_DIR)/%.d)
 # -fopenmp is required to use OMP (multi-threading) - it implies -pthread
 CFLAGS   := $(OFLAGS) -fopenmp -pthread -Wall -Wextra $(DFLAGS) $(XFLAGS)
 # The default is -std=gnu++17 in gcc 11.4
-# The minimum required level is std=gnu++11
+# The minimum required level is std=gnu++17
 # The gnu* flavour is required to find the ftruncate Posix function.
 CXXFLAGS := -std=gnu++17 $(CFLAGS)
 LDFLAGS  := -fopenmp -pthread
