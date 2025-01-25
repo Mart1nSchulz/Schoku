@@ -4,6 +4,12 @@
  *
  * A high speed sudoku solver by M. Schulz
  *
+ * Copyright 2024 Martin Schulz
+ *
+ * This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
  * Based on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
@@ -16,12 +22,21 @@
  *   this significantly improves multi-threaded performance
  * - precompute data for the hidden single search
  *
+ * - added a consistency check on initialization (double occupation with same digit)
+ * - backported adjustments for more diversified puzzle sources (tdoku puzzle files)
+ * - warnings option (-w): by default the messages and warnings are muted.
+ *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
+ * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
+ *   more than 28.
+ * - allow for multi-line comments at the start of puzzle files
+ * - disallow CR/LF (MS-DOS/Windows) line endings
+ * - fixed problem with reporting a large number of solved puzzles when each solution
  * Basic performance measurement and statistics:
  *
  * data: 17-clue sudoku
  * CPU:  Ryzen 7 4700U
  *
- * fastss version: 0.2
+ * schoku version: 0.2
  *     49151  puzzles entered
  *    55.3ms   1.13µs/puzzle  solving time
  *     31355  63.79%  puzzles solved without guessing
@@ -101,10 +116,13 @@ const unsigned char box_start[81] = {
 
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
+int thorough_check  = 0; // check for back tracking even if no guess was made.
+int warnings        = 0; // display warnings
 
 signed char *output;
 
 std::atomic<long> solved_count(0);          // puzzles solved
+std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exists)
 std::atomic<long long> guesses(0);          // how many guesses did it take
 std::atomic<long long> trackbacks(0);       // how often did we back track
 std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
@@ -268,8 +286,11 @@ inline GridState * track_back(GridState* grid_state, int line) {
 	    return grid_state-1;
 	} else {
 		// This only happens when the puzzle is not valid
-		fprintf(stderr, "Line %d: No solution found!\n", line);
-		exit(0);
+        if ( warnings ) {
+            printf("Line %d: No solution found!\n", line);
+        }
+        unsolved_count++;
+        return 0;
 	}
     
 }
@@ -300,6 +321,17 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
         for (unsigned char i = 0; i < 64; ++i) {
             digit = grid[i];
             if (digit >= 49) {
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & (1 << (digit-49)) )
+                         || ( rows[row_index[i]] & (1 << (digit-49)) )
+                         || ( boxes[box_index[i]] & (1 << (digit-49)) ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= 1 << (digit-49);
                 rows[row_index[i]] |= 1 << (digit-49);
                 boxes[box_index[i]] |= 1 << (digit-49);
@@ -309,6 +341,17 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
         for (unsigned char i = 64; i < 81; ++i) {
             digit = grid[i];
             if (digit >= 49) {
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & (1 << (digit-49)) )
+                         || ( rows[row_index[i]] & (1 << (digit-49)) )
+                         || ( boxes[box_index[i]] & (1 << (digit-49)) ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= 1 << (digit-49);
                 rows[row_index[i]] |= 1 << (digit-49);
                 boxes[box_index[i]] |= 1 << (digit-49);
@@ -326,6 +369,9 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
     }
     
     start:
+     if ( grid_state == 0 ) {
+         return false;
+     }
     
     unlocked = grid_state->unlocked;
     candidates = grid_state->candidates;
@@ -345,7 +391,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                     GridState *old_grid_state = grid_state;
                     grid_state = track_back(grid_state, line);
                     trackbacks++;
-                    if ( reportstats ) {
+                    if ( grid_state && reportstats ) {
                         my_digits_entered_and_retracted +=
                                 (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                               + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -381,7 +427,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                     GridState *old_grid_state = grid_state;
                     grid_state = track_back(grid_state, line);
                     trackbacks++;
-                    if ( reportstats ) {
+                    if ( grid_state && reportstats ) {
                         my_digits_entered_and_retracted += 
                             (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                           + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -487,7 +533,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                 GridState *old_grid_state = grid_state;
                 grid_state = track_back(grid_state, line);
                 trackbacks++;
-                if ( reportstats ) {
+                    if ( grid_state && reportstats ) {
                     my_digits_entered_and_retracted += 
                         (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                       + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -528,7 +574,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                         GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                               + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -550,7 +596,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                         GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                               + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -572,7 +618,7 @@ static bool solve(signed char grid[81], GridState *grid_state, int line) {
                         GridState *old_grid_state = grid_state;
                         grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
                               + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
@@ -630,12 +676,23 @@ int main(int argc, char *argv[]) {
         argv++;
     }    
 
+    char opts[80] = { 0 };
+    for (int i = 0; i < argc; i++) {
+        sprintf(opts+strlen(opts), "%s ", argv[i]);
+    }
+
     while ( argc && argv[0][0] == '-' ) {
         if (argv[0][1] == 0) {
             argv++; argc--;
             break;
         }
         switch(argv[0][1]) {
+        case 'c':
+             thorough_check=1;
+             break;
+        case 'w':    // display warnings
+             warnings = 1;
+             break;
         case 'x':    // stats output
              reportstats=1;
              break;
@@ -650,8 +707,8 @@ int main(int argc, char *argv[]) {
 	if ( fdin == -1 ) {
 		if (errno ) {
 			fprintf(stderr, "Error: Failed to open file %s: %s\n", ifn, strerror(errno));
-			exit(0);
 		}
+        exit(0);
 	}
 
     // get size of file
@@ -660,23 +717,27 @@ int main(int argc, char *argv[]) {
     size_t fsize = sb.st_size;
 
 	// map the input file
-	char *string = (char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
+    signed char *string = (signed char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
 	if ( string == MAP_FAILED ) {
 		if (errno ) {
-			printf("Error mmap of input file %s: %s\n", ifn, strerror(errno));
-			exit(0);
+			fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
 		}
+        exit(0);
 	}
 	close(fdin);
 
 	// skip first line, unless it's a puzzle.
     size_t pre = 0;
-	if ( !isdigit(string[0]) || string[81] != 10 ) {
+    while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
 	    while (string[pre] != 10) {
     	    ++pre;
     	}
     	++pre;
 	}
+    if ( string[pre+81] == 13 ) {
+        fprintf(stderr, "Error: input file line ending in CR/LF\n");
+		exit(0);
+    }
     
     size_t post = 1;
 	if ( string[fsize-1] != 10 )
@@ -693,30 +754,30 @@ int main(int argc, char *argv[]) {
 	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
 	if ( fdout == -1 ) {
 		if (errno ) {
-			printf("Error opening output file %s: %s\n", ofn, strerror(errno));
-			exit(0);
+			fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
 		}
+        exit(0);
 	}
 	if ( ftruncate(fdout, (size_t)npuzzles*164) == -1 ) {
 		if (errno ) {
-			printf("Error setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
 		}
 		exit(0);
 	}
 
 	// map the output file
-	output = (signed char *)mmap((void*)0, npuzzles*164, PROT_WRITE, MAP_SHARED, fdout, 0);
+    output = (signed char *)mmap((void*)0, npuzzles*164, PROT_WRITE, MAP_SHARED, fdout, 0);
 	if ( output == MAP_FAILED ) {
 		if (errno ) {
 			printf("Error mmap of output file %s: %s\n", ofn, strerror(errno));
-			exit(0);
 		}
+        exit(0);
 	}
 	close(fdout);
 
     // solve all sudokus and prepare output file
     size_t i;
-	char *string_pre = string+pre;
+	signed char *string_pre = string+pre;
 	GridState *stack = 0;
 
 #pragma omp parallel for firstprivate(stack) shared(string_pre, npuzzles, output, fsize, i) schedule(static,32)
@@ -737,21 +798,26 @@ int main(int argc, char *argv[]) {
 	int err = munmap(string, fsize);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ifn, strerror(errno));
+            fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
 		}
 	}
 	err = munmap(output, (size_t)npuzzles*164);
 	if ( err == -1 ) {
 		if (errno ) {
-			printf("Error munmap file %s: %s\n", ofn, strerror(errno));
+            fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
 		}
 	}
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("fastss version: %s\n", version_string);
+        printf("schoku version: %s\ncommand options: %s\n", version_string, opts);
         printf("%10ld  puzzles entered\n", npuzzles);
+        printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
 		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+        if ( unsolved_count.load()) {
+            printf("%10ld  puzzles had no solution\n", unsolved_count.load());
+        }
+
         printf("%10ld  %5.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
         printf("%10lld  %5.2f/puzzle  total guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
