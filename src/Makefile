@@ -15,24 +15,28 @@ DFLAGS :=
 OFLAGS := -O3
 #OFLAGS := -O2
 #OFLAGS := -g -Og
-#OFLAGS := -pg -O
 # asm output options
 SFLAGS := -masm=intel
 
+# if not using build sub-dirs, leave them as '.'
 SRC_DIR := .
 OBJ_DIR := .
 DEP_DIR := .
 
-CPPFLAGS1  = -MMD -MP -MF $(@:$(OBJ_DIR)/%.o=$(DEP_DIR)/%.d)
+ifeq ($(OBJ_DIR),.)
+        CPPFLAGS1  = -MMD -MP -MF $(@:%.o=$(DEP_DIR)/%.d)
+else
+        CPPFLAGS1  = -MMD -MP -MF $(@:$(OBJ_DIR)/%.o=$(DEP_DIR)/%.d)
+endif
+
 # -fopenmp is required to use OMP (multi-threading) - it implies -pthread
 CFLAGS   := $(OFLAGS) -fopenmp -pthread -Wall -Wextra $(DFLAGS) $(XFLAGS)
 # The default is -std=gnu++17 in gcc 11.4
-# The minimum required level is std=gnu++11
 # The gnu* flavour is required to find the ftruncate Posix function.
 CXXFLAGS := -std=gnu++17 $(CFLAGS)
 LDFLAGS  := -fopenmp -pthread
 
-SOURCE := $(foreach ext, $(EXT), $(wildcard $(SRC_DIR)/*.$(ext)))
+SOURCE := $(SRC_DIR)/schoku.cpp
 OBJECT := $(SOURCE:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 DEPEND := $(OBJECT:$(OBJ_DIR)/%.o=$(DEP_DIR)/%.d)
 
@@ -45,17 +49,31 @@ endef
 
 .PHONY: all clean
 
+ifeq ($(OBJ_DIR),$(DEP_DIR))
+        DIRECTORIES := $(OBJ_DIR)
+else
+        DIRECTORIES := $(OBJ_DIR) $(DEP_DIR)
+endif
 all: $(TARGET)
 
-$(TARGET): $(OBJECT)
+$(TARGET):: $(OBJECT)
 	$(CXX) $(LDFLAGS) $^ -o $@
+
+$(TARGET):: $(DIRECTORIES)
+	@true
 
 $(foreach ext, $(EXT), $(eval $(call rule,$(ext))))
 
-#$(OBJ_DIR) $(DEP_DIR):
-#	mkdir -p $@
+$(DIRECTORIES):
+	mkdir -p $@
 
 -include $(DEPEND)
 
 clean:
 	$(RM) -r $(TARGET) $(OBJECT) $(DEPEND)
+
+$(OBJ_DIR)/schoku_lib.o: schoku.cpp
+	$(COMPILE.cpp) -DLIB_ONLY $(CPPFLAGS1) $< -o $@
+
+test_mirage_wrap: test_mirage_wrap.o $(OBJ_DIR)/schoku_lib.o
+	$(CXX) -pthread $^ -o $@

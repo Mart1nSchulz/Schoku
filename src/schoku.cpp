@@ -1,14 +1,13 @@
 // This code uses AVX2 instructions...
 /*
- * Schoku
- *
- * A high speed sudoku solver by M. Schulz
+ * Schoku (baseline 1 +)
+ * This version is the closests possible to sudoku solver by Mirage.
  *
  * Based on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.1 (baseline)
+ * Version 0.1 (+)
  *
  * Basic changes:
  * - instruction intrinsics instead of BitScan* functions.
@@ -17,12 +16,12 @@
  * - copy solution before freeing grid_state
  * - avoid back tracking from first grid_state
  *
- * Basic performance measurement and statistics:
+ * Baseline performance measurement and statistics:
  *
  * data: 17-clue sudoku
  * CPU:  Ryzen 7 4700U
  *
- * fastss version: 0.1
+ * schoku version: 0.1
  *      49151  puzzles entered
  *    106.1ms   2.16µs/puzzle  solving time
  *      31355  63.79%  puzzles solved without guessing
@@ -43,7 +42,9 @@
 #include <stdbool.h>
 #include <intrin.h>
 
-const char *version_string = "0.1";
+namespace Mirage {
+
+const char *version_string = "0.1 (+)";
 
 // lookup tables that may or may not speed things up by avoiding division
 static const unsigned char box_index[81] = {
@@ -96,10 +97,15 @@ static const unsigned char box_start[81] = {
 
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
+int reporttimings   = 0; // report timings only
+int thorough_check  = 0; // check for back tracking even if no guess was made.
+int numthreads      = 0; // if not 0, number of threads
+int warnings        = 0; // display warnings
 
 signed char *output;
 
 std::atomic<long> solved_count(0);          // puzzles solved
+std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exists)
 std::atomic<long long> guesses(0);          // how many guesses did it take
 std::atomic<long long> trackbacks(0);       // how often did we back track
 std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
@@ -246,7 +252,7 @@ static struct GridState* make_guess(struct GridState* grid_state) {
 }
 
 
-static struct GridState* track_back(struct GridState* grid_state) {
+static struct GridState* track_back(struct GridState* grid_state, int line) {
     // Go back to the state when the last guess was made
     // This state had the guess removed as candidate from it's cell
     
@@ -256,8 +262,11 @@ static struct GridState* track_back(struct GridState* grid_state) {
 	    return old_grid_state;
 	} else {
 		// This only happens when the puzzle is not valid
-		fprintf(stderr, "No solution found!\n");
-		exit(0);
+        if ( warnings ) {
+            printf("Line %d: No solution found!\n", line);
+	}
+        unsolved_count++;
+        return 0;
 	}
     
 }
@@ -290,6 +299,17 @@ static bool solve(signed char grid[81], int line) {
         for (unsigned char i = 0; i < 64; ++i) {
             digit = grid[i];
             if (digit >= 49) {
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & (1 << (digit-49)) )
+                         || ( rows[row_index[i]] & (1 << (digit-49)) )
+                         || ( boxes[box_index[i]] & (1 << (digit-49)) ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= 1 << (digit-49);
                 rows[row_index[i]] |= 1 << (digit-49);
                 boxes[box_index[i]] |= 1 << (digit-49);
@@ -299,6 +319,17 @@ static bool solve(signed char grid[81], int line) {
         for (unsigned char i = 64; i < 81; ++i) {
             digit = grid[i];
             if (digit >= 49) {
+                if ( thorough_check ) {
+                    if (    ( columns[column_index[i]] & (1 << (digit-49)) )
+                         || ( rows[row_index[i]] & (1 << (digit-49)) )
+                         || ( boxes[box_index[i]] & (1 << (digit-49)) ) ) {
+                        if ( warnings ) {
+                            printf("Line %d: puzzle is unsolvable: [%d,%d] = %d\n", line, i/9, i%9, 1 + grid[i] - 49);
+                        }
+                        unsolved_count++;
+                        return false;
+                    }
+                }
                 columns[column_index[i]] |= 1 << (digit-49);
                 rows[row_index[i]] |= 1 << (digit-49);
                 boxes[box_index[i]] |= 1 << (digit-49);
@@ -316,6 +347,9 @@ static bool solve(signed char grid[81], int line) {
     }
     
     start:
+    if ( grid_state == 0 ) {
+        return false;
+    }
     
     unlocked = grid_state->unlocked;
     candidates = grid_state->candidates;
@@ -333,9 +367,9 @@ static bool solve(signed char grid[81], int line) {
                 if (_mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()))) {
                     // Back track, no solutions along this path
                     GridState *old_grid_state = grid_state;
-                    grid_state = track_back(grid_state);
+                    grid_state = track_back(grid_state, line);
                     trackbacks++;
-                    if ( reportstats ) {
+                    if ( grid_state && reportstats ) {
                         my_digits_entered_and_retracted += 
                             (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
                           + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
@@ -364,9 +398,9 @@ static bool solve(signed char grid[81], int line) {
                 if (candidates[80] == 0) {
                     // no solutions go back
                     GridState *old_grid_state = grid_state;
-                    grid_state = track_back(grid_state);
+                    grid_state = track_back(grid_state, line);
                     trackbacks++;
-                    if ( reportstats ) {
+                    if ( grid_state && reportstats ) {
                         my_digits_entered_and_retracted += 
                             (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
                           + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
@@ -473,12 +507,12 @@ static bool solve(signed char grid[81], int line) {
             } else {
                 // no solutions go back
                 GridState *old_grid_state = grid_state;
-                grid_state = track_back(grid_state);
+                grid_state = track_back(grid_state, line);
                 trackbacks++;
-                if ( reportstats ) {
+                if ( grid_state && reportstats ) {
                     my_digits_entered_and_retracted += 
-                        (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
-                      + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
+                        (_popcnt64(grid_state->unlocked[0] & ~old_grid_state->unlocked[0]))
+                      + (_popcnt32(grid_state->unlocked[1] & ~old_grid_state->unlocked[1]));
                 }
                 goto start;
             }
@@ -514,9 +548,9 @@ static bool solve(signed char grid[81], int line) {
                     my_naked_sets_searched++;
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
                               + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
@@ -536,9 +570,9 @@ static bool solve(signed char grid[81], int line) {
 
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
                               + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
@@ -558,9 +592,9 @@ static bool solve(signed char grid[81], int line) {
                     my_naked_sets_searched++;
                     if (s > cnt) {
                         GridState *old_grid_state = grid_state;
-                        grid_state = track_back(grid_state);
+                        grid_state = track_back(grid_state, line);
                         trackbacks++;
-                        if ( reportstats ) {
+                        if ( grid_state && reportstats ) {
                             my_digits_entered_and_retracted += 
                                 (_popcnt64(old_grid_state->unlocked[0] & ~grid_state->unlocked[0]))
                               + (_popcnt32(old_grid_state->unlocked[1] & ~grid_state->unlocked[1]));
@@ -611,7 +645,30 @@ static bool solve(signed char grid[81], int line) {
 }
 
 
+} // namespace Schoku
+
+#ifndef LIB_ONLY
+
+void print_help() {
+        using namespace Mirage;
+        printf("schoku version: %s\n", version_string);
+        printf(R"(Synopsis:
+schoku [options] [puzzles] [solutions]
+	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
+	 [solutions] names the output file with solutions. Default is 'solutions.txt'.
+
+Command line options:
+    -h  help information (this text)
+    -t# set the number of threads
+    -x  provide some statistics
+    -y  provide speed statistics only
+
+)");
+}
+
 int main(int argc, char *argv[]) {
+
+using namespace Mirage;
 
     if ( argc > 0 ) {
         argc--;
@@ -624,8 +681,30 @@ int main(int argc, char *argv[]) {
             break;
         }
         switch(argv[0][1]) {
+        case 'c':
+             thorough_check=1;
+             break;
+        case 'h':
+             print_help();
+             exit(0);
+             break;
+        case 't':    // set number of threads
+             if ( argv[0][2] && isdigit(argv[0][2]) ) {
+                 sscanf(&argv[0][2], "%d", &numthreads);
+                 if ( numthreads != 0 ) {
+                     omp_set_num_threads(numthreads);
+                 }
+             }
+             break;
+        case 'v':    // verify
+        case 'w':    // display warnings
+             warnings = 1;
+             break;
         case 'x':    // stats output
              reportstats=1;
+             break;
+        case 'y':    // timing stats only
+             reporttimings=1;
              break;
         }
         argc--, argv++;
@@ -655,12 +734,16 @@ int main(int argc, char *argv[]) {
 
 // skip first line, unless it's a puzzle.
     size_t pre = 0;
-	if ( !isdigit(string[0]) || string[81] != 10 ) {
+    while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
 	    while (string[pre] != 10) {
     	    ++pre;
     	}
     	++pre;
 	}
+    if ( string[pre+81] == 13 ) {
+        fprintf(stderr, "Error: input file line ending in CR/LF\n");
+		exit(0);
+    }
     
     size_t post = 1;
 	if ( string[fsize-1] != 10 )
@@ -704,9 +787,13 @@ int main(int argc, char *argv[]) {
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("fastss version: %s\n", version_string);
+        printf("schoku version: %s\n", version_string);
         printf("%10ld  puzzles entered\n", npuzzles);
+        printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
 		printf("%8.1lfms  %5.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+        if ( unsolved_count.load()) {
+            printf("%10ld  puzzles had no solution\n", unsolved_count.load());
+        }
         printf("%10ld  %5.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/(double)solved_count.load()*100);
         printf("%10lld  %5.2f/puzzle  total guesses\n", guesses.load(), (double)guesses.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  total back tracks\n", trackbacks.load(), (double)trackbacks.load()/(double)solved_count.load());
@@ -714,7 +801,39 @@ int main(int argc, char *argv[]) {
         printf("%10lld  %5.2f/puzzle  total 'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
         printf("%10lld  %5.2f/puzzle  naked sets found\n", naked_sets_found.load(), naked_sets_found.load()/(double)solved_count.load());
         printf("%10lld %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), naked_sets_searched.load()/(double)solved_count.load());
+    } else if ( reporttimings ) {
+        long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
+		printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
     }
 
     return 0;
 }
+
+#else
+
+namespace Mirage {
+    int line_counter = 0;
+}
+
+
+// library / call interface for invoking the Mirage solver Schoku is based on,
+// using tdoku benchmark conventions.
+// This unfortunately precludes using multiple threads...
+extern "C"
+size_t OtherSolverMirage(const char *input, size_t /*limit*/, uint32_t /*unused_configuration*/,
+                             char *solution, size_t *num_guesses) {
+
+    using namespace Mirage;
+
+    line_counter++;
+    guesses = 0;
+    thorough_check = 1;
+    memcpy(solution, input, 81);
+    bool status = solve((signed char*)solution, line_counter);
+    *num_guesses = guesses.load();
+    if ( !status ) {
+        return 0;
+    }
+    return 1;
+}
+#endif
