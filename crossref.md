@@ -33,15 +33,17 @@
 | reject CR/LF | (no) | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 
 
-| Solver Feature | 0.1 | 0.1+ | 0.2 | 0.3 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 0.9.1 
-| ---- |:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| naked/hidden singles | partial | partial | partial | partial | yes | yes | yes | yes | yes | yes |
-| triad updates  | - | - | - | - | - | - | yes | yes | yes | yes |
-| BUG+1  | - | - | - | - | - | yes | yes | yes | yes | yes |
+| Solver Feature | 0.1 | 0.1+ | 0.2 | 0.3 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 0.9.1 | 0.9.2
+| ---- |:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
+| naked/hidden singles | partial | partial | partial | partial | yes | yes | yes | yes | yes | yes | yes
+| triad updates  | - | - | - | - | - | - | yes | yes | yes | yes | yes |
+| Unique Rectangles | - | - | - | - | - | - | - | - | - | yes | yes |
+| Fishes | - | - | - | - | - | - | - | - | - | - | yes |
+| BUG+1  | - | - | - | - | - | yes | yes | yes | yes | yes | yes |
 
 | Recommended options | 0.1 | 0.1+ | 0.2 | 0.3 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 0.9.1 
 | ---- |:------:|:------:|:------:|:------:|:------:|:------:|:------:|:------:|:------:|:------:|
-| 7_serg_benchmark | (none) | -x | -x -rm | -x -rm | -x -rm | -x -rm | -x -rm | -x -rm | -x -rm | -x -rm |
-| 8_gen_puzzles  | (none) | -x -c | -x -c | -x -c | -x -c -ro | -x -c -ro | -x -c -ro | -x -c -ro | -x -c -ro | -x -c -ro |
+| 7_serg_benchmark | (none) | -rm | -rm | -rm | -rm | -rm | -rm | -rm | -rm | -rm |
+| 8_gen_puzzles  | (none) | -c | -c | -c | -c -ro | -c -ro | -c -ro | -c -ro | -c -ro | -c -ro |
 
 
