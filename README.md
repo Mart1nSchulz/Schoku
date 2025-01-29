@@ -12,13 +12,15 @@ This repository represents a plausible and logical line of evolution of that pro
 
 ### Abstract
 By direct comparison on my test computer, I found that my fastest version of Schoku
-runs up to 4 times faster than the original (internal clock measurement, multi-threaded).
-In single-threaded mode the factor is much smaller at 1.74, due to the original program's
-low multi-threading performance.  
+runs up to 4.5 times faster than the original (internal clock measurement, multi-threaded),
+due to the original program's low multi-threading performance.
+In single-threaded mode the factor sits at 2.  
 When measuring using the time command, the factors are reduced substantially on
 a 17-clue puzzle file with 49151 puzzles, where the startup uses more than 40% of the execution time.
 
 ![Schoku performance](Schoku_Performance.png "Schoku performance")
+
+Benchmark results for Schoku can be found [here](https://pastebin.com/jtU5qddQ).
 
 ### Summary of Changes
 Looking at speed improvements in terms of low hanging fruit, I found that the malloc'ation of the GridState
@@ -40,16 +42,18 @@ I used an approach that pays off by reducing the overall number of guesses.  The
 The program self-measures accurately internally the execution time of the program
 minus the loading and startup sequence and the final reporting.  This approach is
 precise and justifiable.  
-The startup of this program on a specific OS may vary,
+The startup overhead of this program on a specific OS may vary,
 But I found on Cygwin64 the overhead to be very close to 20ms.  
+
 The time command reported timing varies quite a bit while the internal timings were more stable.  
 I elected to collect statistics based on the multi-threaded timings througout.  
-For the later versions of Schoku the factor between multi-threading and single-threading is close to 6
-for a 4 CPU / 8 execution units processor.  
+For the later versions of Schoku the factor between multi-threading and single-threading is approaching 6
+for a 4 CPU / 8 core processor.  
 The original code's ratio of multi- to single-threaded performance was very low at 2.15 and gradually improved with my allocation and alignment
 of the grid state data.
 
-I am taking timings on a Zen2 Ryzen 7 4800U processor.
+I am taking timings on a Zen2 Ryzen 7 4700U processor which operates at around
+3.3GHz in multithreaded mode. For single threaded execution is above 4GHz.
 
 
 ### Approach
@@ -81,17 +85,17 @@ easily than other sets.
 But we are not done yet:
 - look for naked sets (as set of N cells that overall contains exactly N candidates and
   no other candidates) in any row, column or box.
-
 Really any size is possible, a naked set of 1 being a naked single, and a naked set of 9 filling
 all of the row.
+  Note that this algorithm might not be present in all versions.
 
-* consequences of finding a naked set:
-..* no other cell in that section can contain these N candidates.
-  This leaves us with another set (the complementary set).
-..* the complementary set cells can therefore be purged of the N candidates found.
+- consequences of finding a naked set:   
+  no other cell in that section can contain these N candidates. 
+  This leaves us with another set (the complementary set).   
+  the complementary set cells can therefore be purged of the N candidates found.
   The complementary set is a hidden set, therefore naked set search covers hidden set search as well. 
 
-* once more, after removing the extra candidates from the hidden set, repeat from the beginning.
+- once more, after removing the extra candidates from the hidden set, repeat from the beginning.
 
 With these 4 algorithms, we have covered the basics.
 
@@ -115,7 +119,9 @@ There are different difficulty levels at which the program has to operate.
   offers more information to those algorithms.
 - If the collection of puzzles is biased one way or the other, different choices
   in the program influence the performance.
-
+- Sometimes puzzles are incorrect or have multiple solutions.  It is important to have
+  ways to cope with these situations.
+  
 Many other details will play a role.  The order and implementation of the algorithms is 
 obviously a factor and it is hard to tell which decisions impact the larger picture.  
 It is relatively simple to leave out some of the parts above and still achieve good performance.
@@ -146,7 +152,7 @@ To name a few:
 - options to prove uniqueness and verify the solutions
 - an option to check the puzzle
 - options to control the number of threads
-- optionally provde statistics and timing information
+- optionally provide statistics and timing information
 - optionally solve a single puzzle from a puzzle file
 - feature selection
 - options for puzzles that may have none or multiple solutions or are incorrect from the start 
@@ -175,10 +181,16 @@ may or may not be available.
 - __ease of debugging__  
   Luckily gcc has a performant optimizer.  Unfortunately the same optimizer makes it
   extremely hard to debug this program (AVX2 data types, passing 32-byte aligned
-  data on the stack and just plain unwillingness to stop a crucial lines).
+  data on the stack and just plain unwillingness to stop at crucial lines).
   Not to mention that Cygwin can be a development environment, but not a flexible
   or powerful one.  The Linux compatibility has limits.  Performance is not
   guaranteed to be on a par 1-1.
 - I would have preferred a way to portably leverage AVX capable processors.  
   E.g. using Agner Fog's VCL, which I have used for training wheels.
   That will have to wait for another time. 
+
+### Acknowledgements
+- The stackoverflow community.  Just to name one of many many people: Peter Cordes
+  for his prolific, precise and readable writing.
+- Agner Fog for his X86 timing tables and the VCL
+- The free software community at large
