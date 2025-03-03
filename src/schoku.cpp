@@ -25,8 +25,9 @@
  * Functional changes:
  * - added algorithm for (avoidable) unique rectangles.
  * - added algorithm for fishes and finned fishes.
- *   with fishes and naked subsets (-mfs), attains over 91% of solves without guessing
- *   on 17-clue test set.
+ * - increased detection of fishes (combining pairs to triples)
+ *   with fishes and naked subsets (-mfs), attains 91.68% of solves without guessing
+ *   on the 17-clue test set.
  * - adjustments for more diversified puzzle sources (tdoku puzzle files)
  * - warnings option (-w): by default the messages and warnings are muted.
  *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
@@ -68,19 +69,19 @@
  * compile options: OPT_TRIAD_RES OPT_SETS OPT_FSH OPT_UQR
  *      49151  puzzles entered
  *      49151  1943841/s  puzzles solved
- *     25.3ms    0.51µs/puzzle  solving time
- *      44754   91.05%  puzzles solved without guessing
- *       6948    0.14/puzzle  guesses
- *       3935    0.08/puzzle  back tracks
- *      54423    1.11/puzzle  digits entered and retracted
- *    1403313   28.55/puzzle  'rounds'
- *      21757    0.44/puzzle  triads resolved
- *     188693    3.84/puzzle  triad updates
- *      26481    0.54/puzzle  naked sets found
- *     894760   18.20/puzzle  naked sets searched
- *      11401    0.23/puzzle  fishes updated
- *      47896    0.97/puzzle  fishes detected
- *        918  bi-value universal graves detected
+ *     25.4ms    0.52µs/puzzle  solving time
+ *      45059   91.67%  puzzles solved without guessing
+ *       5959    0.12/puzzle  guesses
+ *       3259    0.07/puzzle  back tracks
+ *      44337    0.90/puzzle  digits entered and retracted
+ *    1400058   28.48/puzzle  'rounds'
+ *      21759    0.44/puzzle  triads resolved
+ *     188381    3.83/puzzle  triad updates
+ *      26077    0.53/puzzle  naked sets found
+ *     837881   17.05/puzzle  naked sets searched
+ *      12810    0.26/puzzle  fishes updated
+ *      50426    1.03/puzzle  fishes detected
+ *        949  bi-value universal graves detected
  *
  */
 #include <atomic>
@@ -102,8 +103,6 @@ namespace Schoku {
 const char *version_string = "0.9.2";
 
 const char *compilation_options =
-// Options OPT_SETS and OPT_TRIAD_RES compete to some degree, but they also perform well
-// together for excellent statistics.
 #ifdef OPT_TRIAD_RES
 // Triad resolution examines all triads and if exactly three candidates are present
 // marks them as sets. A tiny penalty to speed but a boost to statistics overall.
@@ -367,6 +366,11 @@ const bit128_t box_bitmasks[9] = {
 
     const unsigned char row_triads_lut[9] = {
         0, 10, 20, 3, 13, 23, 6, 16, 26 };
+
+    const unsigned char row_triad_index_to_offset[30] = {
+         0, 3, 6,27,30,33,54,57,60,0xff,
+         9,12,15,36,39,42,63,66,69,0xff,
+        18,21,24,45,48,51,72,75,78,0xff };
 
     // find the 3-bit positional pattern given the 'band' index 0..8
     const unsigned int bandbits_by_index[9] = {
@@ -1037,7 +1041,7 @@ public:
     unsigned int triads_selection[2];
 };
 
-// Solver sharable data - used by make_guess
+// Solver sharable data - used by some algorithms and make_guess
 class SolverData {
 private:
     bit128_t  bivalues;
@@ -1048,7 +1052,7 @@ public:
     unsigned short guess_hint_digit;
 
     inline bit128_t &getBivalues(unsigned short *candidates) {
-        if ( bivaluesValid == false ) {
+        if ( !bivaluesValid ) {
             __m256i c;
             for (unsigned char i = 0; i < 64; i += 32) {
                 c = _mm256_load_si256((__m256i*) &candidates[i]);
@@ -1306,22 +1310,8 @@ inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater) {
 // - the operation is typically more balanced, in that both branches will provide similar
 //   efficiencies (at least on average).
 //
-template<Verbosity verbose, bool preemptive = false>
+template<Verbosity verbose>
 inline GridState* make_guess(SolverData *solverData) {
-    // If preemptive is true:
-    // This is a structual gambit at the beginning if the puzzles is very hard:
-    // We search for a a resolved candidate digit and exploit the fact that then the two boxes
-    // of the same band each have two triads to place this digit (presuming that there is not
-    // another resolved cell with that digit in the band).
-    // Then the guess consists of allocating this digit to a different triad of one box for
-    // each of the two branches of the guess, in the hope that this will lead to progress
-    // of the solution.
-    // As said above, this is a preemptive move for a very hard puzzle, before trying any
-    // expensive algorithm.  The nice property here is that (assuming the hard puzzle was 
-    // created/selected to defeat all popular solution algorithms) this approach is quite
-    // impossible to prevent _and_ it softens up the puzzle.
-    //
-    // If preemptive is false:
     // Make a guess for a triad with 4 candidate values that has 2 candidates that are not
     // constrained to the triad (not in 'tmust') and has at least 2 or more unresolved cells.
     // If we cannot obtain such a triad, fall back to make_guess().
@@ -1396,33 +1386,23 @@ found:
     unsigned short other_cand  = *wo_musts & ~select_cand;
     unsigned char off = tpos;
 
-    if ( preemptive ) {
-/// XXX
+    off = tpos;
+    // Update candidates
+    for ( unsigned char k=0; k<3; k++, tpos += inc) {
+       new_grid_state->candidates[tpos] &= ~select_cand;
+       candidates[tpos] &= ~other_cand;
+    }
+    if (type == 0 ) {
+        updated.set_indexbits(0x7,off,3);
+        new_grid_state->updated.set_indexbits(7,off,3);
     } else {
-        unsigned short other_cand  = *wo_musts & ~select_cand;
-
-        off = tpos;
-        // Update candidates
-        for ( unsigned char k=0; k<3; k++, tpos += inc) {
-         new_grid_state->candidates[tpos] &= ~select_cand;
-         candidates[tpos] &= ~other_cand;
-        }
-        if (type == 0 ) {
-            updated.set_indexbits(0x7,off,3);
-            new_grid_state->updated.set_indexbits(7,off,3);
-        } else {
-            updated.set_indexbits(0x40201,off,19);
-            new_grid_state->updated.set_indexbits(0x40201,off,19);
-        }
+        updated.set_indexbits(0x40201,off,19);
+        new_grid_state->updated.set_indexbits(0x40201,off,19);
     }
     if ( verbose == VDebug ) {
         printf("guess at level >%d< - new level >%d<\n", stackpointer, new_grid_state->stackpointer);
-        if ( preemptive ) {
-//XXX            printf("guess remove {%d} from %s triad at %s\n",
-        } else {
-            printf("guess remove {%d} from %s triad at %s\n",
-                   1+_tzcnt_u32(select_cand), type==0?"row":"col", cl2txt[off]);
-        }
+        printf("guess remove {%d} from %s triad at %s\n",
+               1+_tzcnt_u32(select_cand), type==0?"row":"col", cl2txt[off]);
     }
     if ( verbose != VNone ) {
         char gridout[82];
@@ -1438,12 +1418,8 @@ found:
                    cl2txt[off], stackpointer, gridout);
         }
         if ( debug ) {
-            if ( preemptive ) {
-//XXX            printf("guess remove {%d} from %s triad at %s\n",
-            } else {
-                printf("saved state for level %d: remove {%d} from %s triad at %s\n",
-                       stackpointer, 1+_tzcnt_u32(other_cand), type==0?"row":"col", cl2txt[off]);
-            }
+            printf("saved state for level %d: remove {%d} from %s triad at %s\n",
+                   stackpointer, 1+_tzcnt_u32(other_cand), type==0?"row":"col", cl2txt[off]);
         }
         if ( debug > 1 ) {
             unsigned short *candidates = new_grid_state->candidates;
@@ -1584,8 +1560,6 @@ Status solve(signed char grid[81], GridState stack[], int line) {
     Status status;
 
     SolverData solverData {};
-
-    int preemptive_guesses = 0;
 
 #ifdef OPT_UQR
     // make_guess accepts a lambda, which will use guess_message to pass along
@@ -2476,11 +2450,6 @@ enter:
 
     } // Algo 2 and Algo 3.1
 
-    if ( preemptive_guesses ) {
-        preemptive_guesses--;
-        goto guess;
-    }
-
 #ifdef OPT_TRIAD_RES
     if ( mode_triad_res )
     { // Algo 3.3
@@ -2562,7 +2531,7 @@ enter:
             m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
             triad_info.triads_selection[Row] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
 
-            // the best that can be done for rows - remember that the the order of
+            // the best that can be done for rows - remember that the order of
             // row triads is not aligned with the order of cells.
             bit128_t tr = grid_state->unlocked;   // for row triads - any triad cell unlocked
 
@@ -2573,10 +2542,8 @@ enter:
 
             while (m) {
                 unsigned char tidx = tzcnt_and_mask(m);
-                unsigned char logical_tidx = tidx-tidx/10;
-                unsigned char ri  = logical_tidx/9+logical_tidx%9/3*3;
-                unsigned char tci = logical_tidx%3*3;
-                unsigned char off = ri*9+tci;
+                unsigned char off  = row_triad_index_to_offset[tidx];
+
                 if ( !tr.check_indexbit(off)) {  // locked
                     grid_state->triads_unlocked[Row] &= ~(1<<tidx);
                     continue;
@@ -2911,6 +2878,7 @@ enter:
 // Additional tracking mechanisms are used to reduce the number of searches:
 // - previously found sets (and their complements) as well as found triads
 // - sets that occupy all available space minus one - impossible due to perfect single detection
+//
 
     if ( mode_sets )
     {
@@ -3461,8 +3429,11 @@ enter:
         }
         unsigned short exclude = 0;
         unsigned short exclude_cols = 0;
-        for (unsigned char t=0; t<9; t++) { // t is the row the pattern is sampled from
-            unsigned int base = cbbv_v.v16[t]; // base: tentative fish pattern
+        unsigned int pair_locs = 0;  // pairs, bits left to right
+        unsigned int alt_base = 0;
+        for (unsigned char t=0; t<9; t++, pair_locs <<= 1) { // t is the row the pattern is sampled from
+            unsigned int base = alt_base? alt_base : cbbv_v.v16[t]; // base: tentative fish pattern
+
             if ( base & exclude ) { 
                 continue;
             }
@@ -3470,6 +3441,9 @@ enter:
             // take each row of bits and compare to all other rows.
             //
             unsigned char cnt = __popcnt16(base);
+            if ( cnt == 2 ) {
+                pair_locs |= 1;
+            }
             if ( cnt+1 < max && cnt > 1) {  // maximum cnt is 5 ('squirmbag').
                 __m256i basev = _mm256_and_si256(_mm256_set1_epi16(base),mask9);
                 // rows that have a non-empty intersection with base
@@ -3506,7 +3480,7 @@ enter:
                     if ( clean_bits ) {
                         if ( verbose == VDebug ) {
                             unsigned char celli  = __tzcnt_u16(subs)*9 + __tzcnt_u16(base);
-                            unsigned char celli2 = (15-__lzcnt16(subs))*9 + (15-__lzcnt16(cbbv_v.v16[t]));
+                            unsigned char celli2 = (15-__lzcnt16(subs))*9 + (15-__lzcnt16(base));
                             if ( debug > 2 ) {
                                 show_fish(cbbv_v, base, subs, hassubs, clean_bits, "row fish");
                             }
@@ -3558,7 +3532,7 @@ enter:
                             // this has to be tested before continuing, as otherwise we lose
                             // the opportunity because of the sashimi elimination.
                             // the hassubs condition may be expendable, but the results are quite positive, if not at a high frequency.
-                            if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && cnt == 2 && _popcnt32(hassubs) <= 3 ) {
+                            if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && alt_base==0 && cnt == 2 && _popcnt32(hassubs) <= 3 ) {
                                 solverData.guess_hint_digit = 1<<dgt;
                                 solverData.guess_hint_index = t*9 + __tzcnt_u16(base & ~box_bits);
                             }
@@ -3613,7 +3587,29 @@ enter:
                     goto enter;
                 }
             }
-        }
+            // scan for two bi-values forming a triple...
+            // just take a single guess with this - it will also catch fin/sashimi
+            unsigned int pair_cnt = __popcnt16(pair_locs);
+            if ( t == 8 && pair_cnt >= 3 ) {
+                unsigned char pos[9];
+                for ( int i=pair_cnt-1; pair_locs; i-- ) {
+                    pos[i] = 8-tzcnt_and_mask(pair_locs);
+                }
+                unsigned short res = 0;
+                for ( unsigned int i=0; i<pair_cnt-1; i++) {
+                    for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
+                        if ( (res = __popcnt16(cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]])) == 3 ) {
+                            alt_base = cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]];
+                            goto done;
+                        }
+                    }
+                }
+            }
+            continue;
+done:
+            t = 7;  // one iteration with the made-up data
+            pair_locs = 0; // will skip this section next time...
+        } // for t
 
         // part 2: look for fishes at columns
 
@@ -3631,8 +3627,10 @@ enter:
         }
 
         exclude = exclude_cols;
-        for (unsigned char t=0; t<9; t++) {
-            unsigned int base = cbbv_col_v.v16[t];
+        pair_locs = 0;  // pairs, bits left to right
+        alt_base = 0;
+        for (unsigned char t=0; t<9; t++, pair_locs <<= 1) { // t is the row the pattern is sampled from
+            unsigned int base = alt_base? alt_base : cbbv_col_v.v16[t]; // base: tentative fish pattern
 
             if ( base & exclude ) { // base: tentative fish pattern
                 continue;
@@ -3641,6 +3639,10 @@ enter:
             // take each col of bits and compare to all other cols.
             //
             unsigned char cnt = __popcnt16(base);
+            if ( cnt == 2 ) {
+                pair_locs |= 1;
+            }
+
             if ( cnt-1 < max && cnt > 1) {  // maximum cnt is 5 ('squirmbag').
                 __m256i basev = _mm256_and_si256(_mm256_set1_epi16(base),mask9);
                 // rows that have a non-empty intersection with base
@@ -3722,7 +3724,7 @@ enter:
                         unsigned int cols2clean = hassubs & ~subsx & band_bits;
                         if ( cols2clean == 0 ) {
                         // the sashimi X-wing base is a good guess:
-                        if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && cnt == 2 && _popcnt32(hassubs) <= 3 ) {
+                        if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && alt_base==0 && cnt == 2 && _popcnt32(hassubs) <= 3 ) {
                             solverData.guess_hint_digit = 1<<dgt;
                             solverData.guess_hint_index = t + __tzcnt_u16(base & ~box_bits)*9;
                         }
@@ -3776,8 +3778,30 @@ enter:
                     goto enter;
                 }
             }
-        }
-    } // for
+            // scan for two bi-values forming a triple...
+            // just take a single guess with this - it will also catch fin/sashimi
+            unsigned int pair_cnt = __popcnt16(pair_locs);
+            if ( t == 8 && pair_cnt >= 3 ) {
+                unsigned char pos[9];
+                for ( int i=pair_cnt-1; pair_locs; i-- ) {
+                    pos[i] = 8-tzcnt_and_mask(pair_locs);
+                }
+                unsigned short res = 0;
+                for ( unsigned int i=0; i<pair_cnt-1; i++) {
+                    for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
+                        if ( (res = __popcnt16(cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]])) == 3 ) {
+                            alt_base = cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]];
+                            goto done2;
+                        }
+                    }
+                }
+            }
+            continue;
+done2:
+            t = 7;  // one iteration with the made-up data
+            pair_locs = 0; // will skip this section next time...
+        } // for t
+    } // for dgt
     } // mode_fish
 #endif
 
@@ -5253,12 +5277,6 @@ using namespace Schoku;
             printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), (double)naked_sets_searched.load()/solved_cnt);
         }
 #endif
-#ifdef OPT_UQR
-        if ( mode_uqr ) {
-            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", unique_rectangles_avoided.load(), (double)unique_rectangles_avoided.load()/solved_cnt);
-            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", unique_rectangles_checked.load(), (double)unique_rectangles_checked.load()/solved_cnt);
-        }
-#endif
 #ifdef OPT_FSH
         if ( mode_fish ) {
             unsigned long long fsh_updates = fishes_updated.load() + fishes_specials_updated.load();
@@ -5266,6 +5284,12 @@ using namespace Schoku;
             printf("%10lld  %6.2f/puzzle  fishes updated\n", fsh_updates, (double)fsh_updates/solved_cnt);
             printf("%10lld  %6.2f/puzzle  fishes detected\n", fsh_detected, (double)fsh_detected/solved_cnt);
          }
+#endif
+#ifdef OPT_UQR
+        if ( mode_uqr ) {
+            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", unique_rectangles_avoided.load(), (double)unique_rectangles_avoided.load()/solved_cnt);
+            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", unique_rectangles_checked.load(), (double)unique_rectangles_checked.load()/solved_cnt);
+        }
 #endif
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
