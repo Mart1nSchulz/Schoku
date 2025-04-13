@@ -14,53 +14,26 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.9.2
+ * Version 0.9.3
  *
  * Performance changes:
- * - further optimized naked and hidden searches.
- * - moved __m256i constants to the program level
- * - AVX2 implementation for populating candidates and writing out the solution
- * - verbose is now a 3-state enum to optimize template instantiations
- * - increased detection of fishes (combining pairs to triples)
- *   with fishes and naked subsets (-mfs), attains 92.53% of solves without guessing
- *   on the 17-clue test set.
- * - cleanup and improvement to naked sets detection with minor drop in overall impact
- *   of naked set detection but important reduction of sets searched.
+ * change to big_index_lut[All]: removed the index bit itself, as this is typically
+ * not useful in the pattern of visibility (e.g. for initialization and entering)
+ * This simplifies the code and speeds up initialization and entering.
  *
  * Functional changes:
- * - added algorithm for (avoidable) unique rectangles.
- * - added algorithm for fishes and finned/sashimi fishes.
- * - adjustments for more diversified puzzle sources (tdoku puzzle files)
- * - warnings option (-w): by default the messages and warnings are muted.
- *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
- * - mode options (-m[FSTU]*) to dynamically invoke features.
- *   Previously these features were only available as compile time options.
- * - rules options (-r[ROM]) to either assume regular puzzles rules (single solution),
- *   search for one solution, even if multiple solutions exist, or determine whether
- *   two or more solutions exist.
- * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
- *   more than 28.
- * - allow for multi-line comments at the start of puzzle files
- * - disallow CR/LF (MS-DOS/Windows) line endings
- * - fixed problem with reporting a large number of solved puzzles when each solution
- *   was counted.
- * - fixed problem with bi-value universal grave: multiple solutions were not recognized.
- * - added option -y for speed information only
- * - added a bare bones debug facility (controlled via environment variable SCHOKU_DBG_FILTER).
- * - pulled stack assignment out of omp for loop in main.
- * - added/implemented a functional addendum to sashimi-pairs (extra candidate eliminations)
  *
  * Performance measurement and statistics:
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.9.2
+ * schoku version: 0.9.3
  * command options: -x
  * compile options: OPT_TRIAD_RES OPT_SETS OPT_FSH OPT_UQR
  *      49151  puzzles entered
- *      49151  2197675/s  puzzles solved
- *     22.4ms    0.46µs/puzzle  solving time
+ *      49151  2226959/s  puzzles solved
+ *     22.1ms    0.45µs/puzzle  solving time
  *      37834   76.98%  puzzles solved without guessing
  *      30798    0.63/puzzle  guesses
  *      20996    0.43/puzzle  back tracks
@@ -75,17 +48,17 @@
  *      49151  puzzles entered
  *      49151  2003530/s  puzzles solved
  *     24.5ms    0.50µs/puzzle  solving time
- *      45481   92.53%  puzzles solved without guessing
- *       5347    0.11/puzzle  guesses
- *       2914    0.06/puzzle  back tracks
- *      39808    0.81/puzzle  digits entered and retracted
- *    1392437   28.33/puzzle  'rounds'
- *      21778    0.44/puzzle  triads resolved
- *     188569    3.84/puzzle  triad updates
- *      25496    0.52/puzzle  naked sets found
- *     578785   11.78/puzzle  naked sets searched
- *       7868    0.16/puzzle  fishes updated
- *      74377    1.51/puzzle  fishes detected
+ *      45482   92.54%  puzzles solved without guessing
+ *       5345    0.11/puzzle  guesses
+ *       2913    0.06/puzzle  back tracks
+ *      39679    0.81/puzzle  digits entered and retracted
+ *    1392241   28.33/puzzle  'rounds'
+ *      21776    0.44/puzzle  triads resolved
+ *     188561    3.84/puzzle  triad updates
+ *      25494    0.52/puzzle  naked sets found
+ *     578766   11.78/puzzle  naked sets searched
+ *       8361    0.17/puzzle  fishes updated
+ *      76490    1.56/puzzle  fishes detected
  *        977  bi-value universal graves detected
  *
  */
@@ -106,7 +79,7 @@
 
 namespace Schoku {
 
-const char *version_string = "0.9.2";
+const char *version_string = "0.9.3";
 
 const char *compilation_options =
 #ifdef OPT_TRIAD_RES
@@ -395,7 +368,7 @@ const unsigned char *box_index = index_by_kind[Box];
 
 alignas(64)
 // this table provides the bit masks corresponding to each index and each Kind of section.
-// The 4th column contains all Kind's or'ed together.
+// The 4th column contains all Kind's or'ed together, but without the origin index bit.
 // Heavily used.
 // Casually speaking, this table provides the 'visibility' from each cell onto the grid
 // for selected sections and all of them.
@@ -403,87 +376,87 @@ alignas(64)
 // most generally bit128_t.
 //
 const unsigned long long big_index_lut[81][4][2] = {
-{{              0x1ff,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x80402010081c0fff,      0x100 }},
-{{              0x1ff,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x804020101c0fff,      0x201 }},
-{{              0x1ff,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x1008040201c0fff,      0x402 }},
-{{              0x1ff,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008040e071ff,      0x804 }},
-{{              0x1ff,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010080e071ff,     0x1008 }},
-{{              0x1ff,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x804020100e071ff,     0x2010 }},
-{{              0x1ff,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x10080402070381ff,     0x4020 }},
-{{              0x1ff,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x20100804070381ff,     0x8040 }},
-{{              0x1ff,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x40201008070381ff,    0x10080 }},
-{{            0x3fe00,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x80402010081ffe07,      0x100 }},
-{{            0x3fe00,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x804020101ffe07,      0x201 }},
-{{            0x3fe00,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x1008040201ffe07,      0x402 }},
-{{            0x3fe00,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008040e3fe38,      0x804 }},
-{{            0x3fe00,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010080e3fe38,     0x1008 }},
-{{            0x3fe00,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x804020100e3fe38,     0x2010 }},
-{{            0x3fe00,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x100804020703ffc0,     0x4020 }},
-{{            0x3fe00,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x201008040703ffc0,     0x8040 }},
-{{            0x3fe00,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x402010080703ffc0,    0x10080 }},
-{{          0x7fc0000,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x804020100ffc0e07,      0x100 }},
-{{          0x7fc0000,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x80402017fc0e07,      0x201 }},
-{{          0x7fc0000,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x100804027fc0e07,      0x402 }},
-{{          0x7fc0000,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008047fc7038,      0x804 }},
-{{          0x7fc0000,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010087fc7038,     0x1008 }},
-{{          0x7fc0000,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x804020107fc7038,     0x2010 }},
-{{          0x7fc0000,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x1008040207ff81c0,     0x4020 }},
-{{          0x7fc0000,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x2010080407ff81c0,     0x8040 }},
-{{          0x7fc0000,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x4020100807ff81c0,    0x10080 }},
-{{        0xff8000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x8040e07ff8040201,      0x100 }},
-{{        0xff8000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0x80e07ff8080402,      0x201 }},
-{{        0xff8000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x100e07ff8100804,      0x402 }},
-{{        0xff8000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x207038ff8201008,      0x804 }},
-{{        0xff8000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x407038ff8402010,     0x1008 }},
-{{        0xff8000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x807038ff8804020,     0x2010 }},
-{{        0xff8000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x10381c0ff9008040,     0x4020 }},
-{{        0xff8000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x20381c0ffa010080,     0x8040 }},
-{{        0xff8000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x40381c0ffc020100,    0x10080 }},
-{{     0x1ff000000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x8040fff038040201,      0x100 }},
-{{     0x1ff000000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0x80fff038080402,      0x201 }},
-{{     0x1ff000000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x100fff038100804,      0x402 }},
-{{     0x1ff000000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x2071ff1c0201008,      0x804 }},
-{{     0x1ff000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x4071ff1c0402010,     0x1008 }},
-{{     0x1ff000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x8071ff1c0804020,     0x2010 }},
-{{     0x1ff000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x10381ffe01008040,     0x4020 }},
-{{     0x1ff000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x20381ffe02010080,     0x8040 }},
-{{     0x1ff000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x40381ffe04020100,    0x10080 }},
-{{   0x3fe00000000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x807fe07038040201,      0x100 }},
-{{   0x3fe00000000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0xbfe07038080402,      0x201 }},
-{{   0x3fe00000000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x13fe07038100804,      0x402 }},
-{{   0x3fe00000000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x23fe381c0201008,      0x804 }},
-{{   0x3fe00000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x43fe381c0402010,     0x1008 }},
-{{   0x3fe00000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x83fe381c0804020,     0x2010 }},
-{{   0x3fe00000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x103ffc0e01008040,     0x4020 }},
-{{   0x3fe00000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x203ffc0e02010080,     0x8040 }},
-{{   0x3fe00000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x403ffc0e04020100,    0x10080 }},
-{{ 0x7fc0000000000000,        0x0 }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, { 0xffc0201008040201,      0x703 }},
-{{ 0x7fc0000000000000,        0x0 }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0xffc0402010080402,      0x703 }},
-{{ 0x7fc0000000000000,        0x0 }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0xffc0804020100804,      0x703 }},
-{{ 0x7fc0000000000000,        0x0 }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, { 0x7fc1008040201008,     0x381c }},
-{{ 0x7fc0000000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, { 0x7fc2010080402010,     0x381c }},
-{{ 0x7fc0000000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, { 0x7fc4020100804020,     0x381c }},
-{{ 0x7fc0000000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7fc8040201008040,    0x1c0e0 }},
-{{ 0x7fc0000000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7fd0080402010080,    0x1c0e0 }},
-{{ 0x7fc0000000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7fe0100804020100,    0x1c0e0 }},
-{{ 0x8000000000000000,       0xff }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, { 0x81c0201008040201,      0x7ff }},
-{{ 0x8000000000000000,       0xff }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0x81c0402010080402,      0x7ff }},
-{{ 0x8000000000000000,       0xff }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0x81c0804020100804,      0x7ff }},
-{{ 0x8000000000000000,       0xff }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, { 0x8e01008040201008,     0x38ff }},
-{{ 0x8000000000000000,       0xff }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, { 0x8e02010080402010,     0x38ff }},
-{{ 0x8000000000000000,       0xff }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, { 0x8e04020100804020,     0x38ff }},
-{{ 0x8000000000000000,       0xff }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf008040201008040,    0x1c0ff }},
-{{ 0x8000000000000000,       0xff }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf010080402010080,    0x1c0ff }},
-{{ 0x8000000000000000,       0xff }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf020100804020100,    0x1c0ff }},
-{{                0x0,    0x1ff00 }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, { 0x81c0201008040201,    0x1ff03 }},
-{{                0x0,    0x1ff00 }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0x81c0402010080402,    0x1ff03 }},
-{{                0x0,    0x1ff00 }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0x81c0804020100804,    0x1ff03 }},
-{{                0x0,    0x1ff00 }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, {  0xe01008040201008,    0x1ff1c }},
-{{                0x0,    0x1ff00 }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, {  0xe02010080402010,    0x1ff1c }},
-{{                0x0,    0x1ff00 }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, {  0xe04020100804020,    0x1ff1c }},
-{{                0x0,    0x1ff00 }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7008040201008040,    0x1ffe0 }},
-{{                0x0,    0x1ff00 }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7010080402010080,    0x1ffe0 }},
-{{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7020100804020100,    0x1ffe0 }},
+{{              0x1ff,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x80402010081c0ffe,      0x100 }},
+{{              0x1ff,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x804020101c0ffd,      0x201 }},
+{{              0x1ff,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x1008040201c0ffb,      0x402 }},
+{{              0x1ff,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008040e071f7,      0x804 }},
+{{              0x1ff,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010080e071ef,     0x1008 }},
+{{              0x1ff,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x804020100e071df,     0x2010 }},
+{{              0x1ff,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x10080402070381bf,     0x4020 }},
+{{              0x1ff,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x201008040703817f,     0x8040 }},
+{{              0x1ff,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x40201008070380ff,    0x10080 }},
+{{            0x3fe00,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x80402010081ffc07,      0x100 }},
+{{            0x3fe00,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x804020101ffa07,      0x201 }},
+{{            0x3fe00,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x1008040201ff607,      0x402 }},
+{{            0x3fe00,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008040e3ee38,      0x804 }},
+{{            0x3fe00,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010080e3de38,     0x1008 }},
+{{            0x3fe00,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x804020100e3be38,     0x2010 }},
+{{            0x3fe00,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x1008040207037fc0,     0x4020 }},
+{{            0x3fe00,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x201008040702ffc0,     0x8040 }},
+{{            0x3fe00,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x402010080701ffc0,    0x10080 }},
+{{          0x7fc0000,        0x0 }, { 0x8040201008040201,      0x100 }, {           0x1c0e07,        0x0 }, { 0x804020100ff80e07,      0x100 }},
+{{          0x7fc0000,        0x0 }, {   0x80402010080402,      0x201 }, {           0x1c0e07,        0x0 }, {   0x80402017f40e07,      0x201 }},
+{{          0x7fc0000,        0x0 }, {  0x100804020100804,      0x402 }, {           0x1c0e07,        0x0 }, {  0x100804027ec0e07,      0x402 }},
+{{          0x7fc0000,        0x0 }, {  0x201008040201008,      0x804 }, {           0xe07038,        0x0 }, {  0x201008047dc7038,      0x804 }},
+{{          0x7fc0000,        0x0 }, {  0x402010080402010,     0x1008 }, {           0xe07038,        0x0 }, {  0x402010087bc7038,     0x1008 }},
+{{          0x7fc0000,        0x0 }, {  0x804020100804020,     0x2010 }, {           0xe07038,        0x0 }, {  0x8040201077c7038,     0x2010 }},
+{{          0x7fc0000,        0x0 }, { 0x1008040201008040,     0x4020 }, {          0x70381c0,        0x0 }, { 0x1008040206ff81c0,     0x4020 }},
+{{          0x7fc0000,        0x0 }, { 0x2010080402010080,     0x8040 }, {          0x70381c0,        0x0 }, { 0x2010080405ff81c0,     0x8040 }},
+{{          0x7fc0000,        0x0 }, { 0x4020100804020100,    0x10080 }, {          0x70381c0,        0x0 }, { 0x4020100803ff81c0,    0x10080 }},
+{{        0xff8000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x8040e07ff0040201,      0x100 }},
+{{        0xff8000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0x80e07fe8080402,      0x201 }},
+{{        0xff8000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x100e07fd8100804,      0x402 }},
+{{        0xff8000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x207038fb8201008,      0x804 }},
+{{        0xff8000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x407038f78402010,     0x1008 }},
+{{        0xff8000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x807038ef8804020,     0x2010 }},
+{{        0xff8000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x10381c0df9008040,     0x4020 }},
+{{        0xff8000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x20381c0bfa010080,     0x8040 }},
+{{        0xff8000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x40381c07fc020100,    0x10080 }},
+{{     0x1ff000000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x8040ffe038040201,      0x100 }},
+{{     0x1ff000000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0x80ffd038080402,      0x201 }},
+{{     0x1ff000000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x100ffb038100804,      0x402 }},
+{{     0x1ff000000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x2071f71c0201008,      0x804 }},
+{{     0x1ff000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x4071ef1c0402010,     0x1008 }},
+{{     0x1ff000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x8071df1c0804020,     0x2010 }},
+{{     0x1ff000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x10381bfe01008040,     0x4020 }},
+{{     0x1ff000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x203817fe02010080,     0x8040 }},
+{{     0x1ff000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x40380ffe04020100,    0x10080 }},
+{{   0x3fe00000000000,        0x0 }, { 0x8040201008040201,      0x100 }, {     0xe07038000000,        0x0 }, { 0x807fc07038040201,      0x100 }},
+{{   0x3fe00000000000,        0x0 }, {   0x80402010080402,      0x201 }, {     0xe07038000000,        0x0 }, {   0xbfa07038080402,      0x201 }},
+{{   0x3fe00000000000,        0x0 }, {  0x100804020100804,      0x402 }, {     0xe07038000000,        0x0 }, {  0x13f607038100804,      0x402 }},
+{{   0x3fe00000000000,        0x0 }, {  0x201008040201008,      0x804 }, {    0x70381c0000000,        0x0 }, {  0x23ee381c0201008,      0x804 }},
+{{   0x3fe00000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {    0x70381c0000000,        0x0 }, {  0x43de381c0402010,     0x1008 }},
+{{   0x3fe00000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {    0x70381c0000000,        0x0 }, {  0x83be381c0804020,     0x2010 }},
+{{   0x3fe00000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, {   0x381c0e00000000,        0x0 }, { 0x1037fc0e01008040,     0x4020 }},
+{{   0x3fe00000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, {   0x381c0e00000000,        0x0 }, { 0x202ffc0e02010080,     0x8040 }},
+{{   0x3fe00000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, {   0x381c0e00000000,        0x0 }, { 0x401ffc0e04020100,    0x10080 }},
+{{ 0x7fc0000000000000,        0x0 }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, { 0xff80201008040201,      0x703 }},
+{{ 0x7fc0000000000000,        0x0 }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0xff40402010080402,      0x703 }},
+{{ 0x7fc0000000000000,        0x0 }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0xfec0804020100804,      0x703 }},
+{{ 0x7fc0000000000000,        0x0 }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, { 0x7dc1008040201008,     0x381c }},
+{{ 0x7fc0000000000000,        0x0 }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, { 0x7bc2010080402010,     0x381c }},
+{{ 0x7fc0000000000000,        0x0 }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, { 0x77c4020100804020,     0x381c }},
+{{ 0x7fc0000000000000,        0x0 }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0x6fc8040201008040,    0x1c0e0 }},
+{{ 0x7fc0000000000000,        0x0 }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0x5fd0080402010080,    0x1c0e0 }},
+{{ 0x7fc0000000000000,        0x0 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x3fe0100804020100,    0x1c0e0 }},
+{{ 0x8000000000000000,       0xff }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, {  0x1c0201008040201,      0x7ff }},
+{{ 0x8000000000000000,       0xff }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0x81c0402010080402,      0x7fe }},
+{{ 0x8000000000000000,       0xff }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0x81c0804020100804,      0x7fd }},
+{{ 0x8000000000000000,       0xff }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, { 0x8e01008040201008,     0x38fb }},
+{{ 0x8000000000000000,       0xff }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, { 0x8e02010080402010,     0x38f7 }},
+{{ 0x8000000000000000,       0xff }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, { 0x8e04020100804020,     0x38ef }},
+{{ 0x8000000000000000,       0xff }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf008040201008040,    0x1c0df }},
+{{ 0x8000000000000000,       0xff }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf010080402010080,    0x1c0bf }},
+{{ 0x8000000000000000,       0xff }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0xf020100804020100,    0x1c07f }},
+{{                0x0,    0x1ff00 }, { 0x8040201008040201,      0x100 }, { 0x81c0000000000000,      0x703 }, { 0x81c0201008040201,    0x1fe03 }},
+{{                0x0,    0x1ff00 }, {   0x80402010080402,      0x201 }, { 0x81c0000000000000,      0x703 }, { 0x81c0402010080402,    0x1fd03 }},
+{{                0x0,    0x1ff00 }, {  0x100804020100804,      0x402 }, { 0x81c0000000000000,      0x703 }, { 0x81c0804020100804,    0x1fb03 }},
+{{                0x0,    0x1ff00 }, {  0x201008040201008,      0x804 }, {  0xe00000000000000,     0x381c }, {  0xe01008040201008,    0x1f71c }},
+{{                0x0,    0x1ff00 }, {  0x402010080402010,     0x1008 }, {  0xe00000000000000,     0x381c }, {  0xe02010080402010,    0x1ef1c }},
+{{                0x0,    0x1ff00 }, {  0x804020100804020,     0x2010 }, {  0xe00000000000000,     0x381c }, {  0xe04020100804020,    0x1df1c }},
+{{                0x0,    0x1ff00 }, { 0x1008040201008040,     0x4020 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7008040201008040,    0x1bfe0 }},
+{{                0x0,    0x1ff00 }, { 0x2010080402010080,     0x8040 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7010080402010080,    0x17fe0 }},
+{{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7020100804020100,     0xffe0 }},
 };
 
 const unsigned short bitx3_lut[8] = {
@@ -586,7 +559,8 @@ const __m256i maskff_epi8 = _mm256_set1_epi8(0xff);
 
 // used for expanding bit vectors to boolean vectors
 const __m256i bit_mask_expand = _mm256_setr_epi16(1<<0, 1<<1, 1<<2, 1<<3, 1<<4, 1<<5, 1<<6, 1<<7, 1<<8, 1<<9, 1<<10, 1<<11, 1<<12, 1<<13, 1<<14, 1<<15);
-const __m256i shuffle_mask_bytes = _mm256_setr_epi8(0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3);
+const __m256i shuffle_interleaved_mask_bytes = _mm256_setr_epi8(0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3);
+const __m256i shuffle_mask_bytes = _mm256_setr_epi8(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3);
 
 // used for load from the grid
 const __m256i select_bits   = _mm256_setr_epi8(1<<0,1<<1,1<<2,1<<3,1<<4,1<<5,1<<6,1<<7,1<<0,1<<1,1<<2,1<<3,1<<4,1<<5,1<<6,1<<7,
@@ -798,8 +772,9 @@ inline __m256i expand_bitvector(unsigned short m) {
     return _mm256_cmpeq_epi16(_mm256_and_si256( bit_mask_expand,_mm256_set1_epi16(m)), bit_mask_expand);
 }
 
+template<bool for_interleaving=false>
 inline __m256i expand_bitvector_epi8(unsigned int m) {
-    __m256i bits = _mm256_shuffle_epi8(_mm256_set1_epi32(m), shuffle_mask_bytes);
+    __m256i bits = _mm256_shuffle_epi8(_mm256_set1_epi32(m), for_interleaving?shuffle_interleaved_mask_bytes:shuffle_mask_bytes);
     return _mm256_cmpeq_epi8(_mm256_and_si256( select_bits, bits), select_bits);
 }
 
@@ -832,7 +807,7 @@ inline __attribute__((always_inline)) unsigned long long compress_epi16_boolean(
     if (doubledbits) {
         return (((unsigned long long)_mm256_movemask_epi8(b2))<<32) | _mm256_movemask_epi8(b1);
     }
-    return _mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(b1,b2), 0xD8));
+    return (unsigned int)_mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packs_epi16(b1,b2), 0xD8));
 }
 
 inline __attribute__((always_inline))__m256i and_unless(__m256i a, __m256i b, __m256i bcond) {
@@ -916,6 +891,11 @@ template<Kind kind>
 inline void add_indices(bit128_t *indices, unsigned char i) {
 	indices->u128 |= *(const __uint128_t *)&big_index_lut[i][kind][0];
 }
+
+template<Kind kind>
+inline void set_indices(bit128_t *indices, unsigned char i) {
+	indices->u128 = *(const __uint128_t *)&big_index_lut[i][kind][0];
+}
 #pragma GCC diagnostic pop
 
 // The pair of functions below can be used to iteratively isolate all distinct bit values
@@ -925,17 +905,21 @@ inline void add_indices(bit128_t *indices, unsigned char i) {
 //
 
 // compute vec & -vec
+template<bool size16=true>
 inline __m256i get_first_lsb(__m256i vec) {
-        // isolate the lsb
-        return _mm256_and_si256(vec, _mm256_sub_epi16(_mm256_setzero_si256(), vec));
+       if ( size16 ) {
+            // isolate the lsb
+            return _mm256_and_si256(vec, _mm256_sub_epi16(_mm256_setzero_si256(), vec));
+       }
+       return _mm256_and_si256(vec, _mm256_sub_epi8(_mm256_setzero_si256(), vec));
 }
 
 // compute vec &= ~lsb; return vec & -vec
+template<bool size16=true>
 inline __m256i andnot_get_next_lsb(__m256i lsb, __m256i &vec) {
         // remove prior lsb
         vec = _mm256_andnot_si256(lsb, vec);
-        // isolate the next lsb
-        return _mm256_and_si256(vec, _mm256_sub_epi16(_mm256_setzero_si256(), vec));
+        return get_first_lsb<size16>(vec);
 }
 
 // global debug aids
@@ -984,7 +968,7 @@ inline void dump_m256i_grid(__m256i v, const char *msg="", int filter=-1) {
 }
 
 // a helper function to print a grid of bits.
-// bits are arranged consecutively as 81 bits in a __unint128_t parameter.
+// bits are arranged consecutively as 9x9 bits in a __unint128_t parameter.
 //
 inline void dump_bits(__uint128_t bits, const char *msg="", int filter=-1) {
     if ( !(filter & dprintfilter) ) {
@@ -1052,17 +1036,24 @@ inline void dump_puzzle(unsigned short *candidates, bit128_t &unlocked, const ch
 
 #ifdef OPT_FSH
 template <bool transposed=false>
-// the parameters cbbv, base, subs and hassubs are transposed for cols
+// parameters:
+// cbbv_v: the bits for the respective digit
+// base: the base (column indices) of the fish found
+// subs: the row indices for the grid
+// hassubs_prp_x: the row indices that intersect the base columns
+// clean_bits: all bits of digits to be cleaned
+// dgt_bits: all bits for the respective digit (same but different presentation as cbbv_v)
+//
 inline void show_fish(cbbv_t &cbbv, unsigned short base, unsigned short subs, unsigned short hassubs, bit128_t &clean_bits, bit128_t &dgt_bits, const char *msg="") {
     printf("%s:\n", msg);
     for ( int i_=0; i_<81; i_++ ) {
         int ti = transposed?transposed_cell[i_]:i_;
         unsigned int ti_bit = 1<<(ti%9);
         unsigned int ti_bitv = 1<<(ti/9);
-        if ( ti_bitv & subs ) {
-            printf("%s", (cbbv.v16[ti/9]&ti_bit)?((ti_bit&base)?"o":"@"):"-");
-        } else if ( (ti_bitv & hassubs) && clean_bits.check_indexbit(i_)) {
+        if ( (ti_bitv & hassubs) && clean_bits.check_indexbit(i_)) {
             printf("X");
+        } else if ( ti_bitv & subs ) {
+            printf("%s", (cbbv.v16[ti/9]&ti_bit)?((ti_bit&base)?"o":"@"):"-");
         } else {
             printf(dgt_bits.check_indexbit(i_)? ".":"-");
         }
@@ -1075,7 +1066,13 @@ inline void show_fish(cbbv_t &cbbv, unsigned short base, unsigned short subs, un
 }
 
 template <bool transposed=false>
-// the parameters cbbv and subs are transposed for cols
+// parameters:
+// cbbv_v: the bits for the respective digit
+// subs: the row indices for the grid
+// fins/fincnt: the fins and their number
+// clean_bits: all bits of digits to be cleaned
+// dgt_bits: all bits for the respective digit (same but different presentation as cbbv_v)
+//
 inline void show_fish(cbbv_t &cbbv, unsigned short subs, unsigned char fincnt, unsigned char *fins, bit128_t &clean_bits, bit128_t &dgt_bits, const char *msg="") {
     printf("%s:\n", msg);
     for ( int i_=0; i_<81; i_++ ) {
@@ -1182,7 +1179,7 @@ private:
 //
 // for columns and boxes, the loading of cbbp_v would be more tedious...
 //
-// Note also that any cnt of 2 identifies a bi-local (i.e. dual link) for that row and digit.
+// Note also that any cnt of 2 identifies a bi-local (i.e. strong link) for that row and digit.
 //
 public:
     bool bivaluesValid;
@@ -1193,6 +1190,7 @@ public:
     unsigned short guess_hint_digit;
 
     inline bit128_t &getBivalues(unsigned short *candidates) {
+
         if ( !bivaluesValid ) {
             __m256i c;
             for (unsigned char i = 0; i < 64; i += 32) {
@@ -1342,22 +1340,21 @@ inline void initialize(signed char grid[81]) {
     }
     // update candidates and process the 9 masks for each chunk of the candidates:
     for ( unsigned int i=0; i<96; i += 32) {
-        __m256i c1 = mask1ff;
-        __m256i c2 = c1;
-        for ( unsigned char dgt=0; dgt<8; dgt += 1) {
+        __m256i bits1_8 = _mm256_setzero_si256();
+        __m256i bits1_8_2 = _mm256_setzero_si256();
+
+        for ( unsigned char dgt=0; dgt<8; dgt += 2) {
             // load 32 digit bits:
-            __m256i bits = _mm256_and_si256(expand_bitvector_epi8(digit_bits[dgt].u32[i>>5]), _mm256_set1_epi8(1<<dgt));
-            c1 = _mm256_andnot_si256(_mm256_unpacklo_epi8(bits, _mm256_setzero_si256()), c1);
-            c2 = _mm256_andnot_si256(_mm256_unpackhi_epi8(bits, _mm256_setzero_si256()), c2);
+            bits1_8 = _mm256_or_si256(bits1_8, _mm256_and_si256(expand_bitvector_epi8<true>(digit_bits[dgt].u32[i>>5]), _mm256_set1_epi8(1<<dgt)));
+            bits1_8_2 = _mm256_or_si256(bits1_8_2, _mm256_and_si256(expand_bitvector_epi8<true>(digit_bits[dgt+1].u32[i>>5]), _mm256_set1_epi8(1<<(dgt+1))));
         }
         // digit 9
         // load 32 digit bits:
-        __m256i bits = _mm256_shuffle_epi8(_mm256_set1_epi32(digit_bits[8].u32[i>>5]), shuffle_mask_bytes);
-        bits = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256( select_bits, bits), select_bits), ones_epi8);
-        c1 = _mm256_andnot_si256(_mm256_unpacklo_epi8(_mm256_setzero_si256(),bits), c1);
-        c2 = _mm256_andnot_si256(_mm256_unpackhi_epi8(_mm256_setzero_si256(),bits), c2);
+        bits1_8 = _mm256_or_si256(bits1_8, bits1_8_2);
+        __m256i bits9 = _mm256_and_si256(expand_bitvector_epi8<true>(digit_bits[8].u32[i>>5]), ones_epi8);
+        *(__m256i*)&candidates[i] = _mm256_andnot_si256(_mm256_unpacklo_epi8(bits1_8,bits9), mask1ff);
+        __m256i c2 = _mm256_andnot_si256(_mm256_unpackhi_epi8(bits1_8,bits9), mask1ff);
 
-        *(__m256i*)&candidates[i] = c1;
         if ( i==64) {
             candidates[80] = _mm256_extract_epi16(c2,0);
             break;
@@ -1384,8 +1381,7 @@ template<Verbosity verbose=VNone>
 inline __attribute__((always_inline)) void enter_digit( unsigned short digit, unsigned char i) {
     // lock this cell and and remove this digit from the candidates in this row, column and box
 
-    bit128_t to_update = {0};
-
+    bit128_t to_update;
     if ( verbose == VDebug ) {
         printf(" %x at %s\n", _tzcnt_u32(digit)+1, cl2txt[i]);
     }
@@ -1403,7 +1399,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 
     candidates[i] = digit;
 
-    add_and_mask_all_indices(&to_update, &unlocked, i);
+    set_indices<All>(&to_update, i);
 
     updated.u128 |= to_update.u128;
     __m256i mask = _mm256_set1_epi16(~digit);
@@ -1767,6 +1763,11 @@ Status solve(signed char grid[81], GridState stack[], int line) {
     unsigned char last_band_uqr = 0;
 #endif
 
+    // Schemes to track progress in order to recompute data.
+    //
+    // 1. count resolved/entered cells in combination with guess level
+    //    allowing to recompute data when additional cells have been resolved.
+    //
     // the low byte is the real count, while
     // the high byte is increased/decreased with each guess/back track
     // init count of resolved cells to the size of the initial set
@@ -1819,7 +1820,7 @@ Status solve(signed char grid[81], GridState stack[], int line) {
 back:
 
     // Each algorithm (naked single, hidden single, naked set)
-    // has its own non-solvability detecting trap door to detect the grid is bad.
+    // has its own non-solvability detecting trap door to detect if the grid is bad.
     // This section acts upon that detection and discards the current grid_state.
     //
     if (grid_state->stackpointer == 0) {
@@ -1846,8 +1847,10 @@ back:
                 non_unique_count++;
             }
         }
-        // failed - just copy the input
-        memcpy(grid, grid-82, 81);
+        if ( !unique_check_mode ) {
+            // failed - just copy the input
+            memcpy(grid, grid-82, 81);
+        }
         return status;
     }
 
@@ -1906,7 +1909,7 @@ enter:
         //
         // lock this cell and and remove this digit from the candidates in this row, column and box
         // and for good measure, detect 0s (back track) and singles.
-        bit128_t to_update = {0};
+        bit128_t to_update;
 
         if ( verbose == VDebug ) {
             printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
@@ -1928,7 +1931,7 @@ enter:
         candidates[e_i] = e_digit;
         current_entered_count++;
 
-        add_and_mask_all_indices(&to_update, &grid_state->unlocked, e_i);
+        set_indices<All>(&to_update, e_i);
 
         grid_state->updated.u128 |= to_update.u128;
 
@@ -1940,7 +1943,7 @@ enter:
             __m256i c = _mm256_load_si256((__m256i*) &candidates[j]);
             // expand unlocked unsigned short to boolean vector
             __m256i munlocked = expand_bitvector(to_update.u16[j>>4]);
-            // apply mask (remove bit), preserving the locked cells
+            // apply mask (remove bit)
             c = andnot_if(c, mask_neg, munlocked);
             _mm256_store_si256((__m256i*) &candidates[j], c);
             __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
@@ -1999,40 +2002,42 @@ enter:
         }
         e_digit = 0;
     } else {
+        __m256i c1;
+        __m256i c2;
+        unsigned long long mask;
+        unsigned int m; 
         // no digit to enter
-        for (unsigned char i = 0; i < 80; i += 16) {
-            unsigned short m = ((bit128_t*)unlocked)->u16[i>>4];
-            if ( m ) {
-                __m256i c = _mm256_load_si256((__m256i*) &candidates[i]);
-                // remove least significant digit and compare to 0:
-                // (c & (c-1)) == 0  => naked single
-                __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
-                // Check if any cell has zero candidates
-                if (__builtin_expect (check_back && _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256())),0)) {
+        for ( unsigned char i=0; i <96; i += 32 ) {
+            m = ((bit128_t*)unlocked)->u32[i>>5];
+            c1 = *(__m256i*) &candidates[i];
+            c2 = *(__m256i*) &candidates[i+16];
+            // test for 0s
+            if (__builtin_expect (check_back && (mask=compress_epi16_boolean(_mm256_cmpeq_epi16(c1, _mm256_setzero_si256()), _mm256_cmpeq_epi16(c2, _mm256_setzero_si256())) & m), 0)) {
                     // Back track, no solutions along this path
                     if ( verbose != VNone ) {
-                        unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
-                        unsigned char pos = i+(_tzcnt_u32(mx)>>1);
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
-                            }
-                        } else if ( debug ) {
-                            printf("back track - cell %s is 0\n", cl2txt[pos]);
+                    unsigned char pos = i+_tzcnt_u64(mask);
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
                         }
+                    } else if ( debug ) {
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
-                    goto back;
                 }
-                unsigned int mask = and_compress_masks<false>(a,m);
-                if ( mask ) {
-                    int idx = _tzcnt_u32(mask);
-                    e_i = idx+i;
-                    e_digit = candidates[e_i];
-                    if ( verbose == VDebug ) {
-                        printf("naked  single      ");
-                    }
-                    goto enter;
+                goto back;
+            }
+            // test for singletons
+            c1 = _mm256_cmpeq_epi16(_mm256_and_si256(c1, _mm256_sub_epi16(c1, ones)), _mm256_setzero_si256());
+            c2 = _mm256_cmpeq_epi16(_mm256_and_si256(c2, _mm256_sub_epi16(c2, ones)), _mm256_setzero_si256());
+            mask = compress_epi16_boolean<false>(c1, c2) & m;
+            if ( mask ) {
+                unsigned char idx = tzcnt_and_mask(mask);
+                e_i = idx+i;
+                e_digit = candidates[e_i];
+                if ( verbose == VDebug ) {
+                    printf("naked  single      ");
                 }
+                goto enter;
             }
         }
     }
@@ -2235,7 +2240,7 @@ enter:
     // that of algorithm 2 for speed.
     // Triads in their own right are significant for two reasons:
     // First, a triad that has 3 candidates is a special case of set that is easily detected.
-    // The detection occurs in part 2 of Algorithm 3 by running a popcount on the collected
+    // The detection occurs in part 3 of Algorithm 3 by running a popcount on the collected
     // triad candidates.  The result is kept in form of a bitvector of 'unlocked triads'
     // for rows and columns.  For columns, the unlocked state is determined directly from
     // the general unlocked bit vector.  For rows, the order in which the row triads are
@@ -2363,18 +2368,17 @@ enter:
         __m256i column_mask_ = column_mask;
         for (unsigned int j = 0; j < 81; j+=9, jrow++) {
             // turn the or'ed rows into a mask for the singletons, if any.
-            __m256i column_mask_neg = _mm256_andnot_si256(column_mask_, mask9x1ff);
             // check col (9) candidates
             unsigned short m = (j < 64) ? (unlocked[0] >> j) : (unlocked[1] >> (j-64));
-            if ( j > 64-9) {
-                m |= unlocked[1] << (64-j);
+            if ( j == 63) {
+                m |= unlocked[1] << (64-63);
             }
-            __m256i a = _mm256_cmpgt_epi16(column_mask_neg, _mm256_setzero_si256());
+            __m256i a = _mm256_cmpgt_epi16(mask9x1ff, column_mask_);
             unsigned int mask = and_compress_masks<false>(a, m & 0x1ff);
             if ( mask) {
                 int idx = __tzcnt_u32(mask);
                 e_i = j+idx;
-                e_digit = ((v16us)column_mask_neg)[idx];
+                e_digit = ((v16us)_mm256_andnot_si256(column_mask_, mask9x1ff))[idx];
                 if ( check_back && (e_digit & (e_digit-1)) ) {
                     if ( verbose != VNone ) {
                         if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
@@ -2618,23 +2622,17 @@ enter:
     { // Algo 3.3
 
             // A3.2.1 (check col-triads)
-            // just a plain old popcount, but for both vectors interleaved
+            // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
+
             __m256i v1 = _mm256_loadu_si256((__m256i *)triad_info.col_triads);
             __m256i v2 = _mm256_loadu_si256((__m256i *)(triad_info.col_triads+16));
+            __m256i v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
+            v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
             __m256i lo1 = _mm256_and_si256 (v1, nibble_mask);
             __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
             __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
-            __m256i cnt12 = _mm256_shuffle_epi8 (lookup, hi1);
-            cnt11 = _mm256_add_epi8 (cnt11, cnt12);
-            __m256i res = _mm256_add_epi8 (cnt11, _mm256_bsrli_epi128(cnt11, 1));
-            __m256i lo2 = _mm256_and_si256 (v2, nibble_mask);
-            __m256i hi2 = _mm256_and_si256 (_mm256_srli_epi16 (v2, 4), nibble_mask );
-            __m256i cnt21 = _mm256_shuffle_epi8 (lookup, lo2);
-            __m256i cnt22 = _mm256_shuffle_epi8 (lookup, hi2);
-            cnt21 = _mm256_add_epi8 (cnt21, cnt22);
-            res = _mm256_and_si256 (res, maskff );
-            res = _mm256_packus_epi16(res, _mm256_and_si256 (_mm256_add_epi8 (cnt21, _mm256_bsrli_epi128(cnt21, 1)), maskff ));
-            res = _mm256_and_si256(_mm256_permute4x64_epi64(res, 0xD8), mask27);
+            cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
+            __m256i res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
 
             // do this only if unlocked has been updated:
             if ( last_entered_count_col_triads != current_entered_count) {
@@ -2672,24 +2670,16 @@ enter:
 
             // A3.2.2 (check row-triads)
 
-            // just a plain old popcount, but for both vectors interleaved
+            // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
             v1 = _mm256_loadu_si256((__m256i *)triad_info.row_triads);
             v2 = _mm256_loadu_si256((__m256i *)(triad_info.row_triads+16));
-
+            v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
+            v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
             lo1 = _mm256_and_si256 (v1, nibble_mask);
             hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
             cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
-            cnt12 = _mm256_shuffle_epi8 (lookup, hi1);
-            cnt11 = _mm256_add_epi8 (cnt11, cnt12);
-            res = _mm256_add_epi8 (cnt11, _mm256_bsrli_epi128(cnt11, 1));
-            lo2 = _mm256_and_si256 (v2, nibble_mask);
-            hi2 = _mm256_and_si256 (_mm256_srli_epi16 (v2, 4), nibble_mask );
-            cnt21 = _mm256_shuffle_epi8 (lookup, lo2);
-            cnt22 = _mm256_shuffle_epi8 (lookup, hi2);
-            cnt21 = _mm256_add_epi8 (cnt21, cnt22);
-            res = _mm256_and_si256 (res, maskff );
-            res = _mm256_packus_epi16(res, _mm256_and_si256 (_mm256_add_epi8 (cnt21, _mm256_bsrli_epi128(cnt21, 1)), maskff ));
-            res = _mm256_and_si256(_mm256_permute4x64_epi64(res, 0xD8), mask27);
+            cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
+            res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
 
             m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
             triad_info.triads_selection[Row] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
@@ -3489,35 +3479,56 @@ enter:
     // Having identified such a valid grid in terms of rows, any extra candidates in the columns
     // can be removed and vice versa.
     //
+    // Fishes are always there:
+    // If the puzzle is solvable, then for each subset of size K of cells of a row or column there
+    // must exist K columns or rows to complete a fish pattern.  If there are not enough such columns
+    // or rows, the puzzle is not solvable (on that path), so back track.
+    //
+    // fishes that need to be cleaned:
+    // Given a base of size N, check whether there are:
+    // - either N lines that match with a real (or assumed) base, and some extra
+    //   lines that overlap with the base, then these extra line can be purged
+    //   (their base portion removed) and the fish is complete,
+    // - or exactly N lines that overlap with the base, then all these lines
+    //   can be purged (their non-base portion removed).
+    // Note that these two possibilities are same, except the second is transposed.
+    // 
     // The search operates just as the naked set search does, i.e. it will not discover
     // fishes where all lines have less than N candidates.  This can be remedied by augmenting
     // the set of lines using additional lines (by 1 additional line, which should go a long
     // way (a jelly fish can have 4 lines of 2 candidates each, but the value of such a search
     // needs to be confirmed).
-    // Once a grid has been found and cleaned, the complementary grid is found in the remaining
-    // lines and rows.
+    //
+    // Once a grid has been found and cleaned, there are two distinct subsets
+    // of fishes present, i.e. the fish and its complementary fish.
+    // If either the fish or its complement have size of 3 or lower, they cannot
+    // be subdivided and therefore need not be searched further.
     //
     // Variants:
+    // All variants start with N-1 matching fish lines and they are regular fishes
+    // as described above.
+    //
     // Finned Fish:
-    // A fish with extra candidates in one line.
-    // The way this is identified in the code is that N-1 'pure' fish lines are found.
-    // Compared to the regular fish search above,
-    // this requires identifying the extra line with 1 or at most 2 extra candidates that can
-    // both 'see' the same candidates on one of the grid lines perpendicular to the base (i.e. in the same box).
+    // identify from the excess lines overlapping the base, one that:
+    // - has one or two extra cells, both in the same box,
+    // - sharing a grid point in the same box.
     // Either one of the extra candidates is valid, or the fish pattern is valid.
-    // Eliminate just those candidates visible to the extra candidates and on the fish grid line
-    // but not a grid point.
+    // Any candidates on the perpendicular grid lines that is not a grid point,
+    // that can be seen by the grid point and the extra cells can be eliminated.
+    //
+    // Finned/sashimi Fish:
+    // This is the same as a finned fish, but the grid point in the same box lacks
+    // the candidate.
     //
     // Sashimi Fish:
-    // Same as the finned fish variant above, except the that fish pattern is missing the
-    // candidate in the box with the fin(s).
-    // Two sashimi fishes can interact between themselves.  Those two lines must (again) be in the 
-    // same band and they then eliminate those candidates visible to both that are not
-    // on the fish grid.
-    //
-    // Note:
-    // - the 'yield' for finned and sashimi fishes is typically low since no definite
-    //   grid can be established.
+    // This requires exactly two excess lines which must share a band.
+    // The overlap with the base must be a single point
+    // for each, resulting in two 'fins', which must not share a box.
+    // As there are only two fins, one of them must complete the grid or the grid
+    // would lack a line. They cannot both be valid either, as that would create
+    // an invalid 'fish' again.
+    // All candidates that can be seen by both fins can be eliminated.
+    //  
     //
     // with the cbbvs in place, look for simple 'fishes'
 
@@ -3547,10 +3558,8 @@ enter:
         __m128i max_v = _mm256_castsi256_si128(_mm256_or_si256(cbbv_v.m256, _mm256_bsrli_epi128(cbbv_v.m256,8)));
         max_v = _mm_or_si128(max_v, _mm_bsrli_si128(max_v,4));
         max_v = _mm_or_si128(max_v, _mm_bsrli_si128(max_v,2));
-        unsigned char max = __popcnt16(_mm_extract_epi16(max_v, 0) | hi>>8);
-        if ( max > 7 ) {
-            max = 7;
-        }
+        unsigned char max_all = __popcnt16(_mm_extract_epi16(max_v, 0) | hi>>8);
+        unsigned char max = max_all > 7 ? 7 : max_all;
         bit128_t dgt_bits = { .u128 = candidate_bits_by_value[dgt].u128 & grid_state->unlocked.u128 };
 
         unsigned int pair_locs = 0;  // pairs, bits left to right
@@ -3578,32 +3587,41 @@ enter:
                 __m256i issub_v = _mm256_and_si256(hassub_v, _mm256_cmpeq_epi16(basev, _mm256_or_si256(basev, cbbv_v.m256)));
 
                 unsigned int subs_prp_x = compress_epi16_boolean(issub_v); // bits for non-empty subsets of base_x
-                unsigned int hassubs_prp_x;  // bits for non-empty intersection with base_x
+                unsigned int hassubs_prp_x = compress_epi16_boolean(hassub_v);  // bits for non-empty intersection with base_x
                 unsigned char nsubs = _popcnt32(subs_prp_x);
                 // test for naked fish and exclude it for row and col search
                 if ( nsubs == cnt && _mm256_testc_si256(issub_v, hassub_v) ) {
                     // found a (naked) fish, leave it
                     if ( _popcnt32(base_x) <= 3 ) {
                         exclude_row[dgt] |= base_x;
-                        exclude_col[dgt] |= subs_prp_x; // the transposed col base_x
+                        exclude_col[dgt] |= subs_prp_x; // the orthogonal grid base
                         fishes_excluded++;   // counted but not currently included in summary
                     }
                     continue;
                 }
+                if ( _popcnt32(hassubs_prp_x) < cnt ) {
+                    if ( verbose == VDebug ) {
+                        printf("back track - insufficient number of rows to form %s for digit %d based on row %d\n", fish_names[cnt-2], dgt+1, t);
+                    }
+                    goto back;
+                }
 
                 bit128_t clean_bits {};
+                unsigned char fincells[2] = {0xff, 0xff};
+                bool doenter = false;
 
-                // if there are exactly N rows with the same pattern of digits, then
-                // it is a fish pattern.
-                // classify found fishes if any.
-                if ( nsubs == cnt ) {
-                    // this part is efficient to find and easy to deal with - however the yield very low.
+                // if there are exactly N rows with exclusively some of the pattern of digits, then
+                // it is a row fish pattern.
+                // if there are exactly N rows that have some of the pattern plus excess,
+                // then it is a col fish pattern.
+                if ( nsubs == cnt || _popcnt32(hassubs_prp_x) == cnt ) {
+                    // this part is efficient to find and easy to deal with - however, the yield is very low.
+                    unsigned short excess_x = nsubs == cnt ? base_x : (0x1ff & ~base_x);
                     fishes_detected++;
-                    hassubs_prp_x = compress_epi16_boolean(hassub_v);
                     unsigned int rows2clean = hassubs_prp_x & ~subs_prp_x;
                     while (rows2clean) {
                         unsigned char row = tzcnt_and_mask(rows2clean);
-                        clean_bits.set_indexbits( cbbv_v.v16[row]&base_x, row*9, 9);
+                        clean_bits.set_indexbits( cbbv_v.v16[row]&excess_x, row*9, 9);
                     }
                     clean_bits.u128 &= grid_state->unlocked.u128 & candidate_bits_by_value[dgt].u128;
                     if ( clean_bits ) {
@@ -3611,42 +3629,40 @@ enter:
                             unsigned char celli  = __tzcnt_u16(subs_prp_x)*9 + __tzcnt_u16(base_x);
                             unsigned char celli2 = (15-__lzcnt16(subs_prp_x))*9 + (15-__lzcnt16(base_x));
                             if ( debug > 2 ) {
-                                show_fish(cbbv_v, base_x, subs_prp_x, hassubs_prp_x, clean_bits, dgt_bits, "row fish");
+                                show_fish(cbbv_v, base_x, nsubs == cnt ? subs_prp_x:hassubs_prp_x, hassubs_prp_x, clean_bits, dgt_bits, "row fish");
                             }
-                            printf("%s (rows) digit %d at cells %s - %s\nRemove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
+                            printf("%s (%s) digit %d at cells %s - %s\nRemove %d at ", fish_names[cnt-2], nsubs==cnt?"rows":"cols", dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
                         }
                     }
+                    if ( cnt <= 3 ) {
+                        exclude_row[dgt] |= base_x;
+                        exclude_col[dgt] |= nsubs == cnt ? subs_prp_x:hassubs_prp_x; // the orthogonal grid base
+                    } else if ( cnt >= max_all-3 ) {
+                        exclude_row[dgt] |= 0x1ff & ~base_x;
+                        exclude_col[dgt] |= 0x1ff & ~(nsubs == cnt ? subs_prp_x:hassubs_prp_x); // the orthogonal grid base
+                    }
+
                 } else if ( nsubs == cnt-1 ) {
                     // nsubs == cnt-1 is required for finned/sashimi fishes.
+                    // There are two case, which are not mutually exclusive:
+                    // Case 1:
                     // for a fin, the following must be true:
                     // The fin(s) cells must be on the perpendicular fish sections w.r.t. to the base_x.
-                    // Only one fin cell is allowed per section parallel to the base_x except
-                    // for case 2 below, where the two fin cells can be in the same box.
-                    // Note: The fins are placed differently, when looking at the final diagram.
-                    //  The communality is that these lines are selected initially using the same
-                    //  criteria: having an overlap with the base line.
-                    //  However, in case 1 the fins are on the grid established by the base,
-                    //  [the fins are on the grid and therefore the case is not called 'finned'
-                    //   in the log]
-                    //  whereas in case 2 the fins are lateral to that grid but affect grid points.
-                    //  There may be alternative definitions that consolidate these view points,
-                    //  but for the purpose of the code the distinction is necessary and important.
-                    // Case 1:
+                    // There must be exactly 2 fin sections.
+                    // These fin cells are mutually exclusive and
+                    // one would be required to complete the fish pattern and eliminate the other.
+
                     // A. This case requires exactly two fin sections.
-                    //    These fin sections and cells are mutually exclusive and
-                    //    one would be required to complete the fish pattern and eliminate the other.
-                    // B. The respective fin cells must be unique on the parallel fish grid line
-                    //    when intersected with the base and unique on their perpendicular fish grid
-                    //    outside of the fish pattern.
-                    // C. They must share a band parallel to the base_x and not share a band with
-                    //    any established grid line parallel to the base.
+                    // B. The respective fin cells must be unique on the perpendicular fish grid line
+                    //    except for grid points.
+                    // C. They must share a band perpendicular to the base_x and not share
+                    //    a band with any established grid line parallel to the base,
+                    //    unless substituted as described under A.
                     // In this case the two fins' views intersect with each other to define
                     // two triads to be cleaned.
                     // Note: This arrangement can also be seen in most cases as an AIC or
                     // (in the case of an X-Wing) as a Skyscraper pattern.
-                    // Note: This pattern extends to swordfish and rarely to jellyfish.
-                    // The fins can occasionally share the same box.
-                    // When logged, this case is identified as 'finned/sashimi-pair'
+                    // When logged, this case is identified as 'sashimi'
                     // Addendum to Case 1:
                     // A direct consequence for the band with the two mutual exclusive fins
                     // is the following:
@@ -3663,19 +3679,17 @@ enter:
                     // Without loss of generality assume that triads A1 and B2 contain cells that
                     // have a candidate value D.  We do know, that due to being linked exclusively,
                     // that neither A2 nor B1 can contain candidate value D (and the code makes sure of that).
-                    // In order to not be a singleton in A1, there must be either another candidate
-                    // value in A1 or A3.  The stated uniqueness requirement for A1 therefore
-                    // forces this candidate to be in A3 and mutually exclusive with the candidate in A1.
-                    // Using the same argument, there has to a candidate in B3 that is mutually exclusive
-                    // with B2. Since the candidates in A1 and B2 are exclusive, so must be the 
-                    // candidates in A3 and B3.  As a consequence, since one or the other must
-                    // true, C3 cannot contain value D.
+                    // If A1 does not contain D, then A3 does.  Conversely, if B2 does not contain D,
+                    // then B3 does.
+                    // Therefore, since D is either in A3 or B3, D cannot be in C3.
                     // In the scenario of Case 1 we must simply look for the following conditions:
                     // a. the fins must not share a box,
                     // b. the fins must be the only candidate D in their respective triad.
                     // [ Note that this addendum is not part of the sashimi pattern directly as
                     //   spelled out by numerous sources on the Web ]. 
                     // Case 2:
+                    // for a fin, the following must be true:
+                    // The fin cell(s) must be on the parallel fish sections w.r.t. to the base_x.
                     // A. the fin cells must all be in the same box (and aligned if there are 2), and
                     // B. the same box must contain a fish grid point (which need not have a candidate)
                     // In this case the fin(s) views intersect with their associated fish grid point's
@@ -3686,53 +3700,72 @@ enter:
                     bool sashimi = false;
                     unsigned int subsx= subs_prp_x;
                     unsigned int finsubcnt = _popcnt32(finsubs_prp_x);  // the complete count
-                    if ( finsubcnt == 2 ) {   // Case 1 A
-                         unsigned short fin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
-                         if (   ( fin_subs_prp[0]/3 == fin_subs_prp[1]/3 )     // Case 1 C
-                              && !(bandbits_by_index[fin_subs_prp[0]/3] & subs_prp_x)) {
-                             unsigned short fin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_v.v16[fin_subs_prp[0]] & base_x),
-                                                                __tzcnt_u16(cbbv_v.v16[fin_subs_prp[1]] & base_x) };
 
-                             if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
-                                  && _popcnt32(cbbv_v.v16[fin_subs_prp[0]] & base_x) == 1
-                                  && _popcnt32(cbbv_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
-                                  fishes_detected++;
-                                  fishes_specials_detected++;
-                                  unsigned char fincells[2] =  { (unsigned char)(fin_subs_prp[0]*9 + fin_subs_pos_prl[0]),
-                                                                 (unsigned char)(fin_subs_prp[1]*9 + fin_subs_pos_prl[1]) };
-                                  clean_bits.u128 =    (*(bit128_t*)big_index_lut[fincells[0]][All]).u128
-                                                     & (*(bit128_t*)big_index_lut[fincells[1]][All]).u128;
-                                 // deal with 'addendum to Case 1'
-                                 if ( fincells[0]/3%3 != fincells[1]/3%3 ) { // not in same box
-                                     if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[0]-fincells[0]%3, 3)) == 1
-                                          && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[1]-fincells[1]%3, 3)) == 1) {
-                                          unsigned char boxoff = 3 * _tzcnt_u32(7 ^ ((1<<fincells[0]/3%3) | (1<<fincells[1]/3%3)));
-                                          unsigned char rowoff = 9 * ( _tzcnt_u32(7 ^ ((1<<fincells[0]/9%3) | (1<<fincells[1]/9%3)))
-                                                                       + fin_subs_prp[0]/3*3 );
-                                           clean_bits.set_indexbits(7, rowoff+boxoff, 3);
-                                     }
-                                 }
-                                   clean_bits.u128 &= candidate_bits_by_value[dgt].u128
-                                                      & grid_state->unlocked.u128;
-                                 clean_bits.unset_indexbit(fincells[0]);
-                                 clean_bits.unset_indexbit(fincells[1]);
-                                 if ( clean_bits ) {
-                                     fishes_specials_updated++;
-                                     if ( verbose == VDebug ) {
-                                         subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
-                                         unsigned char celli = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
-                                         unsigned char celli2 = (15-__lzcnt16(subsx))*9 + (15-__lzcnt16(base_x));
-                                         if ( debug > 2 ) {
-                                             show_fish(cbbv_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, "finned row fish");
-                                         }
-                                         printf("sashimi-pair %s (rows) digit %d at cells %s - %s\nFins at %s,%s - remove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
-                                     }
-                                 }
-                             }
-                         }
+                    if ( finsubcnt == 2 ) {   // Case 1 A
+                        unsigned short fin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
+                        if (   ( fin_subs_prp[0]/3 == fin_subs_prp[1]/3 )) {     // Case 1 C
+                            unsigned short fin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_v.v16[fin_subs_prp[0]] & base_x),
+                                                                   __tzcnt_u16(cbbv_v.v16[fin_subs_prp[1]] & base_x) };
+
+                            if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
+                                 && _popcnt32(cbbv_v.v16[fin_subs_prp[0]] & base_x) == 1
+                                 && _popcnt32(cbbv_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
+                                fishes_detected++;
+                                fishes_specials_detected++;
+                                fincells[0] =  fin_subs_prp[0]*9 + fin_subs_pos_prl[0];
+                                fincells[1] =  fin_subs_prp[1]*9 + fin_subs_pos_prl[1];
+                                clean_bits.u128 =    (*(bit128_t*)big_index_lut[fincells[0]][All]).u128
+                                                   & (*(bit128_t*)big_index_lut[fincells[1]][All]).u128;
+                                // deal with 'addendum to Case 1'
+                                if ( fincells[0]/3%3 != fincells[1]/3%3 ) { // not in same box
+                                    if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[0]-fincells[0]%3, 3)) == 1
+                                         && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[1]-fincells[1]%3, 3)) == 1) {
+                                         unsigned char boxoff = 3 * _tzcnt_u32(7 ^ ((1<<fincells[0]/3%3) | (1<<fincells[1]/3%3)));
+                                         unsigned char rowoff = 9 * ( _tzcnt_u32(7 ^ ((1<<fincells[0]/9%3) | (1<<fincells[1]/9%3)))
+                                                                      + fin_subs_prp[0]/3*3 );
+                                         clean_bits.set_indexbits(7, rowoff+boxoff, 3);
+                                    }
+                                }
+                                clean_bits.u128 &= candidate_bits_by_value[dgt].u128
+                                                   & grid_state->unlocked.u128;
+                                clean_bits.unset_indexbit(fincells[0]);
+                                clean_bits.unset_indexbit(fincells[1]);
+                                if ( clean_bits ) {
+                                    fishes_specials_updated++;
+                                    if ( verbose == VDebug ) {
+                                        subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
+                                        unsigned char celli = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
+                                        unsigned char celli2 = (15-__lzcnt16(subsx))*9 + (15-__lzcnt16(base_x));
+                                        if ( debug > 2 ) {
+                                            show_fish(cbbv_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, "finned row fish");
+                                        }
+                                        printf("sashimi %s (rows) digit %d at cells %s - %s\nFins at %s,%s - remove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
+                                    }
+                                }
+                            }
+                        }
+
+                        if ( clean_bits ) {
+                            fishes_updated++;
+                            dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
+                            unsigned short dgt_mask_bit = 1<<dgt;
+                            while (clean_bits) {
+                                unsigned char cl = tzcnt_and_mask(clean_bits);
+                                if ( candidates[cl] & dgt_mask_bit ) {
+                                    candidates[cl] &= ~dgt_mask_bit;
+                                    if ( verbose == VDebug ) {
+                                        printf("%s ", cl2txt[cl]);
+                                    }
+                                }
+                            }
+                            if ( verbose == VDebug ) {
+                                printf("\n");
+                            }
+                            doenter = true;
+                        }
                     }
 
-                    if ( clean_bits == 0 ) {
+                    {
                         // Case 2
                         // iterate over possible fin rows
                         while ( finsubs_prp_x ) {
@@ -3791,10 +3824,17 @@ enter:
                                 break;
                             }
                         } // while
-                    } // if
+                    } // Case 2
                 } // else
                 if ( clean_bits ) {
                     fishes_updated++;
+                    if ( clean_bits.check_indexbit(fincells[0]) ) {
+                        e_digit = 1<<dgt;
+                        e_i = fincells[1];
+                    } else if ( clean_bits.check_indexbit(fincells[1]) ) {
+                        e_digit = 1<<dgt;
+                        e_i = fincells[0];
+                    }
                     unsigned short dgt_mask_bit = 1<<dgt;
                     while (clean_bits) {
                         unsigned char cl = tzcnt_and_mask(clean_bits);
@@ -3806,8 +3846,14 @@ enter:
                         }
                     }
                     if ( verbose == VDebug ) {
-                        printf("\n");
+                        if ( e_digit == 0 ) {
+                            printf("\n");
+                        } else {
+                            printf("\ncells %s and %s are mutually exclusive (sashimi %s on digit %d),\nenter the remaining ", cl2txt[fincells[0]], cl2txt[fincells[1]], fish_names[cnt-2], dgt+1);
+                        }
                     }
+                    goto enter;
+                } else if ( doenter ) {
                     goto enter;
                 }
             } // if
@@ -3875,7 +3921,7 @@ done:
 
                 unsigned int subs_prp_x = 0x1ff & compress_epi16_boolean(issub_v);
                 unsigned char nsubs = _popcnt32(subs_prp_x);
-                unsigned int hassubs_prp_x;
+                unsigned int hassubs_prp_x = compress_epi16_boolean(hassub_v);
 
                 if ( nsubs == cnt && _mm256_testc_si256(issub_v, hassub_v) ) {
                     // found a (naked) fish
@@ -3884,19 +3930,29 @@ done:
                     // fishes_detected++;
                     continue;
                 }
+                if ( _popcnt32(hassubs_prp_x) < cnt ) {
+                    if ( verbose == VDebug ) {
+                        printf("back track - insufficient number of rows to form %s for digit %d based on row %d\n", fish_names[cnt-2], dgt+1, t);
+                    }
+                    goto back;
+                }
+
                 bit128_t clean_bits {};
                 bit128_t tmp {};
+                unsigned char fincells[2] = {0xff, 0xff};
+                bool doenter = false;
 
                 // if there are exactly N rows with the same pattern of digits, then
                 // it is a fish pattern.
-                if ( nsubs == cnt ) {
+                if ( nsubs == cnt || _popcnt32(hassubs_prp_x) == cnt ) {
                     // this part is efficient to find and easy to deal with - however the yield very low.
+                    unsigned short excess_x = nsubs == cnt ? base_x : (0x1ff & ~base_x);
                     fishes_detected++;
                     hassubs_prp_x = compress_epi16_boolean(hassub_v);
                     unsigned int cols2clean = hassubs_prp_x & ~subs_prp_x;
                     while (cols2clean) {
                         unsigned char col = tzcnt_and_mask(cols2clean);
-                        tmp.set_indexbits( cbbv_col_v.v16[col]&base_x, col*9, 9);
+                        tmp.set_indexbits( cbbv_col_v.v16[col]&excess_x, col*9, 9);
                     }
                     // since we work in a transposed view, we transpose clean_bits here:
                     while ( tmp ) {
@@ -3906,12 +3962,15 @@ done:
                     if ( clean_bits.u128 ) {
                         if ( verbose == VDebug ) {
                             if ( debug > 2 ) {
-                                show_fish<true>(cbbv_col_v, base_x, subs_prp_x, hassubs_prp_x, clean_bits, dgt_bits, "col fish");
+                                show_fish<true>(cbbv_col_v, base_x, nsubs == cnt ? subs_prp_x:hassubs_prp_x, hassubs_prp_x, clean_bits, dgt_bits, "col fish");
                             }
                             unsigned char celli = __tzcnt_u16(subs_prp_x) + __tzcnt_u16(base_x)*9;
                             unsigned char celli2 = (15-__lzcnt16(subs_prp_x)) + (15-__lzcnt16(base_x))*9;
-                            printf("%s (cols) digit %d cells %s - %s\nRemove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
+                            printf("%s (%s) digit %d cells %s - %s\nRemove %d at ", fish_names[cnt-2], nsubs == cnt? "cols":"rows", dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
                         }
+                    }
+                    if ( cnt <= 3 ) {
+                        exclude_col[dgt] |= base_x;
                     }
                 } else if ( nsubs == cnt-1 ) {
                     // nsubs == cnt-1 is required for both fin and sashimi fishes.
@@ -3928,50 +3987,68 @@ done:
                     unsigned int finsubcnt = _popcnt32(finsubs_prp_x);  // the complete count
 
                     if ( finsubcnt == 2 ) {   // Case 1 A
-                         unsigned short fin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
-                         if (   ( fin_subs_prp[0]/3 == fin_subs_prp[1]/3 )     // Case 1 C
-                              && !(bandbits_by_index[fin_subs_prp[0]/3] & subs_prp_x)) {
-                             unsigned short fin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_col_v.v16[fin_subs_prp[0]] & base_x),
-                                                                __tzcnt_u16(cbbv_col_v.v16[fin_subs_prp[1]] & base_x) };
-                             if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
-                                  && _popcnt32(cbbv_col_v.v16[fin_subs_prp[0]] & base_x) == 1
-                                  && _popcnt32(cbbv_col_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
-                                  fishes_detected++;
-                                  fishes_specials_detected++;
-                                  unsigned char fincells[2] =  { (unsigned char)(fin_subs_prp[0] + fin_subs_pos_prl[0]*9),
-                                                                 (unsigned char)(fin_subs_prp[1] + fin_subs_pos_prl[1]*9) };
-                                  clean_bits.u128 =    (*(bit128_t*)big_index_lut[fincells[0]][All]).u128
-                                                     & (*(bit128_t*)big_index_lut[fincells[1]][All]).u128;
-                                 // deal with 'addendum to Case 1'
-                                 if ( fincells[0]/27 != fincells[1]/27 ) { // not in same (vertical) box
-                                     if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[0]/27*27 + fincells[0]%9, 19) & 0x40201) == 1
-                                          && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[1]/27*27 + fincells[1]%9, 19) & 0x40201) == 1) {
-                                          unsigned char boxoff = fincells[0]/3%3*3 + _tzcnt_u32(7 ^ ((1<<fincells[0]%3) | (1<<fincells[1]%3)));
-                                          unsigned char coloff = 27*_tzcnt_u32(7^((1<<fincells[0]/27) | (1<<fincells[1]/27)));
-                                          clean_bits.set_indexbits(0x40201, coloff+boxoff, 19);
-                                     }
-                                 }
-                                 clean_bits.u128 &= candidate_bits_by_value[dgt].u128
-                                                 & grid_state->unlocked.u128;
-                                 clean_bits.unset_indexbit(fincells[0]);
-                                 clean_bits.unset_indexbit(fincells[1]);
-                                 if ( clean_bits ) {
-                                     fishes_specials_updated++;
-                                     if ( verbose == VDebug ) {
-                                         subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
-                                         unsigned char celli = __tzcnt_u16(subsx) + __tzcnt_u16(base_x)*9;
-                                         unsigned char celli2 = (15-__lzcnt16(subsx)) + (15-__lzcnt16(base_x))*9;
-                                         if ( debug > 2 ) {
-                                             show_fish<true>(cbbv_col_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, "finned col fish");
-                                         }
-                                         printf("sashimi-pair %s (cols) digit %d at cells %s - %s\nFins at %s,%s - remove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
-                                     }
-                                 }
-                             }
-                         }
+                        unsigned short fin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
+                        if (   fin_subs_prp[0]/3 == fin_subs_prp[1]/3 ) {    // Case 1 C
+                            unsigned short fin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_col_v.v16[fin_subs_prp[0]] & base_x),
+                                                                    __tzcnt_u16(cbbv_col_v.v16[fin_subs_prp[1]] & base_x) };
+                            if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
+                                 && _popcnt32(cbbv_col_v.v16[fin_subs_prp[0]] & base_x) == 1
+                                 && _popcnt32(cbbv_col_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
+                                fishes_detected++;
+                                fishes_specials_detected++;
+                                fincells[0] =  fin_subs_prp[0] + fin_subs_pos_prl[0]*9;
+                                fincells[1] =  fin_subs_prp[1] + fin_subs_pos_prl[1]*9;
+                                clean_bits.u128 =    (*(bit128_t*)big_index_lut[fincells[0]][All]).u128
+                                                   & (*(bit128_t*)big_index_lut[fincells[1]][All]).u128;
+                                // deal with 'addendum to Case 1'
+                                if ( fincells[0]/27 != fincells[1]/27 ) { // not in same (vertical) box
+                                    if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[0]/27*27 + fincells[0]%9, 19) & 0x40201) == 1
+                                         && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(fincells[1]/27*27 + fincells[1]%9, 19) & 0x40201) == 1) {
+                                         unsigned char boxoff = fincells[0]/3%3*3 + _tzcnt_u32(7 ^ ((1<<fincells[0]%3) | (1<<fincells[1]%3)));
+                                         unsigned char coloff = 27*_tzcnt_u32(7^((1<<fincells[0]/27) | (1<<fincells[1]/27)));
+                                         clean_bits.set_indexbits(0x40201, coloff+boxoff, 19);
+                                    }
+                                }
+                                clean_bits.u128 &= candidate_bits_by_value[dgt].u128
+                                                & grid_state->unlocked.u128;
+                                clean_bits.unset_indexbit(fincells[0]);
+                                clean_bits.unset_indexbit(fincells[1]);
+                                if ( clean_bits ) {
+                                    fishes_specials_updated++;
+                                    if ( verbose == VDebug ) {
+                                        subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
+                                        unsigned char celli = __tzcnt_u16(subsx) + __tzcnt_u16(base_x)*9;
+                                        unsigned char celli2 = (15-__lzcnt16(subsx)) + (15-__lzcnt16(base_x))*9;
+                                        if ( debug > 2 ) {
+                                            show_fish<true>(cbbv_col_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, "finned col fish");
+                                        }
+                                        printf("sashimi %s (cols) digit %d at cells %s - %s\nFins at %s,%s - remove %d at ", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
+                                    }
+                                }
+                            }
+                        }
+
+                        if ( clean_bits ) {
+                            fishes_updated++;
+                            dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
+                            unsigned short dgt_mask_bit = 1<<dgt;
+                            while (clean_bits) {
+                                unsigned char cl = tzcnt_and_mask(clean_bits);
+                                if ( candidates[cl] & dgt_mask_bit ) {
+                                    candidates[cl] &= ~dgt_mask_bit;
+                                    if ( verbose == VDebug ) {
+                                        printf("%s ", cl2txt[cl]);
+                                    }
+                                }
+                            }
+                            if ( verbose == VDebug ) {
+                                printf("\n");
+                            }
+                            doenter = true;
+                        }
                     }
 
-                    if ( clean_bits == 0 ) {
+                    {
                         // Case 2
                         // iterate over possible fin rows
                         while ( finsubs_prp_x ) {
@@ -4031,10 +4108,17 @@ done:
                                 break;
                             }
                         } // while
-                    }  // if
+                    }  // Case 2
                 }
-                if ( clean_bits.u128 ) {
+                if ( clean_bits ) {
                     fishes_updated++;
+                    if ( clean_bits.check_indexbit(fincells[0]) ) {
+                        e_digit = 1<<dgt;
+                        e_i = fincells[1];
+                    } else if ( clean_bits.check_indexbit(fincells[1]) ) {
+                        e_digit = 1<<dgt;
+                        e_i = fincells[0];
+                    }
                     unsigned short dgt_mask_bit = 1<<dgt;
                     while (clean_bits) {
                         unsigned char cl = tzcnt_and_mask(clean_bits);
@@ -4046,8 +4130,14 @@ done:
                         }
                     }
                     if ( verbose == VDebug ) {
-                        printf("\n");
+                        if ( e_digit == 0 ) {
+                            printf("\n");
+                        } else {
+                            printf("\ncells %s and %s are mutually exclusive (sashimi %s on digit %d),\nenter the remaining ", cl2txt[fincells[0]], cl2txt[fincells[1]], fish_names[cnt-2], dgt+1);
+                        }
                     }
+                    goto enter;
+                } else if ( doenter ) {
                     goto enter;
                 }
             }
@@ -4926,6 +5016,7 @@ if ( mode_uqr )
                                 if ( non_uqr_cands_cnt == 1 ) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+                                    // plug the index bit hole (or prove that to be unnecessary)
                                     cand_removal_indx.u128 = *(const __uint128_t*)&big_index_lut[non_pairs_celli[0]][All];
                                     cand_removal_indx.u128 &= *(const __uint128_t*)&big_index_lut[non_pairs_celli[1]][All];
                                     cand_removal_indx.u128 &= candidate_bits_by_value[__tzcnt_u16(non_uqr_cands)].u128;
@@ -5209,7 +5300,7 @@ using namespace Schoku;
 
     int line_to_solve = 0;
 
-    // the debug dprintf and dprintfilter are not used in cheched-in code
+    // the debug dprintf and dprintfilter are not used in checked-in code
     // they are initialized here at no cost just in case...
     const char *schoku_dbg_filter = getenv("SCHOKU_DBG_FILTER");
     if ( schoku_dbg_filter ) {
