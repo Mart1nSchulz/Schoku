@@ -14,51 +14,52 @@
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
  * on Sep 22, 2021
  *
- * Version 0.9.3
+ * Version 0.9.4
  *
  * Performance changes:
- * change to big_index_lut[All]: removed the index bit itself, as this is typically
- * not useful in the pattern of visibility (e.g. for initialization and entering)
- * This simplifies the code and speeds up initialization and entering.
  *
  * Functional changes:
+ * OPT_TRIAD_RES is gone! This functionality is now the default.
+ * Produce a readable hint with -w in case the puzzle may have puzzles
+ * with multiple solutions counted as unsolvable.
  *
  * Performance measurement and statistics:
+ * Same speed, improved stats for 17-clue sudoku
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
  *
- * schoku version: 0.9.3
+ * schoku version: 0.9.4
  * command options: -x
- * compile options: OPT_TRIAD_RES OPT_SETS OPT_FSH OPT_UQR
+ * compile options: OPT_SETS OPT_FSH OPT_UQR
  *      49151  puzzles entered
  *      49151  2226959/s  puzzles solved
  *     22.1ms    0.45µs/puzzle  solving time
- *      37834   76.98%  puzzles solved without guessing
- *      30798    0.63/puzzle  guesses
- *      20996    0.43/puzzle  back tracks
- *     273717    5.57/puzzle  digits entered and retracted
- *    1465686   29.82/puzzle  'rounds'
- *      22972    0.47/puzzle  triads resolved
- *     197772    4.02/puzzle  triad updates
- *        693  bi-value universal graves detected
-
+ *      38591   78.52%  puzzles solved without guessing
+ *      25419    0.52/puzzle  guesses
+ *      16726    0.34/puzzle  back tracks
+ *     218511    4.45/puzzle  digits entered and retracted
+ *    1434826   29.19/puzzle  'rounds'
+ *     117324    2.39/puzzle  triads resolved
+ *     212409    4.32/puzzle  triad updates
+ *        696  bi-value universal graves detected
+ *
  * command options: -x -mfs
- * compile options: OPT_TRIAD_RES OPT_SETS OPT_FSH OPT_UQR
+ * compile options: OPT_SETS OPT_FSH OPT_UQR
  *      49151  puzzles entered
  *      49151  2003530/s  puzzles solved
  *     24.5ms    0.50µs/puzzle  solving time
- *      45482   92.54%  puzzles solved without guessing
- *       5345    0.11/puzzle  guesses
- *       2913    0.06/puzzle  back tracks
- *      39679    0.81/puzzle  digits entered and retracted
- *    1392241   28.33/puzzle  'rounds'
- *      21776    0.44/puzzle  triads resolved
- *     188561    3.84/puzzle  triad updates
- *      25494    0.52/puzzle  naked sets found
- *     578766   11.78/puzzle  naked sets searched
- *       8361    0.17/puzzle  fishes updated
- *      76490    1.56/puzzle  fishes detected
+ *      45487   92.55%  puzzles solved without guessing
+ *       5336    0.11/puzzle  guesses
+ *       2910    0.06/puzzle  back tracks
+ *      39412    0.80/puzzle  digits entered and retracted
+ *    1384649   28.17/puzzle  'rounds'
+ *     102686    2.09/puzzle  triads resolved
+ *     200574    4.08/puzzle  triad updates
+ *      15603    0.32/puzzle  naked sets found
+ *     514507   10.47/puzzle  naked sets searched
+ *       8356    0.17/puzzle  fishes updated
+ *      76439    1.56/puzzle  fishes detected
  *        977  bi-value universal graves detected
  *
  */
@@ -79,15 +80,9 @@
 
 namespace Schoku {
 
-const char *version_string = "0.9.3";
+const char *version_string = "0.9.4";
 
 const char *compilation_options =
-#ifdef OPT_TRIAD_RES
-// Triad resolution examines all triads and if exactly three candidates are present
-// marks them as sets. A tiny penalty to speed but a boost to statistics overall.
-//
-"OPT_TRIAD_RES "
-#endif
 #ifdef OPT_SETS
 // Naked sets detection is a main feature.  The complement of naked sets are hidden sets,
 // which are labeled as such when they are more concise to report.
@@ -738,7 +733,6 @@ Rules rules;
 
 // execution modes at runtime
 bool mode_sets=false;           // 'S', see OPT_SETS
-bool mode_triad_res=false;      // 'T', see OPT_TRIAD_RES
 bool mode_uqr=false;            // 'U', see OPT_UQR
 bool mode_fish=false;			// 'F', see OPT_FSH
 
@@ -1215,7 +1209,7 @@ public:
             lsb = andnot_get_next_lsb(lsb, c);
             // check whether lsb is the last bit
             // count the twos
-            bivalues.u16[4] = compress_epi16_boolean<false>(_mm256_and_si256(
+            bivalues.u64[1] = compress_epi16_boolean<false>(_mm256_and_si256(
                                      _mm256_cmpgt_epi16(c,_mm256_setzero_si256()),
                                      _mm256_cmpeq_epi16(lsb,c)));
     
@@ -1514,14 +1508,7 @@ inline GridState* make_guess(SolverData *solverData) {
             int ti = tzcnt_and_mask(totest);
             int can_ti = ti-ti/10;   // 'canonical' triad index
             if ( __popcnt16 (wo_musts[ti]) == 2 ) {
-                if ( !mode_triad_res ) {
-                    // did not prepare triad_info.triads_selection[i] above,
-                    // so check whether the triad is 'interesting'
-                    if ( __popcnt16(i==0?triad_info.row_triads[ti]:triad_info.col_triads[ti]) != 4 ) {
-                        continue;
-                    }
-                }
-
+            
                 // get and check the unlocked indexbits for the triad
                 unsigned int b;
                 if ( type == 0 ) {
@@ -1773,9 +1760,7 @@ Status solve(signed char grid[81], GridState stack[], int line) {
     // init count of resolved cells to the size of the initial set
     unsigned short current_entered_count = 81 - _popcnt64(unlocked[0]) - _popcnt32(unlocked[1]);
 
-#ifdef OPT_TRIAD_RES
     unsigned short last_entered_count_col_triads = 0;
-#endif
 
     int unique_check_mode = 0;
     bool nonunique_reported = false;
@@ -1833,7 +1818,7 @@ back:
             // This only happens when the puzzle is not valid
             // Bypass the verbose check...
             if ( warnings != 0 ) {
-                printf("Line %d: No solution found!\n", line);
+                printf("Line %d: No %ssolution found!\n", line, rules==Regular?"unique " : "");
             }
             unsolved_count++;
         }
@@ -1975,6 +1960,31 @@ enter:
         if (unlocked[1] & (1ULL << (80-64))) {
             if ((to_update.u16[5] & 1) != 0) {
                 candidates[80] &= ~e_digit;
+                if (__builtin_expect (candidates[80] == 0,0) ) {
+                    // no solutions go back
+                    if ( verbose != VNone ) {
+                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                            if ( warnings != 0 ) {
+                                printf("Line %d: cell %s is 0\n", line, cl2txt[80]);
+                            }
+                        } else {
+                            if ( debug ) {
+                                printf("back track - cell [8,8] is 0\n");
+                            }
+                        }
+                    }
+                    goto back;
+                }
+            }
+            // this check could be postponed
+            if (__popcnt16(candidates[80]) == 1) {
+                // Enter the digit and update candidates
+                if ( verbose == VDebug ) {
+                    printf("naked  single      ");
+                }
+                e_i = 80;
+                e_digit = candidates[80];
+                goto enter;
             }
         }
         if ( dtct_m ) {
@@ -2041,32 +2051,7 @@ enter:
             }
         }
     }
-    if (unlocked[1] & (1ULL << (80-64))) {
-        if (__builtin_expect (candidates[80] == 0,0) ) {
-            // no solutions go back
-            if ( verbose != VNone ) {
-                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                    if ( warnings != 0 ) {
-                        printf("Line %d: cell %s is 0\n", line, cl2txt[80]);
-                    }
-                } else {
-                    if ( debug ) {
-                        printf("back track - cell [8,8] is 0\n");
-                    }
-                }
-            }
-            goto back;
-        } else if (__popcnt16(candidates[80]) == 1) {
-            // Enter the digit and update candidates
-            if ( verbose == VDebug ) {
-                printf("naked  single      ");
-            }
-            e_i = 80;
-            e_digit = candidates[80];
-            goto enter;
-        }
-    }
-    // The solving algorithm ends when there are no remaining unlocked cell.
+    // The solving algorithm ends when there are no remaining unlocked cells.
     // The finishing tasks include verifying the solution and/or confirming
     // its uniqueness, if requested.
     //
@@ -2617,111 +2602,101 @@ enter:
 
     } // Algo 2 and Algo 3.1
 
-#ifdef OPT_TRIAD_RES
-    if ( mode_triad_res )
     { // Algo 3.3
+        // A3.2.1 (check col-triads)
+        // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
 
-            // A3.2.1 (check col-triads)
-            // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
+        __m256i v1 = _mm256_loadu_si256((__m256i *)triad_info.col_triads);
+        __m256i v2 = _mm256_loadu_si256((__m256i *)(triad_info.col_triads+16));
+        __m256i v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
+        v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
+        __m256i lo1 = _mm256_and_si256 (v1, nibble_mask);
+        __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
+        __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
+        cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
+        __m256i res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
 
-            __m256i v1 = _mm256_loadu_si256((__m256i *)triad_info.col_triads);
-            __m256i v2 = _mm256_loadu_si256((__m256i *)(triad_info.col_triads+16));
-            __m256i v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
-            v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
-            __m256i lo1 = _mm256_and_si256 (v1, nibble_mask);
-            __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
-            __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
-            cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
-            __m256i res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
+        // do this only if unlocked has been updated:
+        if ( last_entered_count_col_triads != current_entered_count) {
+            // the high byte is set to the stackpointer, so that this works
+            // across guess/backtrack
+            last_entered_count_col_triads = current_entered_count;
+            unsigned long long tr = unlocked[0];  // col triads - set if any triad cell is unlocked
+            tr |= (tr >> 9) | (tr >> 18) | (unlocked[1]<<(64-9)) | (unlocked[1]<<(64-18));
+            // mimick the pattern of col_triads, i.e. a gap of 1 after each group of 9.
+            if ( bmi2_support ) {
+                tr = _pext_u64(tr, 0x1ffLL | (0x1ffLL<<27) | (0x1ffLL<<54));
+                grid_state->triads_unlocked[Col] &= _pdep_u64(tr, (0x1ff)|(0x1ff<<10)|(0x1ff<<20));
+            } else {
+                grid_state->triads_unlocked[Col] &= (tr & 0x1ff) | ((tr >> 17) & (0x1ff<<10)) | ((tr >> 34) & (0x1ff<<20));
+            }
+        }
 
-            // do this only if unlocked has been updated:
-            if ( last_entered_count_col_triads != current_entered_count) {
-                // the high byte is set to the stackpointer, so that this works
-                // across guess/backtrack
-                last_entered_count_col_triads = current_entered_count;
-                unsigned long long tr = unlocked[0];  // col triads - set if any triad cell is unlocked
-                tr |= (tr >> 9) | (tr >> 18) | (unlocked[1]<<(64-9)) | (unlocked[1]<<(64-18));
-                // mimick the pattern of col_triads, i.e. a gap of 1 after each group of 9.
-                if ( bmi2_support ) {
-                    tr = _pext_u64(tr, 0x1ffLL | (0x1ffLL<<27) | (0x1ffLL<<54));
-                    grid_state->triads_unlocked[Col] &= _pdep_u64(tr, (0x1ff)|(0x1ff<<10)|(0x1ff<<20));
-                } else {
-                    grid_state->triads_unlocked[Col] &= (tr & 0x1ff) | ((tr >> 17) & (0x1ff<<10)) | ((tr >> 34) & (0x1ff<<20));
-                }
+        triad_info.triads_selection[Col] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
+        unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
+        while (m) {
+            unsigned char tidx = tzcnt_and_mask(m);
+            unsigned short cands_triad = triad_info.col_triads[tidx];
+            if ( verbose == VDebug ) {
+                char ret[32];
+                format_candidate_set(ret, cands_triad);
+                printf("triad set (col): %-9s %s\n", ret, cl2txt[tidx/10*3*9+tidx%10]);
+            }
+            // mask off resolved triad:
+            grid_state->triads_unlocked[Col] &= ~(1LL << tidx);
+            unsigned char off = tidx%10+tidx/10*27;
+            grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
+            grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
+            triads_resolved++;
+        }
+
+        // A3.2.2 (check row-triads)
+
+        // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
+        v1 = _mm256_loadu_si256((__m256i *)triad_info.row_triads);
+        v2 = _mm256_loadu_si256((__m256i *)(triad_info.row_triads+16));
+        v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
+        v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
+        lo1 = _mm256_and_si256 (v1, nibble_mask);
+        hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
+        cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
+        cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
+        res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
+
+        m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
+        triad_info.triads_selection[Row] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
+
+        // the best that can be done for rows - remember that the order of
+        // row triads is not aligned with the order of cells.
+        bit128_t tr = grid_state->unlocked;   // for row triads - any triad cell unlocked
+
+        // to allow checking of unresolved triads
+        tr.u64[0]  |= (tr.u64[0] >> 1)  | (tr.u64[0] >> 2);
+        tr.u64[0]  |= ((tr.u64[1] & 1)  | ((tr.u64[1] & 2) >> 1))<<63;
+        tr.u64[1]  |= (tr.u64[1] >> 1)  | (tr.u64[1] >> 2);
+
+        while (m) {
+            unsigned char tidx = tzcnt_and_mask(m);
+            unsigned char off  = row_triad_index_to_offset[tidx];
+
+            if ( !tr.check_indexbit(off)) {  // locked
+                grid_state->triads_unlocked[Row] &= ~(1<<tidx);
+                continue;
             }
 
-            triad_info.triads_selection[Col] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
-            unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
-            while (m) {
-                unsigned char tidx = tzcnt_and_mask(m);
-                unsigned short cands_triad = triad_info.col_triads[tidx];
-                if ( verbose == VDebug ) {
-                    char ret[32];
-                    format_candidate_set(ret, cands_triad);
-                    printf("triad set (col): %-9s %s\n", ret, cl2txt[tidx/10*3*9+tidx%10]);
-                }
-                // mask off resolved triad:
-                grid_state->triads_unlocked[Col] &= ~(1LL << tidx);
-                unsigned char off = tidx%10+tidx/10*27;
-                grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
-                grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
-                triads_resolved++;
+            if ( verbose == VDebug ) {
+                char ret[32];
+                format_candidate_set(ret, triad_info.row_triads[tidx]);
+                printf("triad set (row): %-9s %s\n", ret, cl2txt[off]);
             }
 
-            // A3.2.2 (check row-triads)
-
-            // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
-            v1 = _mm256_loadu_si256((__m256i *)triad_info.row_triads);
-            v2 = _mm256_loadu_si256((__m256i *)(triad_info.row_triads+16));
-            v9 = _mm256_packus_epi16(_mm256_srli_epi16(v1,8), _mm256_srli_epi16(v2,8));
-            v1 = _mm256_packus_epi16(_mm256_and_si256(v1, maskff), _mm256_and_si256(v2, maskff));
-            lo1 = _mm256_and_si256 (v1, nibble_mask);
-            hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
-            cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
-            cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
-            res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
-
-            m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Row];
-            triad_info.triads_selection[Row] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
-
-            // the best that can be done for rows - remember that the order of
-            // row triads is not aligned with the order of cells.
-            bit128_t tr = grid_state->unlocked;   // for row triads - any triad cell unlocked
-
-            // to allow checking of unresolved triads
-            tr.u64[0]  |= (tr.u64[0] >> 1)  | (tr.u64[0] >> 2);
-            tr.u64[0]  |= ((tr.u64[1] & 1)  | ((tr.u64[1] & 2) >> 1))<<63;
-            tr.u64[1]  |= (tr.u64[1] >> 1)  | (tr.u64[1] >> 2);
-
-            while (m) {
-                unsigned char tidx = tzcnt_and_mask(m);
-                unsigned char off  = row_triad_index_to_offset[tidx];
-
-                if ( !tr.check_indexbit(off)) {  // locked
-                    grid_state->triads_unlocked[Row] &= ~(1<<tidx);
-                    continue;
-                }
-
-                if ( verbose == VDebug ) {
-                    char ret[32];
-                    format_candidate_set(ret, triad_info.row_triads[tidx]);
-                    printf("triad set (row): %-9s %s\n", ret, cl2txt[off]);
-                }
-
-                // mask off resolved triad:
-                grid_state->triads_unlocked[Row] &= ~(1LL << tidx);
-                grid_state->set23_found[Row].set_indexbits(0x7,off,3);
-                grid_state->set23_found[Box].set_indexbits(0x7,off,3);
-                triads_resolved++;
-            } // while
-    } else {
-        // by default, all triads will be checked
-        triad_info.triads_selection[Col] = triad_info.triads_selection[Row] = 0x1ff | (0x1ff<<10) | (0x1ff<<20);
+            // mask off resolved triad:
+            grid_state->triads_unlocked[Row] &= ~(1LL << tidx);
+            grid_state->set23_found[Row].set_indexbits(0x7,off,3);
+            grid_state->set23_found[Box].set_indexbits(0x7,off,3);
+            triads_resolved++;
+        } // while
     }   // Algo 3 Part 3
-#else
-    // by default, all triads will be checked
-    triad_info.triads_selection[Col] = triad_info.triads_selection[Row] = 0x1ff | (0x1ff<<10) | (0x1ff<<20);
-#endif
 
 
     {   // Algo 3 Part 2
@@ -5355,11 +5330,6 @@ using namespace Schoku;
                     mode_sets = true;
                     break;
 #endif
-#ifdef OPT_TRIAD_RES
-                case 'T':        // see OPT_TRIAD_RES
-                    mode_triad_res = true;
-                    break;
-#endif
 #ifdef OPT_UQR
                 case 'U':        // see OPT_UQR
                     mode_uqr = true;
@@ -5687,6 +5657,9 @@ using namespace Schoku;
     }
     if ( !reportstats && unsolved_count.load()) {
         printf("%10ld puzzles had no solution\n", unsolved_count.load());
+    }
+    if ( rules == Regular && warnings && unsolved_count.load() ) {
+        printf("\tIf a puzzle may have multiple solutions use either\n\t-mo (find one solution) or -mm (check for multiple solutions)!\n");
     }
 
     return 0;
