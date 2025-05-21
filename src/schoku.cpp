@@ -22,8 +22,25 @@
  * This simplifies the code and speeds up initialization and entering.
  *
  * Functional changes:
+ * OPT_TRIAD_RES is gone! This functionality is now the default.
+ * Produce a readable hint with -w in case the puzzle may have puzzles
+ * with multiple solutions counted as unsolvable.
+ *
+ * Added an env variable SCHOKU_TURBO_CUTOFF_PCT that controls when the staging capability
+ * will be used. This allows to gather results with different settings more easily.
+ * The usage of the staging capability is reduced to the core naked single search.
+ *
+ * At this point the results are unsatisfactory but also puzzling/contradictory.
+ * The kaggle data set shows a performance gain of 20%, while the unbiased and 17-clue
+ * sets are somewhat slower but no much affected byt the cutoff setting.
+ * The difficult hardest_1905 data set performance is most affected in all settings.
+ * More investigation would be necessary.
+ * 
+ * At this stage the 9.3 branch is at best 'experimental'.
+ * Also the performance section below is out of date. 
  *
  * Performance measurement and statistics:
+ * Same speed, improved stats for 17-clue sudoku
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
@@ -939,6 +956,8 @@ inline __m256i andnot_get_next_lsb(__m256i lsb, __m256i &vec) {
 int dprintfilter = 0;       // global filter mask set from env, 
 FILE * dprintout = stdout;
 
+int turbo_cutoff = 0;
+
 int dprintf(int filter, const char *format...) {
     int ret = 0;
     if ( filter & dprintfilter ) {
@@ -1265,7 +1284,7 @@ public:
     }
 
     template<Verbosity verbose>
-    inline bool stage_cell_resolution( unsigned short e_digit, unsigned char e_i, const char *msg = 0 );
+    inline bool stage_cell_resolution( unsigned short e_digit, unsigned char e_i, const char *msg = "" );
 
     template<Verbosity verbose>
     inline bool update_candidates();
@@ -1788,8 +1807,9 @@ inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
 template<Verbosity verbose>
 inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned char e_i, const char *msg ) {
 
-    assert( e_digit != 0 );
     bit128_t to_update;
+
+    assert( e_digit != 0 );
 
 #ifndef NDEBUG
     if ( __popcnt16(e_digit) != 1 ) {
@@ -1811,10 +1831,9 @@ inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned 
     set_indices<All>(&to_update, e_i);
     grid_state->updated.u128 |= to_update.u128;
 
-    bool goback = (e_digit == 0x100) ? update_stage_9_bits.check_indexbit(e_i)
-                                     : (update_stage_bytes[stage_bytes_lu[e_i]] & e_digit);
-
-    if ( goback || !(grid_state->candidates[e_i] & e_digit) ) {
+    // check for upcoming cells being set to 0.
+    if (  (e_digit == 0x100) ? update_stage_9_bits.check_indexbit(e_i)
+                             : (update_stage_bytes[stage_bytes_lu[e_i]] & e_digit) ) {
         // Back track, no solutions along this path
         if ( verbose != VNone ) {
             if ( grid_state->stackpointer == 0 && commonData.unique_check_mode == 0 ) {
@@ -1822,19 +1841,15 @@ inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned 
                     printf("Line %d: [0] cell %s is 0\n", commonData.line, cl2txt[e_i]);
                 }
             } else if ( debug ) {
-                printf("[0] back track - cell %s is 0\n", cl2txt[e_i]);
+                printf("back track - cell %s is 0\n", cl2txt[e_i]);
             }
         }
         return false;
     }
 
     if ( verbose == VDebug ) {
-        if ( msg ) {
-            printf("%s", msg);
-        }
-        printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
+        printf("%s %x at %s\n", msg, _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
     }
-
     if ( e_digit == 0x100 ) {
         update_stage_9_bits.u128 |= to_update.u128;
         update9 = true;
@@ -1864,70 +1879,39 @@ inline bool SolverData::update_candidates() {
     __m256i c1, c2;
     __m256i bits9;
     unsigned long long mask;
+    unsigned int mask1, mask2;
     unsigned int m;
-
-    if ( update_cycles == 0 ) { // single search
-        for ( ; i <96; i += 32 ) {
-            c1 = *(__m256i*) &grid_state->candidates[i];
-            c2 = *(__m256i*) &grid_state->candidates[i+16];
-            m = grid_state->unlocked.u32[i>>5];
-            // test for 0s
-            if (__builtin_expect (commonData.check_back && (mask = compress_epi16_boolean<false>(_mm256_cmpeq_epi16(c1, _mm256_setzero_si256()), _mm256_cmpeq_epi16(c2, _mm256_setzero_si256()))&m), 0)) {
-                // Back track, no solutions along this path
-                if ( verbose != VNone ) {
-                    unsigned char pos = i+_tzcnt_u64(mask);
-                    if ( grid_state->stackpointer == 0 && commonData.unique_check_mode == 0 ) {
-                        if ( warnings != 0 ) {
-                            printf("Line %d: [1] cell %s is 0\n", commonData.line, cl2txt[pos]);
-                        }
-                    } else if ( debug ) {
-                        printf("[1] back track - cell %s is 0\n", cl2txt[pos]);
-                    }
-                }
-                return false;
-            }
-            // test for singletons
-            c1 = _mm256_cmpeq_epi16(_mm256_and_si256(c1, _mm256_sub_epi16(c1, ones)), _mm256_setzero_si256());
-            c2 = _mm256_cmpeq_epi16(_mm256_and_si256(c2, _mm256_sub_epi16(c2, ones)), _mm256_setzero_si256());
-
-            mask = compress_epi16_boolean(c1, c2) & m;
-            if ( mask ) {
-                unsigned char tidx = i+tzcnt_and_mask(mask);
-                if ( !stage_cell_resolution<verbose>( grid_state->candidates[tidx], tidx, "naked  single      ") ) {
-                    return false;
-                }
-                break;
-            }
-        }
-    }
 
     if ( update_cycles ) {
         i = 0;
         do {
-            m = grid_state->unlocked.u32[i>>5];
             bits9 = update9 ?
                     _mm256_and_si256(expand_bitvector_epi8<true>(update_stage_9_bits.u32[i>>5]), ones_epi8) : 
                     _mm256_setzero_si256();
             c2 = *(__m256i*)(update_stage_bytes+i);
             *(__m256i*)&grid_state->candidates[i] = c1 = _mm256_andnot_si256(_mm256_unpacklo_epi8(c2,bits9), *(__m256i*) &grid_state->candidates[i]);
             c2 = _mm256_andnot_si256(_mm256_unpackhi_epi8(c2,bits9), *(__m256i*) &grid_state->candidates[i+16]);
-            *(__m256i*)&grid_state->candidates[i+16] = c2;
-            mask = (unsigned long long)_mm256_movemask_epi8(_mm256_cmpeq_epi16(c2, _mm256_setzero_si256())) << 32;
-
-            if (__builtin_expect (commonData.check_back && ( mask |= _mm256_movemask_epi8(_mm256_cmpeq_epi16(c1, _mm256_setzero_si256())), mask &= m), 0)) {
+            *(__m256i*)	&grid_state->candidates[i+16] = c2;
+            // hide the mask construction inside __builtin_expect and after the check on check_back
+            // unfortunately the parentheses and the asingments/instruction lists are difficult to get right and to read.
+            if (__builtin_expect (commonData.check_back && (
+                   (  mask1 = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c1, _mm256_setzero_si256())))
+               ||  ( (mask2 = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c2, _mm256_setzero_si256()))), (mask2 = i<64? mask2 : mask2&0x3))), 0)) {
                 // Back track, no solutions along this path
                 if ( verbose != VNone ) {
-                    unsigned char pos = i+(_tzcnt_u64(mask)>>1);
+                    unsigned char pos = i+(_tzcnt_u64((unsigned long long)mask1 | ((unsigned long long)mask2<<32))>>1);
                     if ( grid_state->stackpointer == 0 && commonData.unique_check_mode == 0 ) {
                         if ( warnings != 0 ) {
                             printf("Line %d: [2] cell %s is 0\n", commonData.line, cl2txt[pos]);
                         }
                     } else if ( debug ) {
-                        printf("[2] back track - cell %s is 0\n", cl2txt[pos]);
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
                 }
                 return false;
             }
+
+            m = grid_state->unlocked.u32[i>>5];
 
             // test for singletons:
             c1 = _mm256_cmpeq_epi16(_mm256_and_si256(c1, _mm256_sub_epi16(c1, ones)), _mm256_setzero_si256());
@@ -1935,10 +1919,65 @@ inline bool SolverData::update_candidates() {
             mask = compress_epi16_boolean(c1, c2) & m;
             if ( mask ) {
                 do {
-                    unsigned char tidx = i+tzcnt_and_mask(mask);
-                    if ( !stage_cell_resolution<verbose>( grid_state->candidates[tidx], tidx, "naked  single      ") ) {
+                    unsigned char e_i = i+tzcnt_and_mask(mask);
+                    // manually inlined from stage_cell_resolution (not a big imporevement)
+                    unsigned short e_digit = grid_state->candidates[e_i];
+                    bit128_t to_update;
+
+#ifndef NDEBUG
+                    if ( __popcnt16(e_digit) != 1 ) {
+                        if ( warnings != 0 ) {
+                            printf("error in e_digit: %x\n", e_digit);
+                        }
+                    }
+#endif
+
+                    if (e_i < 64) {
+                        _bittestandreset64((long long int *)&grid_state->unlocked.u64[0], e_i);
+                    } else {
+                        _bittestandreset64((long long int *)&grid_state->unlocked.u64[1], e_i-64);
+                    }
+
+                    // unnecessary, we get here for naked singles only!
+                    // grid_state->candidates[e_i] = e_digit;
+                    commonData.current_entered_count++;
+
+                    set_indices<All>(&to_update, e_i);
+                    grid_state->updated.u128 |= to_update.u128;
+
+                    if (  (e_digit == 0x100) ? update_stage_9_bits.check_indexbit(e_i)
+                                             : (update_stage_bytes[stage_bytes_lu[e_i]] & e_digit) ) {
+                        // Back track, no solutions along this path
+                        if ( verbose != VNone ) {
+                            if ( grid_state->stackpointer == 0 && commonData.unique_check_mode == 0 ) {
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: [0] cell %s is 0\n", commonData.line, cl2txt[e_i]);
+                                }
+                            } else if ( debug ) {
+                                printf("back track - cell %s is 0\n", cl2txt[e_i]);
+                            }
+                        }
                         return false;
                     }
+
+                    if ( verbose == VDebug ) {
+                        printf("naked  single       %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
+                    }
+                    if ( e_digit == 0x100 ) {
+                        update_stage_9_bits.u128 |= to_update.u128;
+                        update9 = true;
+                    } else {
+                        __m256i digitsv = _mm256_set1_epi8(e_digit);
+                        __m256i bytes = _mm256_and_si256(expand_bitvector_epi8<true>(to_update.u32[0]), digitsv);
+                        *(__m256i*)(update_stage_bytes) = _mm256_or_si256(*(__m256i*)(update_stage_bytes), bytes);
+                        bytes = _mm256_and_si256(expand_bitvector_epi8<true>(to_update.u32[1]), digitsv);
+                        *(__m256i*)(update_stage_bytes+32) = _mm256_or_si256(*(__m256i*)(update_stage_bytes+32), bytes);
+                        bytes = _mm256_and_si256(expand_bitvector_epi8<true>(to_update.u32[2]), digitsv);
+                        bytes = _mm256_or_si256(*(__m256i*)(update_stage_bytes+64), bytes);
+                        *(__m256i*)(update_stage_bytes+64) = _mm256_or_si256(*(__m256i*)(update_stage_bytes+64), bytes);
+                    }
+                    update_cycles = 3;
+
                 } while ( mask );
             } else {
                 i = (i==64)? 0: i+32;
@@ -2041,6 +2080,7 @@ Status solve(signed char grid[81], GridState stack[], int line) {
     // The 'API' for code that uses the 'goto enter:' method of entering digits
     unsigned short e_digit = 0;
     unsigned char e_i = 0;
+    bool e_staged = false;
 
 #ifdef OPT_FSH
     unsigned short exclude_row[9];
@@ -2069,7 +2109,7 @@ back:
             // This only happens when the puzzle is not valid
             // Bypass the verbose check...
             if ( warnings != 0 ) {
-                printf("Line %d: No solution found!\n", line);
+                printf("Line %d: No %ssolution found!\n", line, rules==Regular?"unique " : "");
             }
             unsolved_count++;
         }
@@ -2143,22 +2183,163 @@ start:
 // Below, two cases are implemented: a) cover algorithm 0 _and_ 1, or b) algorithm 1 alone.
 //
 enter:
-
+  {
+    unsigned short dtct_j = 0;
+    unsigned int dtct_m = 0;
+    bit128_t to_update;
     if ( e_digit ) {
-        if ( !solverData.stage_cell_resolution<verbose>( e_digit, e_i) ) {
-            goto back;
+      if ( (unsigned char)current_entered_count > turbo_cutoff ) {
+            if ( !solverData.stage_cell_resolution<verbose>( e_digit, e_i) ) {
+                goto back;
+            }
+            e_staged = true;
+      } else {
+        //
+        // lock this cell and and remove this digit from the candidates in this row, column and box
+        // and for good measure, detect 0s (back track) and singles.
+
+        if ( verbose == VDebug ) {
+            printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
+        }
+#ifndef NDEBUG
+        if ( __popcnt16(e_digit) != 1 ) {
+            if ( warnings != 0 ) {
+                printf("error in e_digit: %x\n", e_digit);
+            }
+        }
+#endif
+
+        if (e_i < 64) {
+            _bittestandreset64((long long int *)&unlocked[0], e_i);
+        } else {
+            _bittestandreset64((long long int *)&unlocked[1], e_i-64);
+        }
+
+        candidates[e_i] = e_digit;
+        current_entered_count++;
+
+        set_indices<All>(&to_update, e_i);
+
+        grid_state->updated.u128 |= to_update.u128;
+
+        __m256i mask_neg = _mm256_set1_epi16(e_digit);
+
+        for (unsigned char j = 0; j < 80; j += 16) {
+            __m256i c = _mm256_load_si256((__m256i*) &candidates[j]);
+            // expand unlocked unsigned short to boolean vector
+            __m256i munlocked = expand_bitvector(to_update.u16[j>>4]);
+            // apply mask (remove bit)
+            c = andnot_if(c, mask_neg, munlocked);
+            _mm256_store_si256((__m256i*) &candidates[j], c);
+            __m256i a = _mm256_cmpeq_epi16(_mm256_and_si256(c, _mm256_sub_epi16(c, ones)), _mm256_setzero_si256());
+            // this if is only taken very occasionally, branch prediction
+            if (__builtin_expect (check_back && _mm256_movemask_epi8(
+                                  _mm256_cmpeq_epi16(c, _mm256_setzero_si256())
+                                  ), 0)) {
+                // Back track, no solutions along this path
+                if ( verbose != VNone ) {
+                    unsigned int mx = _mm256_movemask_epi8(_mm256_cmpeq_epi16(c, _mm256_setzero_si256()));
+                    unsigned char pos = j+(_tzcnt_u32(mx)>>1);
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        }
+                    } else if ( debug ) {
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
+                    }
+                }
+                e_digit=0;
+                goto back;
+            }
+            unsigned int mask = and_compress_masks<false>(a, grid_state->unlocked.u16[j>>4]);
+            if ( mask && dtct_m == 0 ) {
+                dtct_m = mask;
+                dtct_j = j;
+            }
+        }
+        if ( (to_update.u64[1] & unlocked[1] & (1ULL << (80-64))) ) {
+            candidates[80] &= ~e_digit;
+            if (__builtin_expect (candidates[80] == 0,0) ) {
+            // no solutions go back
+                if ( verbose != VNone ) {
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[80]);
+                        }
+                    } else {
+                        if ( debug ) {
+                            printf("back track - cell [8,8] is 0\n");
+                        }
+                    }
+                }
+                goto back;
+            }
+        }
+      }
+    } else {
+        __m256i c1;
+        __m256i c2;
+        unsigned long long mask;
+        unsigned int m;
+        // no digit to enter
+        for ( unsigned char i=0; i <96; i += 32 ) {
+            m = ((bit128_t*)unlocked)->u32[i>>5];
+            c1 = *(__m256i*) &candidates[i];
+            c2 = *(__m256i*) &candidates[i+16];
+            // test for 0s
+            if (__builtin_expect (check_back && (mask=compress_epi16_boolean(_mm256_cmpeq_epi16(c1, _mm256_setzero_si256()), _mm256_cmpeq_epi16(c2, _mm256_setzero_si256())) & m), 0)) {
+                // Back track, no solutions along this path
+                if ( verbose != VNone ) {
+                    unsigned char pos = i+_tzcnt_u64(mask);
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: cell %s is 0\n", line, cl2txt[pos]);
+                        }
+                    } else if ( debug ) {
+                        printf("back track - cell %s is 0\n", cl2txt[pos]);
+                    }
+                }
+                goto back;
+            }
+            // test for singletons
+            c1 = _mm256_cmpeq_epi16(_mm256_and_si256(c1, _mm256_sub_epi16(c1, ones)), _mm256_setzero_si256());
+            c2 = _mm256_cmpeq_epi16(_mm256_and_si256(c2, _mm256_sub_epi16(c2, ones)), _mm256_setzero_si256());
+            mask = compress_epi16_boolean(c1, c2) & m;
+            if ( mask ) {
+                dtct_m = mask;
+                dtct_j = i;
+                break;
+            }
         }
     }
-
-update:
-
-    // either there's something to update, or update_candidates will
-    // simply search for naked singles.
-    //
-    if ( !solverData.update_candidates<verbose>() ) {
-        goto back;
+    // process last dtct_m instance.
+    if ( dtct_m ) {
+        unsigned char idx = tzcnt_and_mask(dtct_m);
+        e_i = idx+dtct_j;
+        e_digit = candidates[e_i];
+        if ( verbose == VDebug ) {
+            printf("naked  single      ");
+        }
+        goto enter;
+    }
+    if ( e_staged ) {
+        if ( !solverData.update_candidates<verbose>() ) {
+            goto back;
+        }
+        e_staged = false;     
+    } else if (unlocked[1] & (1ULL << (80-64))) {
+        if (__popcnt16(candidates[80]) == 1) {
+            // Enter the digit and update candidates
+            if ( verbose == VDebug ) {
+                printf("naked  single      ");
+            }
+            e_i = 80;
+            e_digit = candidates[80];
+            goto enter;
+        }
     }
     e_digit = 0;
+  }
 
     // The solving algorithm ends when there are no remaining unlocked cell.
     // The finishing tasks include verifying the solution and/or confirming
@@ -2401,8 +2582,6 @@ update:
 
     // Algo 2 and Algo 3.1
     {
-        bool foundsome = false;
-
         __m256i column_or_tails[9];
         __m256i column_or_head = _mm256_setzero_si256();
         __m256i col_triads_3, col_triads_2;
@@ -2471,8 +2650,8 @@ update:
             }
             __m256i a = _mm256_cmpgt_epi16(mask9x1ff, column_mask_);
             unsigned int mask = and_compress_masks<false>(a, m & 0x1ff);
-            while ( mask) {
-                int idx = tzcnt_and_mask(mask);
+            if ( mask) {
+                int idx = __tzcnt_u32(mask);
                 e_i = j+idx;
                 e_digit = ((v16us)_mm256_andnot_si256(column_mask_, mask9x1ff))[idx];
                 if ( check_back && (e_digit & (e_digit-1)) ) {
@@ -2487,17 +2666,15 @@ update:
                     }
                     goto back;
                 }
-                foundsome = true;
-                if ( !solverData.stage_cell_resolution<verbose>( e_digit, e_i, "hidden single (col)") ) {
-                    goto back;
+                if ( verbose == VDebug ) {
+                    printf("hidden single (col)");
                 }
+                goto enter;
             }
+
             // leverage previously computed or'ed rows in head and tails.
             column_or_head_ = column_mask_ = _mm256_or_si256(*(__m256i_u*) &candidates[j], column_or_head_);
             column_mask_ = _mm256_or_si256(column_or_tails[jrow],column_mask_);
-        }
-        if ( foundsome ) {
-            goto update;
         }
 
         unsigned short cand9_row = 0;
@@ -5358,7 +5535,7 @@ Command line options:
         add a 2 or even 3 for even more detail.
     -h  help information (this text)
     -l# solve a single line from the puzzle.
-    -m[FSTU]* execution modes (fishes, sets, triads, unique rectangles), lower or upper case
+    -m[FSU]* execution modes (fishes, sets, unique rectangles), lower or upper case
     -r[ROM] puzzle rules (lower or upper case):
         R  for regular puzzles (unique solution exists)
            not suitable for puzzles that have multiple solutions
@@ -5399,6 +5576,11 @@ using namespace Schoku;
        } else {
             sscanf(&schoku_dbg_filter[off], "%d", &dprintfilter);
        }
+    }
+    const char *schoku_turbo_cutoff_pct = getenv("SCHOKU_TURBO_CUTOFF_PCT");
+    if ( schoku_turbo_cutoff_pct ) {
+        sscanf(schoku_turbo_cutoff_pct, "%d", &turbo_cutoff);
+        turbo_cutoff = (int)(turbo_cutoff/100.*81.);
     }
 
     if ( argc > 0 ) {
