@@ -10,7 +10,7 @@ TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
 DFLAGS := -DNDEBUG
-#DFLAGS := -DNDEBUG -DOPT_TRIAD_RES -DOPT_SETS -DOPT_FSH -DOPT_UQR
+#DFLAGS := -DNDEBUG -DOPT_SETS -DOPT_FSH -DOPT_UQR
 # OPT_TRIAD_RES
 #     resolves triads that have exactly 3 candidates
 # OPT_SETS
