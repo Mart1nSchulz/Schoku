@@ -15,9 +15,6 @@ TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options (OPT_TRIAD_RES is slower)
 DFLAGS := -DNDEBUG
-#DFLAGS := -DNDEBUG -DOPT_TRIAD_RES
-# OPT_TRIAD_RES
-#     resolves triads that have exactly 3 candidates
 
 # optimization options 
 # Note: these are easily overridden on the command line, for example: make OFLAGS=-O2
