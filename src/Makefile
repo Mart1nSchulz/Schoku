@@ -9,10 +9,11 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
-DFLAGS := -DNDEBUG
-#DFLAGS := -DNDEBUG -DOPT_SETS -DOPT_FSH -DOPT_UQR
-# OPT_TRIAD_RES
-#     resolves triads that have exactly 3 candidates
+DFLAGS := -DNDEBUG -DOPT_BIVALS
+#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_SETS -DOPT_FSH -DOPT_UQR
+# OPT_BIVALS
+#     opportunistic bi-values processing (naked pairs and triples, Y-wings)
+#     on by default, when compiled.
 # OPT_SETS
 #     resolves naked sets (complementary sets are labeled hidden sets
 # OPT_FSH
