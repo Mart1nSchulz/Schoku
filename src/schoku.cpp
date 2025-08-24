@@ -22,6 +22,7 @@
  * - process columns first in the hidden singles search to gain some performance.
  * - moved __m256i constants to the program level
  * - AVX2 implementation of reading the puzzle file and writing back the solution
+ * - additional optimization to hidden single search for boxes
  *
  * Functional changes:
  * - adjustments for more diversified puzzle sources (tdoku puzzle files)
@@ -46,16 +47,16 @@
  * command options: -x puzzles.txt
  * compile options:
  *      49151  puzzles entered
- *      49151  2204713/s  puzzles solved
- *     21.9ms   445µs/puzzle  solving time
- *      38591   78.52%  puzzles solved without guessing
- *      25419    0.52/puzzle  guesses
- *      16726    0.34/puzzle  back tracks
- *     218511    4.45/puzzle  digits entered and retracted
+ *      49151  2433977/s  puzzles solved
+ *     20.2ms   410ns/puzzle  solving time
+ *      38596   78.53%  puzzles solved without guessing
+ *      25410    0.52/puzzle  guesses
+ *      16721    0.34/puzzle  back tracks
+ *     218423    4.44/puzzle  digits entered and retracted
  *      26259    0.53/puzzle  'rounds'
- *     117196    2.39/puzzle  triads resolved
+ *     117195    2.38/puzzle  triads resolved
  *     212409    4.32/puzzle  triad updates
- *        696  bi-value universal graves detected
+ *        704  bi-value universal graves detected
  *
  */
 #include <atomic>
@@ -159,6 +160,23 @@ union {
             u64[1] |= mask << (pos-64);
         }
     }
+
+    // The following 'immediate' right shift works across the 64 bit boundary and
+    // should translate into one unaligned load plus shift plus and 'and' (which can be optimized away as needed)
+    // pos must not be less than 32.
+    // 32 >= pos < 64, bitcount <= 64
+    // This is ideal for all accesses to the third band, or 8th row.
+    template<unsigned int pos, unsigned int bitcount=64>
+    inline unsigned long long get_rshfti() {
+        unsigned long long ret = (*((unsigned long long *)&u8[4])>>(pos-32));
+        if ( bitcount == 64 ) {
+            return ret;
+        }
+        if ( bitcount < 64 ) {
+            return ret & ((1LL<<bitcount)-1);
+        }
+    }
+
     // bitcount <= 64
     inline unsigned long long get_indexbits(unsigned char pos, unsigned char bitcount) {
         unsigned long long res = 0;
@@ -495,6 +513,8 @@ char cl2txt[81][6] = {
         /*  80 */  "[8,8]"
     };
 
+const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
+
 alignas(64)
 // general purpose / multiple locations:
 const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
@@ -540,7 +560,7 @@ const __m256i mask9x1ff = _mm256_and_si256(mask1ff, mask9);
 
 // used in triads (row triad capture):
 const __m256i shuff725to012 = _mm256_setr_epi8(14, 15,  4,  5, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,  -1, -1,
-                                               -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+                                               14, 15,  4,  5, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,  -1, -1);
 
 // used in triads processing:
 const __m256i mask_musts = _mm256_setr_epi16( 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0x1ff, 0, 0,
@@ -563,6 +583,7 @@ const __m256i fours     = _mm256_set1_epi8 ( 4 );
 //   popcnt by nibble
 const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                            0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
+
 // interleaved indexing for stage_bytes:
 const unsigned char stage_bytes_lu[81] = { 0, 1, 2, 3, 4, 5, 6, 7,
                                        16, 17, 18, 19, 20, 21, 22, 23,
@@ -591,6 +612,7 @@ std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
 std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
 std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
 bool bmi2_support = false;
+bool pext_support = false;
 
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
@@ -613,10 +635,31 @@ Rules rules;
 
 signed char *output;
 
+// isolate the strict-aliasing warning for casts from unsigned long long [2] arrays:
+inline const __uint128_t *cast2cu128(const unsigned long long *from) {
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+	return (const __uint128_t *)from;
+#pragma GCC diagnostic pop
+}
+
 inline unsigned char tzcnt_and_mask(unsigned long long &mask) {
     unsigned char ret = _tzcnt_u64(mask);
     mask = _blsr_u64(mask);
     return ret;
+}
+
+inline unsigned char tzcnt_and_mask(bit128_t &mask) {
+    if ( mask.u64[0] ) {
+        unsigned char ret = _tzcnt_u64(mask.u64[0]);
+        mask.u64[0] = _blsr_u64(mask.u64[0]);
+        return ret;
+    }
+    unsigned char ret = _tzcnt_u64(mask.u64[1]);
+    mask.u64[1] = _blsr_u64(mask.u64[1]);
+    return ret+64;
+    // returns 128 for input of 0.
 }
 
 inline __m256i expand_bitvector(unsigned short m) {
@@ -634,7 +677,7 @@ inline __attribute__((always_inline)) unsigned short compress_epi16_boolean128(_
     if (doubledbits) {
         return _mm_movemask_epi8(b);
     }
-    if ( bmi2_support ) {
+    if ( pext_support ) {
         return _pext_u32(_mm_movemask_epi8(b), 0x5555);
     } else {
         return _mm_movemask_epi8(_mm_packs_epi16(b, _mm_setzero_si128()));
@@ -646,10 +689,10 @@ inline __attribute__((always_inline)) unsigned int compress_epi16_boolean(__m256
     if (doubledbits) {
         return _mm256_movemask_epi8(b);
     }
-    if ( bmi2_support ) {
+    if ( pext_support ) {
         return _pext_u32(_mm256_movemask_epi8(b),0x55555555);
     } else {
-        return _mm_movemask_epi8(_mm_packs_epi16(_mm256_castsi256_si128(b), _mm256_extractf128_si256(b,1)));
+        return _mm_movemask_epi8(_mm_packs_epi16(_mm256_castsi256_si128(b), _mm256_extracti128_si256(b,1)));
     }
 }
 
@@ -688,7 +731,7 @@ inline __attribute__((always_inline))__m256i andnot_if(__m256i a, __m256i b, __m
 
 template<bool doubledbits=false>
 inline __attribute__((always_inline)) unsigned int and_compress_masks(__m256i a, unsigned short b) {
-    if ( bmi2_support ) {
+    if ( pext_support ) {
 // path 1:
         unsigned int res = compress_epi16_boolean<doubledbits>(a);
         if (doubledbits) {
@@ -706,48 +749,19 @@ inline __attribute__((always_inline)) unsigned int and_compress_masks(__m256i a,
     }
 }
 
-// for the 9 cells of a box (given by the index of the box),
-// return the corresponding masking bits as a contiguous bit vector
-inline unsigned int get_contiguous_masked_indices_for_box(unsigned long long indices[2], int boxi) {
-
-    // step 1, and-combine the indices with const bitmask for the box
-    bit128_t ret = { .u64 = { box_bitmasks[boxi].u64[0] & indices[0], box_bitmasks[boxi].u64[1] & indices[1] } };
-
-    // step 2, extract the 21 bit extent for the given box
-    // for the first 6 boxes, we know the indices are all in the low 64 bits
-    // for the last 3 boxes, combine the 10 bits [54:63] from u64[0] with u64[1] and shift down accordingly:
-    unsigned int mask = (boxi < 6) ? (ret.u64[0]>>box_start_by_boxindex[boxi])
-                       : (((ret.u64[1]<<10) | (ret.u64[0] >> (64-10))) >> (box_start_by_boxindex[boxi]-(64-10)));
-
-    // step 3, combine the 21 given bits (0b111000000111000000111)
-    // into contiguous 9 bits for the given box
-    if ( bmi2_support ) {
-        const unsigned int mask21 = (0x7<<18)|(0x7<<9)|0x7;
-        return _pext_u32(mask,mask21);
-    } else {
-        return   (mask & 7)
-               | ( (mask>>(9-3)) & (7<<3) )
-               | ( (mask>>(18-6)) & (7<<6) );
-    }
-    // not reached
-}
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 inline void add_and_mask_all_indices(bit128_t *indices, bit128_t *mask, unsigned char i) {
-	indices->u128 |= (*(const __uint128_t *)&big_index_lut[i][All][0]) & mask->u128;
+	indices->u128 |= *cast2cu128(big_index_lut[i][All]) & mask->u128;
 }
 
 template<Kind kind>
 inline void add_indices(bit128_t *indices, unsigned char i) {
-	indices->u128 |= *(const __uint128_t *)&big_index_lut[i][kind][0];
+	indices->u128 |= *cast2cu128(big_index_lut[i][kind]);
 }
 
 template<Kind kind>
 inline void set_indices(bit128_t *indices, unsigned char i) {
-	indices->u128 = *(const __uint128_t *)&big_index_lut[i][kind][0];
+	indices->u128 = *cast2cu128(big_index_lut[i][kind]);
 }
-#pragma GCC diagnostic pop
 
 // The pair of functions below can be used to iteratively isolate all distinct bit values
 // and determine whether popcnt(X) == N is true for the input vector elements using movemask
@@ -939,10 +953,7 @@ inline void initialize_and_stage(signed char grid[81], bit128_t &digit_bits9, un
         while (lkd) {
             int dix = tzcnt_and_mask(lkd)+off;
             int dgt = grid[dix] - 49;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-            digit_bits[dgt].u128 = digit_bits[dgt].u128 | (*(const __uint128_t *)&big_index_lut[dix][All][0]);
-#pragma GCC diagnostic pop
+            digit_bits[dgt].u128 = digit_bits[dgt].u128 | *cast2cu128(big_index_lut[dix][All]);
             candidates[dix] = 1<<dgt;
             if ( verbose == VDebug ) {
                 lineout[dix] = '1' + dgt;
@@ -1073,8 +1084,8 @@ found:
 
     unsigned char off = tpos;
     for ( unsigned char k=0; k<3; k++, tpos += inc) {
-         new_grid_state->candidates[tpos] &= ~select_cand;
-         candidates[tpos] &= ~other_cand;
+        new_grid_state->candidates[tpos] &= ~select_cand;
+        candidates[tpos] &= ~other_cand;
     }
     // Update candidates
     if (type == 0 ) {
@@ -1134,10 +1145,7 @@ inline GridState* make_guess(bit128_t &bivalues) {
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
 
     // Find the cell with fewest possible candidates
-    unsigned long long to_visit;
     unsigned char guess_index = 0;
-    unsigned char i_rel;
-    unsigned char cnt;
     unsigned char best_cnt = 16;
 
     if ( bivalues.u64[0] ) {
@@ -1146,7 +1154,10 @@ inline GridState* make_guess(bit128_t &bivalues) {
         guess_index = _tzcnt_u64(bivalues.u64[1]) + 64;
     } else {
         // very unlikely
-        to_visit = unlocked.u64[0];
+        unsigned char cnt;
+        unsigned char i_rel;
+            
+        unsigned long long to_visit = unlocked.u64[0];
         while ( best_cnt > 3 && to_visit != 0 ) {
             i_rel = tzcnt_and_mask(to_visit);
             cnt = __popcnt16(candidates[i_rel]);
@@ -1844,13 +1855,16 @@ hidden_search:
     //       appear in the other cells: back track
     //    2. If the 'or' of all the cells does not contain all digits: back track
     //
-    // columns are or'ed together, leaving out the current row, and hidden column singles are
-    // isolated for that row. For efficiency, precompute and save the or'ed rows (tails) and
+    // columns are or'ed together (i.e. all columns in parallel, while reading one row at a time,
+    // leaving out the current row, and hidden column singles are thus isolated for that row.
+    // For efficiency, precompute and save the or'ed rows (tails) and
     // preserve the last leading set of rows (the head).
     // To check for an invalid state of the puzzle:
     // - check the columns or'ed value to be 0x1ff.
+    // - andnot with 0x1ff and then check all non-zero results to be singletons, or otherwise
+    //   back track.
     //
-    // Combine 8 cells from rows and 8 cells from boxes into one __m256i vector.
+    // Combine 8 cells from 2 rows into one __m256i vector. (9th row: use __m128i vector)
     // Rotate and or until each vector element represents 7 cells or'ed (except the cell
     // directly corresponding to its position, containing the hidden single if there is one).
     // Broadcast the nineth cell and or it for good measure, then andnot with 0x1ff
@@ -1858,7 +1872,11 @@ hidden_search:
     // For the nineth cell, rotate and or one last time and use just one element of the result
     // to check the nineth cell for a hidden single.
     //
-    // Compress to a bit vector and check that 'found singles' are really singles. 
+    // For boxes, loading of the data is the most expensive.
+    // You can follow the 'column' approach or the 'row' approach.  The column approach
+    // performs better, although it is harder to understand.
+    //
+    // All checks use compression to a bit vector
     //
     // Algorithm 3
     // Definition: An intersection of row/box and col/box consisting of three cells
@@ -1941,212 +1959,232 @@ hidden_search:
     {
         __m256i column_or_tails[9];
         __m256i column_or_head = _mm256_setzero_si256();
-        __m256i column_mask = _mm256_setzero_si256();
+        __m256i column_cand_or = _mm256_setzero_si256();
         __m256i col_triads_1, col_triads_2, col_triads_3;
-
-        // columns
-        // to start, we simply tally the or'ed rows
-        signed char j = 81-9;
-        // compute fresh col_triads_3
-        col_triads_3 = _mm256_setzero_si256();
-        // A2 (cols)
-        // precompute 'tails' of the or'ed column_mask only once
-        // working backwords
-        // 3 iterations, rows 8, 7 and 6.
-        for ( ; j >= 54; j -= 9) {
-            column_or_tails[j/9-1] = col_triads_3;
-            col_triads_3 = _mm256_or_si256(col_triads_3, *(__m256i_u*) &candidates[j]);
-        }
-        // col_triads_3 now contains the third set of column-triads
-        // compute fresh col_triads_2
-        // A2 and A3.1.a
-        // 3 iterations, rows 5, 4 and 3.
-        col_triads_2 = _mm256_setzero_si256();
-        for ( ; j >= 27; j -= 9) {
-            column_or_tails[j/9-1] = _mm256_or_si256(col_triads_2,col_triads_3);
-            col_triads_2 = _mm256_or_si256(col_triads_2, *(__m256i_u*) &candidates[j]);
-        }
-        // A2 and A3.1.a
-        // col_triads_2/3 contain the second/third set of column-triads
-        column_mask = _mm256_or_si256(col_triads_2, col_triads_3);
-
-        // 2 iterations, rows 1 and 2.
-        // the first set of column triads is computed below as part of the computed
-        // 'head' or.
-        for ( ; j > 0; j -= 9) {
-            column_or_tails[j/9-1] = column_mask;
-            column_mask = _mm256_or_si256(column_mask, *(__m256i_u*) &candidates[j]);
-        }
-        // or in row 0 and check whether all digits or covered
-        if ( check_back && !_mm256_testz_si256(mask9x1ff,_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9x1ff)) ) {
-            // the current grid has no solution, go back
-            if ( verbose != VNone ) {
-                unsigned int m = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_andnot_si256(_mm256_or_si256(column_mask, *(__m256i*) &candidates[0]), mask9x1ff), _mm256_setzero_si256()));
-                int idx = __tzcnt_u32(m)>>1;
-                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                    if ( warnings != 0 ) {
-                        printf("Line %d: stack 0, back track - column %d does not contain all digits\n", line, idx);
-                    }
-                } else if ( debug ) {
-                    printf("back track - missing digit in column %d\n", idx);
-                }
+        {
+            // columns
+            // to start, we simply tally the or'ed rows
+            signed char j = 81-9;
+            // compute fresh col_triads_3
+            col_triads_3 = _mm256_setzero_si256();
+            // A2 (cols)
+            // precompute 'tails' of the or'ed column_cand_or only once
+            // working backwords
+            // 3 iterations, rows 8, 7 and 6.
+            for ( ; j >= 54; j -= 9) {
+                column_or_tails[j/9-1] = col_triads_3;
+                col_triads_3 = _mm256_or_si256(col_triads_3, *(__m256i_u*) &candidates[j]);
             }
-            goto back;
-        }
-
-        // breaking the column hidden singles out of the loop this way will win some performance
-        unsigned int jrow = 0;
-        for (unsigned int j = 0; j < 81; j+=9, jrow++) {
-            // turn the or'ed rows into a mask for the singletons, if any.
-            // check col (9) candidates
-            unsigned short m = (j < 64) ? (unlocked[0] >> j) : (unlocked[1] >> (j-64));
-            if ( j == 63) {
-                m |= unlocked[1] << (64-63);
+            // col_triads_3 now contains the third set of column-triads
+            // compute fresh col_triads_2
+            // A2 and A3.1.a
+            // 3 iterations, rows 5, 4 and 3.
+            col_triads_2 = _mm256_setzero_si256();
+            for ( ; j >= 27; j -= 9) {
+                column_or_tails[j/9-1] = _mm256_or_si256(col_triads_2,col_triads_3);
+                col_triads_2 = _mm256_or_si256(col_triads_2, *(__m256i_u*) &candidates[j]);
             }
-            __m256i a = _mm256_cmpgt_epi16(mask9x1ff, column_mask);
-            unsigned int mask = and_compress_masks<false>(a, m & 0x1ff);
-            if ( mask) {
-                int idx = __tzcnt_u32(mask);
-                e_i = j+idx;
-                e_digit = ((v16us)_mm256_andnot_si256(column_mask, mask9x1ff))[idx];
-                if ( check_back && (e_digit & (e_digit-1)) ) {
-                    if ( verbose != VNone ) {
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
-                            }
-                        } else if ( debug ) {
-                            printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
+            // A2 and A3.1.a
+            // col_triads_2/3 contain the second/third set of column-triads
+            column_cand_or = _mm256_or_si256(col_triads_2, col_triads_3);
+            // 2 iterations, rows 1 and 2.
+            // the first set of column triads is computed below as part of the computed
+            // 'head' or.
+            for ( ; j > 0; j -= 9) {
+                column_or_tails[j/9-1] = column_cand_or;
+                column_cand_or = _mm256_or_si256(column_cand_or, *(__m256i_u*) &candidates[j]);
+            }
+            // or in row 0 and check whether all digits or covered
+            if ( check_back && !_mm256_testz_si256(mask9x1ff,_mm256_andnot_si256(_mm256_or_si256(column_cand_or, *(__m256i*) &candidates[0]), mask9x1ff)) ) {
+                // the current grid has no solution, go back
+                if ( verbose != VNone ) {
+                    __m256i missing = _mm256_andnot_si256(_mm256_or_si256(column_cand_or, *(__m256i*) &candidates[0]), mask9x1ff);
+                    unsigned int m = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
+                    int idx = __tzcnt_u32(m)>>1;
+                    unsigned short digit = ((__v16hu)missing)[idx];
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: stack 0, back track - column %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
                         }
+                    } else if ( debug ) {
+                        printf("back track - missing digit %d in column %d\n", __tzcnt_u16(digit)+1, idx);
                     }
-                    goto back;
                 }
-                if ( verbose == VDebug ) {
-                    printf("hidden single (col)");
-                }
-                goto enter;
+                goto back;
             }
 
-            // leverage previously computed or'ed rows in head and tails.
-            column_or_head = column_mask = _mm256_or_si256(*(__m256i_u*) &candidates[j], column_or_head);
-            column_mask = _mm256_or_si256(column_or_tails[jrow],column_mask);
+            // breaking the column hidden singles out of the loop this way will win some performance
+            unsigned int jrow = 0;
+            for (unsigned int j = 0; j < 81; j+=9, jrow++) {
+                // turn the or'ed rows into a mask for the singletons, if any.
+                // check col (9) candidates
+                unsigned short m = (j < 64) ? (unlocked[0] >> j) : (unlocked[1] >> (j-64));
+                if ( j == 63) {
+                    m |= unlocked[1] << (64-63);
+                }
+                __m256i a = _mm256_cmpgt_epi16(mask9x1ff, column_cand_or);
+                unsigned int mask = and_compress_masks<false>(a, m & 0x1ff);
+                if ( mask) {
+                    int idx = __tzcnt_u32(mask);
+                    e_i = j+idx;
+                    e_digit = ((v16us)_mm256_andnot_si256(column_cand_or, mask9x1ff))[idx];
+                    if ( check_back && (e_digit & (e_digit-1)) ) {
+                        if ( verbose != VNone ) {
+                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
+                                }
+                            } else if ( debug ) {
+                                printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
+                            }
+                        }
+                        goto back;
+                    }
+                    if ( verbose == VDebug ) {
+                        printf("hidden single (col)");
+                    }
+                    goto enter;
+                }
 
-            if ( j == 18 ) {
-                // A3.1.c
-                col_triads_1 = column_or_head;
+                // leverage previously computed or'ed rows in head and tails.
+                column_or_head = column_cand_or = _mm256_or_si256(*(__m256i_u*) &candidates[j], column_or_head);
+                column_cand_or = _mm256_or_si256(column_or_tails[jrow],column_cand_or);
+
+                if ( j == 18 ) {
+                    // A3.1.c
+                    col_triads_1 = column_or_head;
+                }
             }
         }
 
-        unsigned short cand9_row = 0;
-        unsigned short cand9_box = 0;
+        // rows
+        //
+        // The grid is processed as indicated by the keys below:
+        // P1 P1 P1 P1 P1 P1 P1 P1 C9
+        // P1 P1 P1 P1 P1 P1 P1 P1 C9
+        // P2 P2 P2 P2 P2 P2 P2 P2 C9
+        // P2 P2 P2 P2 P2 P2 P2 P2 C9
+        // P3 P3 P3 P3 P2 P3 P3 P3 C9
+        // P3 P3 P3 P3 P4 P3 P3 P3 C9
+        // P4 P4 P4 P4 P4 P4 P4 P4 C9
+        // P4 P4 P4 P4 P4 P4 P4 P4 C9
+        // R9 R9 R9 R9 R9 R9 R9 R9 C80
+
+        // Px: processed in pairs of rows, for their first 8 cells
+        // C9: the 9th cell of each of the first 8 rows and boxes is prepared
+        //     and stored in row_9th_cand_vert.  row_9th_cand_vert is then processed at the end.
+        // R9: is processed for 8 cells of each rows and boxes, the cell 80
+        //     is processed using the row and box logic and stored in cand80_row
+        //     and cand80_box
+        // C80: the value of cand80_row is examined last
+
+        // The examination of each row and its cells is made up of three steps:
+        // 1 - or the other values of the row
+        // 2 - check that the row or box contains all digits
+        // 3 - check negated or'ed value for non-zero candidates.
+        //     if there are multiple candidates, back track,
+        //     enter any valid singletons found
+
+        // row_9th_cand_vert cumulates the 9th row or'ed singleton candidates
+        // which are processed in the end.
+        __v8hu row_9th_cand_vert;
+        // the last singleton candidate of the grid.
+        unsigned short cand80_row = 0;
         unsigned char irow = 0;
 
-        __v16hu rowbox_9th_mask;
+        // find hidden singles in rows
 
-        for (unsigned char i = 0; i < 81; i += 9, irow++) {
-            // rows and boxes
+        for (unsigned char i = 0; i < 72; i += 18, irow+=2) {
+            // rows, in pairs
 
-            unsigned char b = box_start_by_boxindex[irow];
-             __m256i c = _mm256_set_m128i(_mm_set_epi16(candidates[b+19], candidates[b+18], candidates[b+11], candidates[b+10], candidates[b+9], candidates[b+2], candidates[b+1], candidates[b]),
-                         *(__m128i_u*) &candidates[i]);
+             __m256i c1 = _mm256_set_m128i(*(__m128i_u*) &candidates[i+9],
+                                           *(__m128i_u*) &candidates[i]);
 
-            unsigned short the9thcand_row = candidates[i+8];
-            unsigned short the9thcand_box = candidates[b+20];
+            unsigned short the9thcand_row[2] = { candidates[i+8], candidates[i+17] };
 
-            __m256i rowbox_or7 = _mm256_setzero_si256();
-            __m256i rowbox_or8;
-            __m256i rowbox_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_box),_mm_set1_epi16(the9thcand_row));
+            __m256i row_or7 = _mm256_setzero_si256();
+            __m256i row_or8;
+            __m256i row_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_row[1]),_mm_set1_epi16(the9thcand_row[0]));
 
             __m256i row_triad_capture[2];
             {
-                __m256i c_ = c;
+                __m256i c1_ = c1;
                 // A2 and A3.1.b
-                // first lane for the row, 2nd lane for the box
+                // c1 2 lanes for two rows
                 // step j=0
                 // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
-                    c_ = _mm256_alignr_epi8(c_, c_, 2);
-                    rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
                 // step j=1
                 // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
-                c_ = _mm256_alignr_epi8(c_, c_, 2);
-                rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
-                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
-                row_triad_capture[0] = _mm256_or_si256(rowbox_or7, rowbox_9th);
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of these rows saved in pos 5, 13
+                row_triad_capture[0] = _mm256_or_si256(row_or7, row_9th);
                 // step j=2
                 // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
-                c_ = _mm256_alignr_epi8(c_, c_, 2);
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
                 // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
-                row_triad_capture[1] = rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                row_triad_capture[1] = row_or7;
                 // continue the rotate/or routine for this row
                 for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
-                    // first lane for the row, 2nd lane for the box
-                    c_ = _mm256_alignr_epi8(c_, c_, 2);
-                    rowbox_or7 = _mm256_or_si256(c_, rowbox_or7);
+                    // c1 2 lanes for two row
+                    c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                    row_or7 = _mm256_or_si256(c1_, row_or7);
                 }
 
-                rowbox_or8 = _mm256_or_si256(c, rowbox_or7);
-                // test rowbox_or8 | rowbox_9th to hold all the digits
+                row_or8 = _mm256_or_si256(c1, row_or7);
+                // test row_or8 to hold all the digits
                 if ( check_back ) {
-                    if ( !_mm256_testz_si256(mask1ff,_mm256_andnot_si256(_mm256_or_si256(rowbox_9th, rowbox_or8), mask1ff))) {
+                    if ( !_mm256_testz_si256(mask1ff,_mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff))) {
                         // the current grid has no solution, go back
                         if ( verbose != VNone ) {
                             unsigned int m = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_setzero_si256(),
-                            _mm256_andnot_si256(_mm256_or_si256(rowbox_9th, rowbox_or8), mask1ff)));
-                            const char *row_or_box = (m & 0xffff)?"box":"row";
+                            _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff)));
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                                 if ( warnings != 0 ) {
-                                    printf("Line %d: stack 0, back track - %s %d does not contain all digits\n", line, row_or_box, irow);
+                                    printf("Line %d: stack 0, back track - row %d does not contain all digits\n", line, irow+(m & 0xffff)?0:1);
                                 }
                             } else if ( debug ) {
-                                printf("back track - missing digit in %s %d\n", row_or_box, irow);
+                                printf("back track - missing digit in row %d\n", irow+(m & 0xffff)?0:1);
                             }
                         }
                         goto back;
                     }
                 }
             }
-            // hidden singles in row and box
-            __m256i rowbox_mask = _mm256_andnot_si256(_mm256_or_si256(rowbox_9th, rowbox_or7), mask1ff);
+            // hidden singles in row
+            __m256i row_mask = _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or7), mask1ff);
             {
-                // Check that the singles are indeed singles
-                if ( check_back && !_mm256_testz_si256(rowbox_mask, _mm256_sub_epi16(rowbox_mask, ones))) {
-                    // This is rare as it can only occur when a wrong guess was made or the puzzle is invalid.
-                    // the current grid has no solution, go back
-                    if ( verbose != VNone ) {
-                        unsigned int m = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(rowbox_mask,
-                                         _mm256_sub_epi16(rowbox_mask, ones)), _mm256_setzero_si256()));
-                        const char *row_or_box = (m & 0xffff)?"row":"box";
-                        int idx = __tzcnt_u32(m)>>1;
-                        unsigned char celli = (m & 0xffff)? irow*9+idx:b+box_offset[idx&7];
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                printf("Line %d: stack 0, back track - %s cell %s does contain multiple hidden singles\n", line, row_or_box, cl2txt[celli]);
-                            }
-                        } else if ( debug ) {
-                            printf("back track - multiple hidden singles in %s cell %s\n", row_or_box, cl2txt[celli]);
+                // check row (8) candidates
+                unsigned short m1 = grid_state->unlocked.get_indexbits(i, 8) | (grid_state->unlocked.get_indexbits(i+9, 8)<<8);
+                __m256i a1 = _mm256_cmpgt_epi16(row_mask, _mm256_setzero_si256());
+
+                unsigned int mask1 = and_compress_masks<false>(a1, m1);
+                if (mask1) {
+                    int idx = __tzcnt_u32(mask1);
+                    int idx_ = idx + ((mask1 & 0xff)?0:1);
+                    e_i = i + idx_;
+                    e_digit = ((v16us)row_mask)[idx];
+                    if ( __popcnt16(e_digit) == 1 ) {
+                        if ( verbose == VDebug ) {
+                            printf("hidden single (row)");
                         }
+                        goto enter;
                     }
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: stack 0, back track - %s cell %s does contain multiple hidden singles\n", line, mask1?"row":"box", cl2txt[e_i]);
+                        }
+                    } else if ( debug ) {
+                        printf("back track - multiple hidden singles in row cell %s\n", cl2txt[e_i]);
+                    }
+                    e_digit = 0;
                     goto back;
                 }
-
-                // check row/box (8) candidates
-                unsigned short m = grid_state->unlocked.get_indexbits(i, 8) | ((get_contiguous_masked_indices_for_box(unlocked,irow)&0xff)<<8);
-                __m256i a = _mm256_cmpgt_epi16(rowbox_mask, _mm256_setzero_si256());
-                unsigned int mask = and_compress_masks<false>(a, m);
-                if (mask) {
-                    int s_idx = __tzcnt_u32(mask);
-                    bool is_row = s_idx < 8;
-                    int celli = is_row ? i + s_idx : b + box_offset[s_idx&7];
-                    if ( verbose == VDebug ) {
-                        printf("hidden single (%s)", is_row?"row":"box");
-                    }
-                    e_i = celli;
-                    e_digit = ((v16us)rowbox_mask)[s_idx];
-                    goto enter;
-                }
-            } // row/box
-
+            }
             // deal with saved row_triad_capture:
             // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
             // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
@@ -2157,21 +2195,279 @@ hidden_search:
             // (or is written into the gap 10th slot).
             row_triad_capture[0] = _mm256_shuffle_epi8(_mm256_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),shuff725to012);
             _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture[0]));
-
-            cand9_row = ~((v16us)rowbox_or8)[0] & the9thcand_row;
-            cand9_box = ~((v16us)rowbox_or8)[8] & the9thcand_box;
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow+1]],  _mm256_extracti128_si256(row_triad_capture[0],1));
 
             if ( i == 72 ) {
                 break;
             }
 
-            // for the next iteration, leverage previously computed or'ed rows in head and tails.
             if ( irow < 8 ) {
-                rowbox_9th_mask[irow]   = cand9_row;
-                rowbox_9th_mask[irow+8] = cand9_box;
+                row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
+                row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
+            }
+        }   // for row Px
+
+        // boxes:
+        //
+        // Note on nomenclature:
+        // The prefix box_perp stands for the special arrangement of the box data:
+        // Just as columns are arranged perpendicular to rows, so the box_perp are
+        // arranged as perpendicular (columns as an analogy) to the box representation
+        // in their canonical sequence of cells (rows as an analogy).
+        // One representation of box cells could be transposed into the other,
+        // in the same manner rows and columns can be transposed.
+        // This whole section follows step by step the algorithm applied to columns
+        // above, which is much easier to grasp.
+        {
+            __m256i box_perp_or_tails[9];
+            __m256i box_perp_or_head = _mm256_setzero_si256();
+            __m256i box_perp_cand_or = _mm256_setzero_si256();
+            // save the loaded 'rows':
+            __m256i box_perp_rows[9];
+
+            {
+                box_perp_or_tails[8] = _mm256_setzero_si256();
+                // box 'columns' alias box_perp 'rows'
+                // to start, we simply tally the or'ed box_perp 'rows'
+            
+                // A2 (box_perps)
+                // precompute 'tails' of the or'ed box_perp_cand_or only once
+                // working backwords
+                unsigned short *candp = candidates;
+
+                __m256i box_perp_0 = box_perp_rows[0] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
+                                                                   candp[27], candp[30],candp[33],
+                                                                   candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
+                candp += 20;
+                for ( unsigned char j = 8; j > 0; candp -= box_perp_ind_incr[--j]) {
+                    // the box_perp 'row' for later, at the price of 9 __m256i... 
+                    box_perp_rows[j] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
+                                                          candp[27], candp[30],candp[33],
+                                                          candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
+                    box_perp_or_tails[j-1] = box_perp_cand_or = _mm256_or_si256(box_perp_cand_or, box_perp_rows[j]);
+                }
+                // or in box_perp[0] and check whether all digits or covered
+                if ( check_back && !_mm256_testz_si256(mask9x1ff, _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_0), mask9x1ff)) ) {
+                    // the current grid has no solution, go back
+                    if ( verbose != VNone ) {
+                        __m256i missing = _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_rows[0]), mask9x1ff);
+                        unsigned int m  = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
+                        int idx = __tzcnt_u32(m)>>1;
+                        unsigned short digit = ((__v16hu)missing)[idx];
+                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, back track - box %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
+                            }
+                        } else if ( debug ) {
+                            printf("back track - missing digit %d in box %d\n", __tzcnt_u16(digit)+1, idx);
+                        }
+                    }
+                    goto back;
+                }
+
+                for (unsigned int j = 0; j < 9; j++ ) {
+                    // computing the bitmask of unlocked box cells is too expensive,
+                    // instead mask out all singles (which are necessarily locked).
+                    __m256i box_perp_j_singles = _mm256_cmpeq_epi16(_mm256_and_si256(box_perp_rows[j], _mm256_sub_epi16(box_perp_rows[j], ones)), _mm256_setzero_si256());
+                    box_perp_cand_or = _mm256_or_si256(box_perp_or_tails[j], box_perp_cand_or);
+                    unsigned int mask = compress_epi16_boolean<false>(_mm256_andnot_si256(box_perp_j_singles, _mm256_cmpgt_epi16(mask9x1ff, box_perp_cand_or)));
+                    if ( mask) {
+                        int idx = __tzcnt_u32(mask);
+                        // idx gives us the box and j gives us the cell within the box.
+                        e_i = box_start_by_boxindex[idx] + box_offset[j];
+                        e_digit = 0x1ff & ~((v16us)box_perp_cand_or)[idx];
+                        if ( check_back && (e_digit & (e_digit-1)) ) {
+                            if ( verbose != VNone ) {
+                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                    if ( warnings != 0 ) {
+                                        printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
+                                    }
+                                } else if ( debug ) {
+                                    printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
+                                }
+                            }
+                            goto back;
+                        }
+                        if ( verbose == VDebug ) {
+                            printf("hidden single (box)");
+                        }
+                        goto enter;
+                    }
+
+                    if ( j == 8 ) {
+                        break;
+                    }
+
+                    // leverage previously computed or'ed box_perp 'rows' in head and tails.
+                    box_perp_cand_or = box_perp_or_head = _mm256_or_si256(box_perp_rows[j], box_perp_or_head);            
+                }
+            }
+        }
+
+        // 9th row
+        {
+            __m128i c = *(__m128i_u*) &candidates[72];
+
+            unsigned short the9thcand_row = candidates[80];
+
+            __m128i row_or7 = _mm_setzero_si128();
+            __m128i row_or8;
+            __m128i row_9th_elem = _mm_set1_epi16(the9thcand_row);
+
+            __m128i row_triad_capture[2];
+            {
+                __m128i c_ = c;
+                // A2 and A3.1.b
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                row_triad_capture[0] = _mm_or_si128(row_or7, row_9th_elem);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
+                row_triad_capture[1] = row_or7 = _mm_or_si128(c_, row_or7);
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
+                    // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                    c_ = _mm_alignr_epi8(c_, c_, 2);
+                    row_or7 = _mm_or_si128(c_, row_or7);
+                }
+
+                row_or8 = _mm_or_si128(c, row_or7);
+                // test row_or8 | row_9th_elem to hold all the digits
+                if ( check_back ) {
+                    if ( !_mm_testz_si128(_mm256_castsi256_si128(mask1ff),_mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff)))) {
+                        // the current grid has no solution, go back
+                        if ( verbose != VNone ) {
+                            __m128i missing = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff));
+                            unsigned int m = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_setzero_si128(), missing));
+                            //  unsigned char s_idx = __tzcnt_u32(m)>>1;
+                            unsigned short digit = ((__v8hu)missing)[(m & 0xffff)?8:0];
+                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - row %d misses digit %d\n", line, 8, __tzcnt_u16(digit)+1);
+                                }
+                            } else if ( debug ) {
+                                printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, 8);
+                            }
+                        }
+                        goto back;
+                    }
+                }
             }
 
-        }   // for
+            // hidden singles in row 9
+            __m128i row_mask = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or7), _mm256_castsi256_si128(mask1ff));
+            {
+                // check row (8) candidates
+
+                __m128i a = _mm_cmpgt_epi16(row_mask, _mm_setzero_si128());
+                unsigned short mask = compress_epi16_boolean128<false>(a) & grid_state->unlocked.get_indexbits(72, 8);
+                if (mask) {
+                    int s_idx = __tzcnt_u32(mask);
+                    e_i = 72 + s_idx;
+                    e_digit = ((v8us)row_mask)[s_idx];
+                    // Check that the single is indeed a single
+                    if ( __popcnt16(e_digit) == 1 ) {
+                        if ( verbose == VDebug ) {
+                            printf("hidden single (row)");
+                        }
+                        goto enter;
+                    } else {
+                        if ( verbose != VNone ) {
+                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                                if ( warnings != 0 ) {
+                                    printf("Line %d: stack 0, back track - row cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
+                                }
+                            } else if ( debug ) {
+                                printf("back track - multiple hidden singles in row cell %s\n", cl2txt[e_i]);
+                            }
+                        }
+                        e_digit = 0;
+                        goto back;
+                    }
+                }
+            } // row
+
+            // deal with saved row_triad_capture:
+            // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
+            // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
+            // Blend the two captured vectors to contain all three triads in pos 7, 2 and 5
+            // shuffle the triads from pos 7,2,5 into pos 0,1,2
+            // spending 3 instructions on this: blend, shuffle, storeu
+            // a 'random' 4th unsigned short is overwritten by the next triad store
+            // (or is written into the gap 10th slot).
+            row_triad_capture[0] = _mm_shuffle_epi8(_mm_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20), _mm256_castsi256_si128(shuff725to012));
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[8]], row_triad_capture[0]);
+
+            cand80_row = ~((v8us)row_or8)[0] & the9thcand_row;
+
+        } // row R9
+
+        // check saved row singleton candidates (9th column)
+
+        unsigned int mask = _mm_movemask_epi8(_mm_cmpgt_epi16((__m128i)row_9th_cand_vert, _mm_setzero_si128()));
+        while (mask) {
+            int s_idx = __tzcnt_u32(mask) >> 1;
+            unsigned char celli = s_idx*9+8;
+            unsigned short cand = ((v8us)row_9th_cand_vert)[s_idx];
+            if ( ((bit128_t*)unlocked)->check_indexbit(celli) ) {
+                // check for a single.
+                // This is rare as it can only occur when a wrong guess was made.
+                // the current grid has no solution, go back
+                if ( check_back && cand & (cand-1) ) {
+                    if ( verbose != VNone ) {
+                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                            if ( warnings != 0 ) {
+                                printf("Line %d: stack 0, multiple hidden singles in row cell %s\n", line, cl2txt[celli]);
+                            }
+                        } else if ( debug ) {
+                            printf("back track - multiple hidden singles in row cell %s\n", cl2txt[celli]);
+                        }
+                    }
+                    goto back;
+                }
+                if ( verbose == VDebug ) {
+                    printf("hidden single (row)");
+                }
+                e_i = celli;
+                e_digit = cand;
+                goto enter;
+            }
+            mask &= ~(3<<(s_idx<<1));
+        }
+
+        // check cell 80
+        if ( cand80_row && ((bit128_t*)unlocked)->check_indexbit(80) ) {
+            // check for a single.
+            // This is rare as it can only occur when a wrong guess was made.
+            // the current grid has no solution, go back
+            if ( check_back && (cand80_row & (cand80_row-1)) ) {
+                if ( verbose != VNone ) {
+                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
+                        if ( warnings != 0 ) {
+                            printf("Line %d: stack 0, multiple hidden singles in row cell %s\n", line, cl2txt[80]);
+                        }
+                    } else if ( debug ) {
+                        printf("back track - multiple hidden singles in row cell %s\n", cl2txt[80]);
+                    }
+                }
+                goto back;
+            }
+            if ( verbose == VDebug ) {
+                printf("hidden single (row)");
+            }
+            e_i = 80;
+            e_digit = cand80_row;
+            goto enter;
+        } // cell 80
 
         // Store all column triads sequentially, paying attention to overlap.
         //
@@ -2181,70 +2477,10 @@ hidden_search:
         // mask 5 hi triads to 0xffff, which will not trigger any checks
         _mm256_storeu_si256((__m256i *)(triad_info.col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
 
-        // check row/box 9th candidates
-        unsigned int mask = compress_epi16_boolean<true>(_mm256_cmpgt_epi16((__m256i)rowbox_9th_mask, _mm256_setzero_si256()));
-        while (mask) {
-            int s_idx = __tzcnt_u32(mask) >> 1;
-            bool is_row = s_idx < 8;
-            unsigned char celli = is_row ? s_idx*9+8 : box_start_by_boxindex[s_idx&7] + 20;
-            unsigned short cand = ((v16us)rowbox_9th_mask)[s_idx];
-            if ( ((bit128_t*)unlocked)->check_indexbit(celli) ) {
-                // check for a single.
-                // This is rare as it can only occur when a wrong guess was made.
-                // the current grid has no solution, go back
-                if ( check_back && cand & (cand-1) ) {
-                    if ( verbose != VNone ) {
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
-                            }
-                        } else if ( debug ) {
-                            printf("back track - multiple hidden singles in row/box cell %s\n", cl2txt[80]);
-                        }
-                    }
-                    goto back;
-                }
-                if ( verbose == VDebug ) {
-                    printf("hidden single (%s)", is_row?"row":"box");
-                }
-                e_i = celli;
-                e_digit = cand;
-                goto enter;
-            }
-            mask &= ~(3<<(s_idx<<1));
-        }
-
-        // cell 80 is coincidently the nineth cell of the 9th row and the 9th box
-        unsigned cand80 = cand9_row | cand9_box;
-
-        if ( cand80 && ((bit128_t*)unlocked)->check_indexbit(80) ) {
-            // check for a single.
-            // This is rare as it can only occur when a wrong guess was made.
-            // the current grid has no solution, go back
-            if ( check_back && (cand80 & (cand80-1)) ) {
-                if ( verbose != VNone ) {
-                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        if ( warnings != 0 ) {
-                            printf("Line %d: stack 0, multiple hidden singles in row/box cell %s\n", line, cl2txt[80]);
-                        }
-                    } else if ( debug ) {
-                        printf("back track - multiple hidden singles in row/box cell %s\n", cl2txt[80]);
-                    }
-                }
-                goto back;
-            }
-            if ( verbose == VDebug ) {
-                printf("hidden single (%s)", (cand80 == cand9_row) ? "row":"box");
-            }
-            e_i = 80;
-            e_digit = cand80;
-            goto enter;
-        } // cell 80
-
     } // Algo 2 and Algo 3.1
 
     { // Algo 3.2
-            // A3.2.1 (check col-triads)
+        // A3.2.1 (check col-triads)
         // just a plain old popcount, but using the knowledge that the upper byte is always 1 or 0.
 
         __m256i v1 = _mm256_loadu_si256((__m256i *)triad_info.col_triads);
@@ -2265,7 +2501,7 @@ hidden_search:
             unsigned long long tr = unlocked[0];  // col triads - set if any triad cell is unlocked
             tr |= (tr >> 9) | (tr >> 18) | (unlocked[1]<<(64-9)) | (unlocked[1]<<(64-18));
             // mimick the pattern of col_triads, i.e. a gap of 1 after each group of 9.
-            if ( bmi2_support ) {
+            if ( pext_support ) {
                 tr = _pext_u64(tr, 0x1ffLL | (0x1ffLL<<27) | (0x1ffLL<<54));
                 grid_state->triads_unlocked[Col] &= _pdep_u64(tr, (0x1ff)|(0x1ff<<10)|(0x1ff<<20));
             } else {
@@ -2707,25 +2943,25 @@ hidden_search:
             if ( __popcnt16(candidates[target]) == 3 ) {
                 unsigned char row = row_index[target];
                 unsigned short cand3 = candidates[target];
-                    unsigned short digit = 0;
-                    unsigned short mask = ((bit128_t*)unlocked)->get_indexbits(row*9,9);
-                    __m256i maskv = expand_bitvector(mask);
-                    __m256i c = _mm256_and_si256(_mm256_load_si256((__m256i*) &candidates[row*9]), maskv);
-                    while (cand3) {
-                        unsigned short canddigit = __blsi_u32(cand3);
-                        // count cells with this candidate digit:
-                        __m256i tmp = _mm256_and_si256(_mm256_set1_epi16(canddigit), c);
-                        // as a boolean
-                        tmp = _mm256_cmpeq_epi16(tmp,_mm256_setzero_si256());
-                        // need three cell, doubled bits in mask:
-                        if ( _popcnt32(~_mm256_movemask_epi8(tmp)) == 3*2 ) {
-                            digit = canddigit;
-                            break;
-                        }
-                        cand3 &= ~canddigit;
+                unsigned short digit = 0;
+                unsigned short mask = ((bit128_t*)unlocked)->get_indexbits(row*9,9);
+                __m256i maskv = expand_bitvector(mask);
+                __m256i c = _mm256_and_si256(_mm256_load_si256((__m256i*) &candidates[row*9]), maskv);
+                while (cand3) {
+                    unsigned short canddigit = __blsi_u32(cand3);
+                    // count cells with this candidate digit:
+                    __m256i tmp = _mm256_and_si256(_mm256_set1_epi16(canddigit), c);
+                    // as a boolean
+                    tmp = _mm256_cmpeq_epi16(tmp,_mm256_setzero_si256());
+                    // need three cell, doubled bits in mask:
+                    if ( _popcnt32(~_mm256_movemask_epi8(tmp)) == 3*2 ) {
+                        digit = canddigit;
+                        break;
                     }
-                    if ( digit ) {
-                        bug_count++;
+                    cand3 &= ~canddigit;
+                }
+                if ( digit ) {
+                    bug_count++;
                     if ( verbose == VDebug ) {
                         printf("bi-value universal grave pivot:");
                     }
@@ -2784,7 +3020,7 @@ Command line options:
         M  determine whether multiple solutions exist beyond the first found
     -t# set the number of threads
     -v  verify the solution
-    -w  display warning (mostly unexpected solving details for regular puzzles)
+    -w  display warnings (mostly unexpected solving details for regular puzzles)
     -x  provide some statistics
     -y  provide speed statistics only
     -#1 change base for row and column reporting from 0 to 1
@@ -2903,15 +3139,16 @@ using namespace Schoku;
         exit(0);
     }
 
-    bmi2_support = __builtin_cpu_supports("bmi2") && !__builtin_cpu_is("znver2");
+    bmi2_support = __builtin_cpu_supports("bmi2");
+    pext_support = bmi2_support && !__builtin_cpu_is("znver2");
 
     if ( debug ) {
          omp_set_num_threads(1);
          printf("debug mode requires restriction of the number of threads to 1\n");
 
          printf("BMI2 instructions %s %s\n",
-               __builtin_cpu_supports("bmi2") ? "found" : "not found",
-               bmi2_support? "and enabled" : __builtin_cpu_is("znver2")? "but use of pdep/pext instructions disabled":"");
+               bmi2_support ? "found" : "not found",
+               pext_support? "and enabled" : __builtin_cpu_is("znver2")? "but use of pdep/pext instructions disabled":"");
     }
 
 	auto starttime = std::chrono::steady_clock::now();
@@ -3005,7 +3242,7 @@ using namespace Schoku;
         // copy unsolved grid
         memcpy(output, &string_pre[i], 81);
         // add comma and newline in right place
-        output[81]  = ',';
+        output[81] = ',';
         output[163] = 10;
         // solve the grid in place
         if ( stack == 0 ) {
@@ -3078,7 +3315,7 @@ using namespace Schoku;
         printf("%10ld  puzzles entered\n", npuzzles);
         printf("%10ld  %.0lf/s  puzzles solved\n", solved_count.load(), (double)solved_count.load()/((double)duration/1000000000LL));
         if ( duration/npuzzles > 1000 ) {
-		printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+		    printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
         } else {
             printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/npuzzles));
         }
@@ -3104,7 +3341,7 @@ using namespace Schoku;
     } else if ( reporttimings ) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
         if ( duration/npuzzles > 1000 ) {
-		    printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
         } else {
             printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/npuzzles));
         }
@@ -3135,7 +3372,8 @@ namespace Schoku {
 void initializeSchoku() {
     using namespace Schoku;
 
-    bmi2_support = __builtin_cpu_supports("bmi2") && !__builtin_cpu_is("znver2");
+    bmi2_support = __builtin_cpu_supports("bmi2");
+    pext_support = bmi2_support && !__builtin_cpu_is("znver2");
     stack = (GridState*) (~0x3fll & ((unsigned long long) malloc(sizeof(GridState)*GRIDSTATE_MAX+0x40)+0x40));
     stack->stackpointer = 0;
     initialized = true;
