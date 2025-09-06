@@ -18,27 +18,36 @@
  *
  * Performance changes:
  * - full implementation of triad processing
- *   both removal of extra triad candidates and full triad set detection (with -mT)
+ *   both removal of extra triad candidates and full triad set detection
  * - process columns first in the hidden singles search to gain some performance.
  * - moved __m256i constants to the program level
  * - AVX2 implementation of reading the puzzle file and writing back the solution
  * - additional optimization to hidden single search for boxes
+ * - removed (!) naked set search
+ * - added check for BUG+1 situation
+ * - significant improvements to guesses and when no bivalues are present using
+ *   conjugate pairs.
  *
  * Functional changes:
  * - adjustments for more diversified puzzle sources (tdoku puzzle files)
  * - warnings option (-w): by default the messages and warnings are muted.
  *   With -w pertinent messages (mostly for regular rules 'surprises') are shown.
- * - mode options (-mT) to dynamically invoke features.
- * - rules options (-r[ROM]) to either assume regular puzzles rules (single solution),
- *   search for one solution, even if multiple solutions exist, or determine whether
- *   two or more solutions exist.
+ * - rules options (-r[ROM]) to either
+ *   + assume regular puzzles rules (single solution),
+ *   + search for one solution, even if multiple solutions exist, or
+ *   + determine whether two or more solutions exist.
  * - increased the maximum number of Gridstate structs to 34, as one puzzle set needed
  *   more than 28.
  * - allow for multi-line comments at the start of puzzle files
  * - disallow CR/LF (MS-DOS/Windows) line endings
- *
+ * - added compilation option to create a library version only, as well as an adaptor
+ *   for benchmaring with the tdoku framework. 
  *
  * Performance measurement and statistics:
+ * change to the meaning of 'round' in statistics:
+ *    a round is counted every time the algorithm passes all trivial parts of the algorithm:
+ *    naked and hidden singles and triads (aka 'pointing/claiming' locked candidates).
+ * added a line in statistics for boards that contain no bivalues.
  *
  * data: 17-clue sudoku (49151 puzzles)
  * CPU:  Ryzen 7 4700U
@@ -47,16 +56,17 @@
  * command options: -x puzzles.txt
  * compile options:
  *      49151  puzzles entered
- *      49151  2433977/s  puzzles solved
- *     20.2ms   410ns/puzzle  solving time
+ *      49151  2460749/s  puzzles solved
+ *     20.0ms   406ns/puzzle  solving time
  *      38596   78.53%  puzzles solved without guessing
- *      25410    0.52/puzzle  guesses
- *      16721    0.34/puzzle  back tracks
- *     218423    4.44/puzzle  digits entered and retracted
- *      26259    0.53/puzzle  'rounds'
- *     117195    2.38/puzzle  triads resolved
- *     212409    4.32/puzzle  triad updates
- *        704  bi-value universal graves detected
+ *      21584    0.43/puzzle  guesses
+ *      13497    0.27/puzzle  back tracks
+ *     170602    3.47/puzzle  digits entered and retracted
+ *      22431    0.46/puzzle  'rounds'
+ *     114468    2.33/puzzle  triads resolved
+ *     209017    4.25/puzzle  triad updates
+ *        134  board states without bivalues
+ *        709  bi-value universal graves detected
  *
  */
 #include <atomic>
@@ -199,7 +209,40 @@ union {
     }
 } bit128_t;
 
+// the following table serves to quickly identify if two positions of the same digit can view
+// each other:
+// the first byte represents 0..7 -> 0x1..0x80 of rows, then 0..7 cols and 0..7 boxes.
+// the last byte represents the nineth row, col or box, 0b0..0b111.
+//
+
+typedef
+union {
+    unsigned char u8[4];
+    unsigned int  u32;
+    // assume a single kind is indicated, return it.
+    // otherwise, the first kind will be returned.
+    inline Kind kindof() {
+        unsigned char k = _tzcnt_u32(u32)/8;
+        if ( k == 4 ) {
+            k = _tzcnt_u32(u8[3]);
+        }
+        return (Kind)k;   // 32 indicating the class is 0.
+    }
+} viewbits_t;
+
 alignas(64)
+const viewbits_t viewbits_by_i[81] = {
+  {  0x1, 0x1,  0x1,   0},  {  0x1, 0x2,  0x1,   0},  {  0x1, 0x4,  0x1,   0},  {  0x1, 0x8,  0x2,   0},  {  0x1, 0x10,  0x2,   0},  {  0x1, 0x20,  0x2,   0},  {  0x1, 0x40,  0x4,   0},  {  0x1, 0x80,  0x4,   0},  {  0x1, 0,  0x4, 0x2},
+  {  0x2, 0x1,  0x1,   0},  {  0x2, 0x2,  0x1,   0},  {  0x2, 0x4,  0x1,   0},  {  0x2, 0x8,  0x2,   0},  {  0x2, 0x10,  0x2,   0},  {  0x2, 0x20,  0x2,   0},  {  0x2, 0x40,  0x4,   0},  {  0x2, 0x80,  0x4,   0},  {  0x2, 0,  0x4, 0x2},
+  {  0x4, 0x1,  0x1,   0},  {  0x4, 0x2,  0x1,   0},  {  0x4, 0x4,  0x1,   0},  {  0x4, 0x8,  0x2,   0},  {  0x4, 0x10,  0x2,   0},  {  0x4, 0x20,  0x2,   0},  {  0x4, 0x40,  0x4,   0},  {  0x4, 0x80,  0x4,   0},  {  0x4, 0,  0x4, 0x2},
+  {  0x8, 0x1,  0x8,   0},  {  0x8, 0x2,  0x8,   0},  {  0x8, 0x4,  0x8,   0},  {  0x8, 0x8, 0x10,   0},  {  0x8, 0x10, 0x10,   0},  {  0x8, 0x20, 0x10,   0},  {  0x8, 0x40, 0x20,   0},  {  0x8, 0x80, 0x20,   0},  {  0x8, 0, 0x20, 0x2},
+  { 0x10, 0x1,  0x8,   0},  { 0x10, 0x2,  0x8,   0},  { 0x10, 0x4,  0x8,   0},  { 0x10, 0x8, 0x10,   0},  { 0x10, 0x10, 0x10,   0},  { 0x10, 0x20, 0x10,   0},  { 0x10, 0x40, 0x20,   0},  { 0x10, 0x80, 0x20,   0},  { 0x10, 0, 0x20, 0x2},
+  { 0x20, 0x1,  0x8,   0},  { 0x20, 0x2,  0x8,   0},  { 0x20, 0x4,  0x8,   0},  { 0x20, 0x8, 0x10,   0},  { 0x20, 0x10, 0x10,   0},  { 0x20, 0x20, 0x10,   0},  { 0x20, 0x40, 0x20,   0},  { 0x20, 0x80, 0x20,   0},  { 0x20, 0, 0x20, 0x2},
+  { 0x40, 0x1, 0x40,   0},  { 0x40, 0x2, 0x40,   0},  { 0x40, 0x4, 0x40,   0},  { 0x40, 0x8, 0x80,   0},  { 0x40, 0x10, 0x80,   0},  { 0x40, 0x20, 0x80,   0},  { 0x40, 0x40,    0, 0x4},  { 0x40, 0x80,    0, 0x4},  { 0x40, 0,    0, 0x6},
+  { 0x80, 0x1, 0x40,   0},  { 0x80, 0x2, 0x40,   0},  { 0x80, 0x4, 0x40,   0},  { 0x80, 0x8, 0x80,   0},  { 0x80, 0x10, 0x80,   0},  { 0x80, 0x20, 0x80,   0},  { 0x80, 0x40,    0, 0x4},  { 0x80, 0x80,    0, 0x4},  { 0x80, 0,    0, 0x6},
+  {    0, 0x1, 0x40, 0x1},  {    0, 0x2, 0x40, 0x1},  {    0, 0x4, 0x40, 0x1},  {    0, 0x8, 0x80, 0x1},  {    0, 0x10, 0x80, 0x1},  {    0, 0x20, 0x80, 0x1},  {    0, 0x40,    0, 0x5},  {    0, 0x80,    0, 0x5},  {    0, 0,    0, 0x7},
+};
+
 // not heavily used
 const unsigned char index_by_i[81][3] = {
   { 0, 0, 0},  { 0, 1, 0},  { 0, 2, 0},  { 0, 3, 1},  { 0, 4, 1},  { 0, 5, 1},  { 0, 6, 2},  { 0, 7, 2},  { 0, 8, 2},
@@ -515,6 +558,10 @@ char cl2txt[81][6] = {
 
 const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
 
+const unsigned char group4x3offsets[12] = { box_offset[0], box_offset[1], box_offset[2], 0xff,
+                                            box_offset[3], box_offset[4], box_offset[5], 0xff,
+                                            box_offset[6], box_offset[7], box_offset[8], 0xff };
+
 alignas(64)
 // general purpose / multiple locations:
 const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
@@ -583,6 +630,8 @@ const __m256i fours     = _mm256_set1_epi8 ( 4 );
 //   popcnt by nibble
 const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                            0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
+// used in make_guess
+const __m256i c0 = _mm256_set1_epi16(0xC0);
 
 // interleaved indexing for stage_bytes:
 const unsigned char stage_bytes_lu[81] = { 0, 1, 2, 3, 4, 5, 6, 7,
@@ -611,6 +660,7 @@ std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exi
 std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
 std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
 std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
+std::atomic<long> no_bivals_count(0);       // counts board states without bivalues
 bool bmi2_support = false;
 bool pext_support = false;
 
@@ -647,6 +697,12 @@ inline const __uint128_t *cast2cu128(const unsigned long long *from) {
 inline unsigned char tzcnt_and_mask(unsigned long long &mask) {
     unsigned char ret = _tzcnt_u64(mask);
     mask = _blsr_u64(mask);
+    return ret;
+}
+
+inline unsigned char tzcnt_and_mask(unsigned int &mask) {
+    unsigned char ret = _tzcnt_u32(mask);
+    mask = _blsr_u32(mask);
     return ret;
 }
 
@@ -932,7 +988,7 @@ inline void initialize_and_stage(signed char grid[81], bit128_t &digit_bits9, un
     if ( grid[80] <= '0' ) {
         unlocked.u16[5] = 1;
     }
-    updated = unlocked;
+//    updated = unlocked;
 
     bit128_t digit_bits[9] {};
 
@@ -1008,7 +1064,7 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 
     set_indices<All>(&to_update, i);
 
-    updated.u128 |= to_update.u128;
+//    updated.u128 |= to_update.u128;
     __m256i mask = _mm256_set1_epi16(~digit);
     for (unsigned char j = 0; j < 80; j += 16) {
         unsigned short m = to_update.u16[j>>4];
@@ -1047,7 +1103,6 @@ inline GridState* make_guess(TriadInfo &triad_info, bit128_t &bivalues) {
             int ti = tzcnt_and_mask(totest);
             int can_ti = ti-ti/10;   // 'canonical' triad index
             if ( __popcnt16 (wo_musts[ti]) == 2 ) {
-
                 // get and check the unlocked indexbits for the triad
                 unsigned int b;
                 if ( type == 0 ) {
@@ -1075,7 +1130,7 @@ found:
 
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
-    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+    if ( stackpointer >= GRIDSTATE_MAX-2 ) {
         fprintf(stderr, "Error: no GridState struct availabe\n");
         exit(0);
     }
@@ -1089,11 +1144,11 @@ found:
     }
     // Update candidates
     if (type == 0 ) {
-        updated.set_indexbits(0x7,off,3);
-        new_grid_state->updated.set_indexbits(7,off,3);
+//        updated.set_indexbits(0x7,off,3);
+//        new_grid_state->updated.set_indexbits(7,off,3);
     } else {
-        updated.set_indexbits(0x40201,off,19);
-        new_grid_state->updated.set_indexbits(0x40201,off,19);
+//        updated.set_indexbits(0x40201,off,19);
+//        new_grid_state->updated.set_indexbits(0x40201,off,19);
     }
 
     if ( verbose == VDebug ) {
@@ -1140,23 +1195,187 @@ found:
 //
 template<Verbosity verbose>
 inline GridState* make_guess(bit128_t &bivalues) {
-    // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
+    // Find a cell with the least candidates.
+    // For bivalues, build a score and once done, keep the highest scoring bivalue.
+    // If there are no bivalues, score trivalues.
     // Pick the candidate with the highest value as the guess.
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
 
     // Find the cell with fewest possible candidates
     unsigned char guess_index = 0;
-    unsigned char best_cnt = 16;
+    unsigned char best_index = 0xff;
+    short best_score;
+    unsigned short cands;
+    unsigned char t = bivalues.u64[0]==0 ? 1 : 0;
+    unsigned short digit;
+    unsigned short search_digit;
+    unsigned short best_digit = 0;
+    unsigned long long bivals = bivalues.u64[t];
 
-    if ( bivalues.u64[0] ) {
-        guess_index = _tzcnt_u64(bivalues.u64[0]);
-    } else if ( bivalues.u64[1] ) {
-        guess_index = _tzcnt_u64(bivalues.u64[1]) + 64;
-    } else {
-        // very unlikely
+    if ( bivals ) {
+        unsigned char cnt = 0;
+        best_score = -1;
+        while ( bivals ) {
+            unsigned char search_index = tzcnt_and_mask(bivals) + (t<<6);
+            bit128_t bv2 = { .u128= bivalues & *(bit128_t*)&big_index_lut[search_index][All][0] };
+            search_digit = 0;
+            short score = 0;
+            cands = candidates[search_index];
+            bool malus = false;
+            while ( bv2 ) {
+                unsigned char check_index = tzcnt_and_mask(bv2);
+                if ( (cands & candidates[check_index]) ) {
+                    score++;
+                    if ( cands == candidates[check_index] ) {
+                        malus = true;
+                    } else {
+                       search_digit |= cands & candidates[check_index];
+                    }
+                }
+            }
+            if ( malus ) {
+                score --;
+                if ( !search_digit ) {
+                    search_digit = cands;
+                }
+            } 
+            if ( score >= 3 ) {
+                best_index = search_index;
+                best_digit = search_digit;
+                break;
+            }
+            if ( score > best_score ) {
+                best_index = search_index;
+                best_digit = search_digit;
+                best_score = score;
+            }
+            if ( cnt++ >= 8 ) {
+                break;
+            }
+        }
+        guess_index = best_index;
+        if ( best_digit == 0 ) {
+            best_digit = candidates[guess_index];
+        }
+        digit = 0x8000 >> __lzcnt16(best_digit); 
+        return make_guess<verbose>(guess_index, digit);
+    }
+
+    // Trivalue scoring
+    //
+    // very unlikely except for very hard puzzles while under 27 cells solved.
+    // a puzzle with no bivalues is always hard - extra effort and solving algos are
+    // appropriate.
+    //
+        no_bivals_count++;
+        __m256i *box_cols = (__m256i *)(this+1);
+
+        // fudged and sideways carry-save adder
+        __m256i accu[3];
+        __m256i tmp, cpairs;
+        __m256i carry = box_cols[1];
+        accu[0] = _mm256_xor_si256(box_cols[0], carry);
+        accu[1] = _mm256_and_si256(box_cols[0], carry);
+        accu[2] = _mm256_setzero_si256();
+        for (unsigned int i=2; i<9; i++ ) {
+           carry   = box_cols[i];
+           tmp     = _mm256_xor_si256(accu[0], carry);
+           carry   = _mm256_and_si256(accu[0], carry);
+           accu[0] = tmp;
+           tmp     = _mm256_xor_si256(accu[1], carry);
+           carry   = _mm256_and_si256(accu[1], carry);
+           accu[1] = tmp;
+           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
+        }
+        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+
+        if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
+            // cpairs contains, for each box, the digits that are conjugate pairs in this box.
+
+            unsigned char boxi = 0;
+            for ( ; boxi < 9; boxi++ ) {
+                // extract the boxes conjugate pair digits
+                unsigned int dgtit = ((v16us)cpairs)[boxi];
+                unsigned short *boxp = candidates+box_start_by_boxindex[boxi];
+                unsigned char best_score = 0;
+                unsigned char score = 0;
+                unsigned char score_index;
+                unsigned char dgti;
+                __m256i box = _mm256_setr_epi64x(*(unsigned long long *)(boxp),
+                                                 *(unsigned long long *)(boxp+9),
+                                                 *(unsigned long long *)(boxp+18), 0);
+                unsigned int mskByStart[9] {};
+                unsigned short dgtByStart[9] {};
+                unsigned char pos1, pos2;
+                unsigned short dgt;
+                while ( dgtit ) {
+                    dgt  = __blsi_u32(dgtit);
+                    dgti = tzcnt_and_mask(dgtit);
+                    score = 0;
+                    unsigned int mskpos = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(box,_mm256_set1_epi16(1<<dgti)), _mm256_setzero_si256())) & 0x3f3f3f;
+                    score_index = box_start_by_boxindex[boxi];
+                    unsigned char lpos1 = _tzcnt_u32(mskpos)>>1;
+                    pos1 = group4x3offsets[lpos1];
+                    lpos1 = lpos1 - lpos1/4;
+                    pos2 = group4x3offsets[(62-__lzcnt64(mskpos))>>1];
+                    // check for hidden pair
+                    if ( mskByStart[lpos1] == mskpos ) {
+                        // this is a hidden pair, simply guess dgti in pos1
+                        // this will resolve at minimum 2 cells
+                        unsigned short cands = dgtByStart[lpos1] | dgt; 
+                        candidates[score_index+pos1] &= cands;
+                        candidates[score_index+pos2] &= cands;
+                        if ( verbose == VDebug ) {
+                            char ret[32];
+                            format_candidate_set(ret, cands);
+                            printf("hidden pair (box): %-7s %s\n", ret, cl2txt[score_index+pos1]);
+                        }
+//dbgprintf(1, "found hidden pair digit=%x in box %d, pos1=%d, lpos1=%d\n", dgti+1, boxi, pos1, lpos1);
+                        return make_guess<verbose>(score_index+pos1, dgt);
+                    }
+                    // score this conjugate pair
+                    mskByStart[lpos1] = mskpos;
+                    dgtByStart[lpos1] = dgt;
+                    if ( (viewbits_by_i[pos1].u32 & viewbits_by_i[pos2].u32 & 0x300ffff) == 0 ) {
+                        score++;
+                    }
+//                    if ( mskByStart[pos1] & mskpos) {
+//                        score++;
+//                    }
+                    score_index = box_start_by_boxindex[boxi];
+                    if ( __popcnt16(candidates[score_index+pos1]) <= 3 ) {
+                        score++;
+                        score_index += pos2;
+                    } else {
+                        if ( __popcnt16(candidates[score_index+pos2]) <= 3 ) {
+                            score++;
+                        }
+                        score_index += pos1;
+                    }
+//dbgprintf(1, "found conjugate pair digit=%x in box %d, pos1=%d, pos2=%d, score=%d\n", dgti+1, boxi, pos1, pos2, score);
+                    if ( score > best_score ) {
+                        best_index = score_index;
+                        best_score = score;
+                        best_digit = 1<<dgti;
+                    }
+                    if ( best_score >= 2 ) {
+                        break;
+                    }
+                }
+                if ( best_score >= 2 ) {
+                    break;
+                }
+            }
+
+            if ( best_index != 0xff ) {
+                return make_guess<verbose>(best_index, best_digit);
+            }
+        }
+        // find a trivalue cell if nothing else helps.
+
         unsigned char cnt;
+        unsigned char best_cnt = 16;
         unsigned char i_rel;
-            
         unsigned long long to_visit = unlocked.u64[0];
         while ( best_cnt > 3 && to_visit != 0 ) {
             i_rel = tzcnt_and_mask(to_visit);
@@ -1176,13 +1395,10 @@ inline GridState* make_guess(bit128_t &bivalues) {
                 guess_index = i_rel;
             }
         }
-    }
-
-    // Find the first candidate in this cell (lsb set)
-    // Note: using tzcnt would be equally valid; this pick is historical
-    unsigned short digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
-
-    return make_guess<verbose>(guess_index, digit);
+        // Find the first candidate in this cell (lsb set)
+        // Note: using tzcnt would be equally valid; this pick is historical
+        digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+        return make_guess<verbose>(guess_index, digit);
 }
 
 // this version of make_guess takes a cell index and digit for the guess
@@ -1191,7 +1407,7 @@ template<Verbosity verbose>
 inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
-    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+    if ( stackpointer >= GRIDSTATE_MAX-2 ) {
         fprintf(stderr, "Error: no GridState object availabe\n");
         exit(0);
     }
@@ -1202,7 +1418,7 @@ inline GridState* make_guess(unsigned char guess_index, unsigned short digit ) {
     // when we get back here to the old grid, we know the guess was wrong
     candidates[guess_index] &= ~digit;
 
-    updated.set_indexbit(guess_index);
+//    updated.set_indexbit(guess_index);
 
     if ( verbose == VDebug && (debug > 1) ) {
         char gridout[82];
@@ -1268,7 +1484,7 @@ inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned 
     commonData.current_entered_count++;
 
     set_indices<All>(&to_update, e_i);
-    grid_state->updated.u128 |= to_update.u128;
+//    grid_state->updated.u128 |= to_update.u128;
 
     // check for upcoming cells being set to 0.
     if (  (e_digit == 0x100) ? update_stage_9_bits.check_indexbit(e_i)
@@ -1382,7 +1598,7 @@ inline bool SolverData::update_candidates(bit128_t &update_stage_9_bits, unsigne
                     commonData.current_entered_count++;
 
                     set_indices<All>(&to_update, e_i);
-                    grid_state->updated.u128 |= to_update.u128;
+//                    grid_state->updated.u128 |= to_update.u128;
 
                     if (  (e_digit == 0x100) ? update_stage_9_bits.check_indexbit(e_i)
                                              : (update_stage_bytes[stage_bytes_lu[e_i]] & e_digit) ) {
@@ -1636,7 +1852,7 @@ enter:
 
         set_indices<All>(&to_update, e_i);
 
-        grid_state->updated.u128 |= to_update.u128;
+//        grid_state->updated.u128 |= to_update.u128;
 
         __m256i mask_neg = _mm256_set1_epi16(e_digit);
 
@@ -2223,7 +2439,10 @@ hidden_search:
             __m256i box_perp_or_head = _mm256_setzero_si256();
             __m256i box_perp_cand_or = _mm256_setzero_si256();
             // save the loaded 'rows':
-            __m256i box_perp_rows[9];
+            // the save location is the next gridstate, where we can find it later
+            // for searching for conjugatge pairs (just before they are overwritten there
+            // by the new gridstate):
+            __m256i *box_perp_rows = (__m256i *) (grid_state+1);
 
             {
                 box_perp_or_tails[8] = _mm256_setzero_si256();
@@ -2793,7 +3012,7 @@ hidden_search:
                         candidates[9+8+i27]  = _mm256_extract_epi16(c2, 8);
                         candidates[18+8+i27] = _mm256_extract_epi16(c3, 8);
                     }
-                    grid_state->updated.set_indexbits(m | (m<<9) | (m<<18), i*27, 27);
+//                    grid_state->updated.set_indexbits(m | (m<<9) | (m<<18), i*27, 27);
 
                 }
                 // iterate over triads to update
@@ -2836,7 +3055,7 @@ hidden_search:
             if ( type == 0 ) {
                 for ( unsigned char k=0; k<2; k++ ) {
                     if ( row_combo_tpos[k] ) {
-                        grid_state->updated.set_indexbits(row_combo_tpos[k], k*27, 27);
+//                        grid_state->updated.set_indexbits(row_combo_tpos[k], k*27, 27);
                     }
                     if ( rslvd_row_combo_tpos[k] ) {
 //                        grid_state->set23_found[Row].set_indexbits(rslvd_row_combo_tpos[k], k*27, 27);
@@ -3335,6 +3554,7 @@ using namespace Schoku;
         printf("%10lld  %6.2f/puzzle  'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  triads resolved\n", triads_resolved.load(), triads_resolved.load()/(double)solved_count.load());
         printf("%10lld  %6.2f/puzzle  triad updates\n", triad_updates.load(), triad_updates.load()/(double)solved_count.load());
+        printf("%10ld  %6.2f/puzzle  board states without bivalues\n", no_bivals_count.load(), (double)no_bivals_count.load()/(double)solved_count.load());
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
         }
