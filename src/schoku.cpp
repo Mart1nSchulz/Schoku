@@ -24,7 +24,10 @@
  * Produce a readable hint with -w in case the puzzle file may have
  * puzzles with multiple solutions counted as unsolvable.
  * Debug trace output is now running multithreaded as well!
- * new statistic details: average preset cells, average timing is now given in ns, if < 1000.
+ * new statistic details:
+ * + average preset cells, average timing is now given in ns, if < 1000.
+ * + count of board states that have no bivalue cells
+ * major changes to guess that involve bivalues and trivalues
  *
  * Performance measurement and statistics:
  * change to the meaning of 'round' in statistics:
@@ -42,13 +45,14 @@
  *      49151  2228878/s  puzzles solved
  *     21.2ms   431ns/puzzle  solving time
  *      38596   78.53%  puzzles solved without guessing
- *      25410    0.52/puzzle  guesses
- *      16721    0.34/puzzle  back tracks
- *     218423    4.44/puzzle  digits entered and retracted
- *      26259    0.53/puzzle  'rounds'
- *     117195    2.38/puzzle  triads resolved
- *     212409    4.32/puzzle  triad updates
- *        704  bi-value universal graves detected
+ *      21548    0.44/puzzle  guesses
+ *      13497    0.27/puzzle  back tracks
+ *     170602    3.47/puzzle  digits entered and retracted
+ *      22431    0.46/puzzle  'rounds'
+ *     114463    2.33/puzzle  triads resolved
+ *     209017    4.25/puzzle  triad updates
+ *        709  bi-value universal graves detected
+ *        134  board states without bivalues
  *
  * command options: -x -mfs
  * compile options: OPT_SETS OPT_FSH OPT_UQR
@@ -56,17 +60,18 @@
  *      49151  2060942/s  puzzles solved
  *     23.8ms   483ns/puzzle  solving time
  *      45509   92.59%  puzzles solved without guessing
- *       5307    0.11/puzzle  guesses
- *       2890    0.06/puzzle  back tracks
- *      39227    0.80/puzzle  digits entered and retracted
- *      26044    0.53/puzzle  'rounds'
- *     102656    2.09/puzzle  triads resolved
- *     200574    4.08/puzzle  triad updates
- *      15545    0.32/puzzle  naked sets found
- *     504663   10.27/puzzle  naked sets searched
- *       8341    0.17/puzzle  fishes updated
- *      76065    1.55/puzzle  fishes detected
- *       1014  bi-value universal graves detected
+ *       5051    0.10/puzzle  guesses
+ *       2698    0.05/puzzle  back tracks
+ *      36229    0.74/puzzle  digits entered and retracted
+ *      25720    0.52/puzzle  'rounds'
+ *     102523    2.09/puzzle  triads resolved
+ *     200282    4.07/puzzle  triad updates
+ *      15457    0.31/puzzle  naked sets found
+ *     495225   10.08/puzzle  naked sets searched
+ *       8335    0.17/puzzle  fishes updated
+ *      75043    1.53/puzzle  fishes detected
+ *       1013  bi-value universal graves detected
+ *         11  board states without bivalues
  *
  */
 #include <atomic>
@@ -254,17 +259,40 @@ union bit128_t {
     }
 } bit128_t;
 
-// isolate the strict-aliasing warning for casts from unsigned long long [2] arrays:
-inline const __uint128_t *cast2cu128(const unsigned long long *from) {
+// the following table serves to quickly identify if two positions of the same digit can view
+// each other:
+// the first byte represents 0..7 -> 0x1..0x80 of rows, then 0..7 cols and 0..7 boxes.
+// the last byte represents the nineth row, col or box, 0b0..0b111.
+//
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-	return (const __uint128_t *)from;
-#pragma GCC diagnostic pop
-
-}
+typedef
+union {
+    unsigned char u8[4];
+    unsigned int  u32;
+    // assume a single kind is indicated, return it.
+    // otherwise, the first kind will be returned.
+    inline Kind kindof() {
+        unsigned char k = _tzcnt_u32(u32)/8;
+        if ( k == 4 ) {
+            k = _tzcnt_u32(u8[3]);
+        }
+        return (Kind)k;   // 32 indicating the class is 0.
+    }
+} viewbits_t;
 
 alignas(64)
+const viewbits_t viewbits_by_i[81] = {
+  {  0x1, 0x1,  0x1,   0},  {  0x1, 0x2,  0x1,   0},  {  0x1, 0x4,  0x1,   0},  {  0x1, 0x8,  0x2,   0},  {  0x1, 0x10,  0x2,   0},  {  0x1, 0x20,  0x2,   0},  {  0x1, 0x40,  0x4,   0},  {  0x1, 0x80,  0x4,   0},  {  0x1, 0,  0x4, 0x2},
+  {  0x2, 0x1,  0x1,   0},  {  0x2, 0x2,  0x1,   0},  {  0x2, 0x4,  0x1,   0},  {  0x2, 0x8,  0x2,   0},  {  0x2, 0x10,  0x2,   0},  {  0x2, 0x20,  0x2,   0},  {  0x2, 0x40,  0x4,   0},  {  0x2, 0x80,  0x4,   0},  {  0x2, 0,  0x4, 0x2},
+  {  0x4, 0x1,  0x1,   0},  {  0x4, 0x2,  0x1,   0},  {  0x4, 0x4,  0x1,   0},  {  0x4, 0x8,  0x2,   0},  {  0x4, 0x10,  0x2,   0},  {  0x4, 0x20,  0x2,   0},  {  0x4, 0x40,  0x4,   0},  {  0x4, 0x80,  0x4,   0},  {  0x4, 0,  0x4, 0x2},
+  {  0x8, 0x1,  0x8,   0},  {  0x8, 0x2,  0x8,   0},  {  0x8, 0x4,  0x8,   0},  {  0x8, 0x8, 0x10,   0},  {  0x8, 0x10, 0x10,   0},  {  0x8, 0x20, 0x10,   0},  {  0x8, 0x40, 0x20,   0},  {  0x8, 0x80, 0x20,   0},  {  0x8, 0, 0x20, 0x2},
+  { 0x10, 0x1,  0x8,   0},  { 0x10, 0x2,  0x8,   0},  { 0x10, 0x4,  0x8,   0},  { 0x10, 0x8, 0x10,   0},  { 0x10, 0x10, 0x10,   0},  { 0x10, 0x20, 0x10,   0},  { 0x10, 0x40, 0x20,   0},  { 0x10, 0x80, 0x20,   0},  { 0x10, 0, 0x20, 0x2},
+  { 0x20, 0x1,  0x8,   0},  { 0x20, 0x2,  0x8,   0},  { 0x20, 0x4,  0x8,   0},  { 0x20, 0x8, 0x10,   0},  { 0x20, 0x10, 0x10,   0},  { 0x20, 0x20, 0x10,   0},  { 0x20, 0x40, 0x20,   0},  { 0x20, 0x80, 0x20,   0},  { 0x20, 0, 0x20, 0x2},
+  { 0x40, 0x1, 0x40,   0},  { 0x40, 0x2, 0x40,   0},  { 0x40, 0x4, 0x40,   0},  { 0x40, 0x8, 0x80,   0},  { 0x40, 0x10, 0x80,   0},  { 0x40, 0x20, 0x80,   0},  { 0x40, 0x40,    0, 0x4},  { 0x40, 0x80,    0, 0x4},  { 0x40, 0,    0, 0x6},
+  { 0x80, 0x1, 0x40,   0},  { 0x80, 0x2, 0x40,   0},  { 0x80, 0x4, 0x40,   0},  { 0x80, 0x8, 0x80,   0},  { 0x80, 0x10, 0x80,   0},  { 0x80, 0x20, 0x80,   0},  { 0x80, 0x40,    0, 0x4},  { 0x80, 0x80,    0, 0x4},  { 0x80, 0,    0, 0x6},
+  {    0, 0x1, 0x40, 0x1},  {    0, 0x2, 0x40, 0x1},  {    0, 0x4, 0x40, 0x1},  {    0, 0x8, 0x80, 0x1},  {    0, 0x10, 0x80, 0x1},  {    0, 0x20, 0x80, 0x1},  {    0, 0x40,    0, 0x5},  {    0, 0x80,    0, 0x5},  {    0, 0,    0, 0x7},
+};
+
 // not heavily used
 const unsigned char index_by_i[81][3] = {
   { 0, 0, 0},  { 0, 1, 0},  { 0, 2, 0},  { 0, 3, 1},  { 0, 4, 1},  { 0, 5, 1},  { 0, 6, 2},  { 0, 7, 2},  { 0, 8, 2},
@@ -595,6 +623,10 @@ char cl2txt[81][6] = {
 
 const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
 
+const unsigned char group4x3offsets[12] = { box_offset[0], box_offset[1], box_offset[2], 0xff,
+                                            box_offset[3], box_offset[4], box_offset[5], 0xff,
+                                            box_offset[6], box_offset[7], box_offset[8], 0xff };
+
 alignas(64)
 // general purpose / multiple locations:
 const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
@@ -656,6 +688,8 @@ const __m256i fours     = _mm256_set1_epi8 ( 4 );
 //   popcnt by nibble
 const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                            0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
+// used in make_guess
+const __m256i c0 = _mm256_set1_epi16(0xC0);
 
 #ifdef OPT_UQR
 // used in UQR processing:
@@ -695,6 +729,7 @@ std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exi
 std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
 std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
 std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
+std::atomic<long> no_bivals_count(0);       // counts board states without bivalues
 
 #if defined(OPT_UQR) || defined(OPT_FSH)
     typedef union {
@@ -789,6 +824,15 @@ bool mode_uqr=false;            // 'U', see OPT_UQR
 bool mode_fish=false;			// 'F', see OPT_FSH
 
 signed char *output;
+
+// isolate the strict-aliasing warning for casts from unsigned long long [2] arrays:
+inline const __uint128_t *cast2cu128(const unsigned long long *from) {
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+	return (const __uint128_t *)from;
+#pragma GCC diagnostic pop
+}
 
 // global debug aids
 int dbgprintfilter = 0;       // global filter mask set from env, 
@@ -1620,7 +1664,7 @@ template<Verbosity verbose, typename F>
 inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater, FILE *output) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
-    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+    if ( stackpointer >= GRIDSTATE_MAX-2 ) {
         fprintf(stderr, "Error: no GridState struct availabe\n");
         exit(0);
     }
@@ -1740,7 +1784,7 @@ found:
 
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
-    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+    if ( stackpointer >= GRIDSTATE_MAX-2 ) {
         fprintf(stderr, "Error: no GridState struct availabe\n");
         exit(0);
     }
@@ -1807,38 +1851,210 @@ found:
 //
 template<Verbosity verbose>
 inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
-    // Find a cell with the least candidates. The first cell with 2 candidates will suffice.
+    // Find a cell with the least candidates.
+    // For bivalues, build a score and once done, keep the highest scoring bivalue.
+    // If there are no bivalues, score trivalues.
     // Pick the candidate with the highest value as the guess.
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
 
     // Find the cell with fewest possible candidates
     unsigned char guess_index = 0;
-    unsigned char cnt;
-    unsigned char best_cnt = 16;
+    unsigned char best_index = 0xff;
+    short best_score;
+    unsigned short cands;
+    unsigned char t = bivalues.u64[0]==0 ? 1 : 0;
+    unsigned short digit;
+    unsigned short search_digit;
+    unsigned short best_digit = 0;
+    unsigned long long bivals = bivalues.u64[t];
 
-    if ( bivalues.u64[0] ) {
-        guess_index = _tzcnt_u64(bivalues.u64[0]);
-    } else if ( bivalues.u64[1] ) {
-        guess_index = _tzcnt_u64(bivalues.u64[1]) + 64;
-    } else {
-        // very unlikely
-        bit128_t to_visit = unlocked;
-        unsigned char i;
-        while ( best_cnt > 3 && to_visit ) {
-            i = tzcnt_and_mask(to_visit);
-            cnt = __popcnt16(candidates[i]);
-            if (cnt < best_cnt) {
-                best_cnt = cnt;
-                guess_index = i;
+    if ( bivals ) {
+        unsigned char cnt = 0;
+        best_score = -1;
+        while ( bivals ) {
+            unsigned char search_index = tzcnt_and_mask(bivals) + (t<<6);
+            bit128_t bv2 = { .u128= bivalues & *(bit128_t*)&big_index_lut[search_index][All][0] };
+            search_digit = 0;
+            short score = 0;
+            cands = candidates[search_index];
+            bool malus = false;
+            while ( bv2 ) {
+                unsigned char check_index = tzcnt_and_mask(bv2);
+                if ( (cands & candidates[check_index]) ) {
+                    score++;
+                    if ( cands == candidates[check_index] ) {
+                        malus = true;
+                    } else {
+                       search_digit |= cands & candidates[check_index];
+                    }
+                }
+            }
+            if ( malus ) {
+                score --;
+                if ( !search_digit ) {
+                    search_digit = cands;
+                }
+            } 
+            if ( score >= 3 ) {
+                best_index = search_index;
+                best_digit = search_digit;
+                break;
+            }
+            if ( score > best_score ) {
+                best_index = search_index;
+                best_digit = search_digit;
+                best_score = score;
+            }
+            if ( cnt++ >= 8 ) {
+                break;
             }
         }
+        guess_index = best_index;
+        if ( best_digit == 0 ) {
+            best_digit = candidates[guess_index];
+        }
+        digit = 0x8000 >> __lzcnt16(best_digit); 
+        return make_guess<verbose>(guess_index, digit, output);
     }
 
-    // Find the first candidate in this cell (lsb set)
-    // Note: using tzcnt would be equally valid; this pick is historical
-    unsigned short digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+    // Trivalue scoring
+    //
+    // very unlikely except for very hard puzzles while under 27 cells solved.
+    // a puzzle with no bivalues is always hard - extra effort and solving algos are
+    // appropriate.
+    //
+        no_bivals_count++;
+        __m256i *box_cols = (__m256i *)(this+1);
 
-    return make_guess<verbose>(guess_index, digit, output);
+        // fudged and sideways carry-save adder
+        __m256i accu[3];
+        __m256i tmp, cpairs;
+        __m256i carry = box_cols[1];
+        accu[0] = _mm256_xor_si256(box_cols[0], carry);
+        accu[1] = _mm256_and_si256(box_cols[0], carry);
+        accu[2] = _mm256_setzero_si256();
+        for (unsigned int i=2; i<9; i++ ) {
+           carry   = box_cols[i];
+           tmp     = _mm256_xor_si256(accu[0], carry);
+           carry   = _mm256_and_si256(accu[0], carry);
+           accu[0] = tmp;
+           tmp     = _mm256_xor_si256(accu[1], carry);
+           carry   = _mm256_and_si256(accu[1], carry);
+           accu[1] = tmp;
+           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
+        }
+        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+
+        if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
+            // cpairs contains, for each box, the digits that are conjugate pairs in this box.
+
+            unsigned char boxi = 0;
+            for ( ; boxi < 9; boxi++ ) {
+                // extract the boxes conjugate pair digits
+                unsigned int dgtit = ((v16us)cpairs)[boxi];
+                unsigned short *boxp = candidates+box_start_by_boxindex[boxi];
+                unsigned char best_score = 0;
+                unsigned char score = 0;
+                unsigned char score_index;
+                unsigned char dgti;
+                __m256i box = _mm256_setr_epi64x(*(unsigned long long *)(boxp),
+                                                 *(unsigned long long *)(boxp+9),
+                                                 *(unsigned long long *)(boxp+18), 0);
+                unsigned int mskByStart[9] {};
+                unsigned short dgtByStart[9] {};
+                unsigned char pos1, pos2;
+                unsigned short dgt;
+                while ( dgtit ) {
+                    dgt  = __blsi_u32(dgtit);
+                    dgti = tzcnt_and_mask(dgtit);
+                    score = 0;
+                    unsigned int mskpos = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(box,_mm256_set1_epi16(1<<dgti)), _mm256_setzero_si256())) & 0x3f3f3f;
+                    score_index = box_start_by_boxindex[boxi];
+                    unsigned char lpos1 = _tzcnt_u32(mskpos)>>1;
+                    pos1 = group4x3offsets[lpos1];
+                    lpos1 = lpos1 - lpos1/4;
+                    pos2 = group4x3offsets[(62-__lzcnt64(mskpos))>>1];
+                    // check for hidden pair
+                    if ( mskByStart[lpos1] == mskpos ) {
+                        // this is a hidden pair, simply guess dgti in pos1
+                        // this will resolve at minimum 2 cells
+                        unsigned short cands = dgtByStart[lpos1] | dgt; 
+                        candidates[score_index+pos1] &= cands;
+                        candidates[score_index+pos2] &= cands;
+                        if ( verbose == VDebug ) {
+                            char ret[32];
+                            format_candidate_set(ret, cands);
+                            fprintf(output, "hidden pair (box): %-7s %s\n", ret, cl2txt[score_index+pos1]);
+                        }
+//dbgprintf(1, "found hidden pair digit=%x in box %d, pos1=%d, lpos1=%d\n", dgti+1, boxi, pos1, lpos1);
+                        return make_guess<verbose>(score_index+pos1, dgt, output);
+                    }
+                    // score this conjugate pair
+                    mskByStart[lpos1] = mskpos;
+                    dgtByStart[lpos1] = dgt;
+                    if ( (viewbits_by_i[pos1].u32 & viewbits_by_i[pos2].u32 & 0x300ffff) == 0 ) {
+                        score++;
+                    }
+//                    if ( mskByStart[pos1] & mskpos) {
+//                        score++;
+//                    }
+                    score_index = box_start_by_boxindex[boxi];
+                    if ( __popcnt16(candidates[score_index+pos1]) <= 3 ) {
+                        score++;
+                        score_index += pos2;
+                    } else {
+                        if ( __popcnt16(candidates[score_index+pos2]) <= 3 ) {
+                            score++;
+                        }
+                        score_index += pos1;
+                    }
+//dbgprintf(1, "found conjugate pair digit=%x in box %d, pos1=%d, pos2=%d, score=%d\n", dgti+1, boxi, pos1, pos2, score);
+                    if ( score > best_score ) {
+                        best_index = score_index;
+                        best_score = score;
+                        best_digit = 1<<dgti;
+                    }
+                    if ( best_score >= 2 ) {
+                        break;
+                    }
+                }
+                if ( best_score >= 2 ) {
+                    break;
+                }
+            }
+
+            if ( best_index != 0xff ) {
+                return make_guess<verbose>(best_index, best_digit, output);
+            }
+        }
+        // find a trivalue cell if nothing else helps.
+
+        unsigned char cnt;
+        unsigned char best_cnt = 16;
+        unsigned char i_rel;
+        unsigned long long to_visit = unlocked.u64[0];
+        while ( best_cnt > 3 && to_visit != 0 ) {
+            i_rel = tzcnt_and_mask(to_visit);
+            cnt = __popcnt16(candidates[i_rel]);
+            if (cnt < best_cnt) {
+                best_cnt = cnt;
+                guess_index = i_rel;
+            }
+        }
+
+        to_visit = unlocked.u64[1];
+        while ( best_cnt > 3 && to_visit != 0 ) {
+            i_rel = tzcnt_and_mask(to_visit) + 64;
+            cnt = __popcnt16(candidates[i_rel]);
+            if (cnt < best_cnt) {
+                best_cnt = cnt;
+                guess_index = i_rel;
+            }
+        }
+        // Find the first candidate in this cell (lsb set)
+        // Note: using tzcnt would be equally valid; this pick is historical
+        digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+        return make_guess<verbose>(guess_index, digit, output);
 }
 
 // this version of make_guess takes a cell index and digit for the guess
@@ -1847,7 +2063,7 @@ template<Verbosity verbose>
 inline GridState* make_guess(unsigned char guess_index, unsigned short digit, FILE *output ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
-    if ( stackpointer >= GRIDSTATE_MAX-1 ) {
+    if ( stackpointer >= GRIDSTATE_MAX-2 ) {
         fprintf(stderr, "Error: no GridState object availabe\n");
         exit(0);
     }
@@ -2780,7 +2996,10 @@ hidden_search:
             __m256i box_perp_or_head = _mm256_setzero_si256();
             __m256i box_perp_cand_or = _mm256_setzero_si256();
             // save the loaded 'rows':
-            __m256i box_perp_rows[9];
+            // the save location is the next gridstate, where we can find it later
+            // for searching for conjugatge pairs (just before they are overwritten there
+            // by the new gridstate):
+            __m256i *box_perp_rows = (__m256i *) (grid_state+1);
 
             {
                 box_perp_or_tails[8] = _mm256_setzero_si256();
@@ -4370,7 +4589,7 @@ done:
                 bool dosearch = false;
 
                 // if there are exactly N cols with exclusively some of the pattern of digits, then
-                // it is a row fish pattern.
+                // it is a col fish pattern.
                 // if there are exactly N cols that have some of the pattern plus excess,
                 // then it is a row fish pattern.
                 if ( nsubs == cnt || _popcnt32(hassubs_prp_x) == cnt ) {
@@ -5905,7 +6124,7 @@ using namespace Schoku;
     }
     // lacking BMI support? unlikely!
     if ( !__builtin_cpu_supports("bmi") ) {
-        fprintf(stderr, "This program requires a CPU with the BMI instructions (such as blsr)\n");
+        fprintf(stderr, "This program requires a CPU with the ABM and BMI instructions (such as blsi/tzcnt/popcnt/lzcnt)\n");
         exit(0);
     }
 
@@ -6164,6 +6383,9 @@ using namespace Schoku;
 #endif
         if ( bug_count.load() ) {
             printf("%10ld  bi-value universal graves detected\n", bug_count.load());
+        }
+        if ( no_bivals_count.load() ) {
+            printf("%10ld  board states without bivalues\n", no_bivals_count.load());
         }
     } else if ( reporttimings ) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
