@@ -18,12 +18,25 @@
  * The schoku_9.4 branch is dedicated to exploration of new approaches to sets, guesses
  *
  * Performance changes:
- * The default performance is slightly slower, but reduces guesses.
+ * The default performance using OPT_BIVALS is slightly slower, but reduces guesses.
+ * make_guess was updated to provide scoring for bivalue and trivalue searches.
+ * This reduces guesses significantly for hard puzzles and improves speed.
+ * The statistics gathering using -x was impacting performance. This has been
+ * fixed using the OMP reduction feature instead of std::atomic counters.
+ * Very nice performance and now very close to the raw speed without stats collection.
  *
  * Functional changes:
  * OPT_TRIAD_RES is gone! This functionality is now the default.
- * OPT_BIVALS now by default processes bi-values for Y-wings, naked pairs and naked triples.
+ * OPT_BIVALS now by default processes bi-values for Y-wings, W-wings, naked pairs and naked triples.
+ * max. achievable percentage of non-guess puzzles for 17-clue sudokos is 95.63%
  * OPT_BIVALS can be turned off using -mb-
+ * The hidden single search for boxes is gone(!).
+ * The loading of the box data was slow and triad processing ensures that the hidden
+ * single will be detected via column-based hidden single search.
+ * This not only is faster, but it also equilibrates the executuion of the hidden single
+ * searches vs triad processing.  More naked singles are detected that way as well.
+ * The same can be done for the row hidden single search.
+ * For now this can be controlled via a define: USE_ROW_HIDDEN_SEARCH 
  *
  * Produce a readable hint with -w in case the puzzle file may have
  * puzzles with multiple solutions counted as unsolvable.
@@ -48,44 +61,46 @@
  * command options: -x
  * compile options: OPT_BIVALS
  *      49151    17.0/puzzle  puzzles entered and presets
- *      49151  2308957/s  puzzles solved
- *     21.3ms   433ns/puzzle  solving time
- *      41495   84.42%  puzzles solved without guessing
- *      13372    0.27/puzzle  guesses
- *       7761    0.16/puzzle  back tracks
- *     103065    2.10/puzzle  digits entered and retracted
- *      25555    0.52/puzzle  'rounds'
- *     109168    2.22/puzzle  triads resolved
- *     205206    4.18/puzzle  triad updates
- *       1892    0.04/puzzle  Y-wing updates
- *       9127    0.19/puzzle  naked sets found
- *     221171    4.50/puzzle  naked sets searched
- *        986  bi-value universal graves detected
+ *      49151  2319702/s  puzzles solved
+ *     21.2ms   431ns/puzzle  solving time
+ *      41524   84.48%  puzzles solved without guessing
+ *      13280    0.27/puzzle  guesses
+ *       7712    0.16/puzzle  back tracks
+ *     100030    2.04/puzzle  digits entered and retracted
+ *      25388    0.52/puzzle  'rounds'
+ *     355490    7.23/puzzle  triads resolved
+ *     944093   19.21/puzzle  triad updates
+ *       1834    0.04/puzzle  Y-wing updates
+ *       1768    0.04/puzzle  W-wing updates
+ *       9122    0.19/puzzle  naked sets found
+ *     219594    4.47/puzzle  naked sets searched
+ *        972  bi-value universal graves detected
  *        134  board states without bivalues
  *
  * schoku version: 0.9.4
  * command options: -x -mf
- * compile options: OPT_BIVALS OPT_SETS OPT_FSH OPT_UQR
+ * compile options: OPT_BIVALS OPT_FSH
  *      49151    17.0/puzzle  puzzles entered and presets
- *      49151  2010521/s  puzzles solved
- *     24.4ms   497ns/puzzle  solving time
- *      44894   91.34%  puzzles solved without guessing
- *       7360    0.15/puzzle  guesses
- *       4231    0.09/puzzle  back tracks
- *      58924    1.20/puzzle  digits entered and retracted
- *      27641    0.56/puzzle  'rounds'
- *     106601    2.17/puzzle  triads resolved
- *     204596    4.16/puzzle  triad updates
- *       2351    0.05/puzzle  Y-wing updates
- *       8934    0.18/puzzle  naked sets found
- *     248925    5.06/puzzle  naked sets searched
- *       8401    0.17/puzzle  fishes updated
- *      80304    1.63/puzzle  fishes detected
- *       1013  bi-value universal graves detected
+ *      49151  1759087/s  puzzles solved
+ *     23.7ms   483ns/puzzle  solving time
+ *      45111   91.78%  puzzles solved without guessing
+ *       7066    0.14/puzzle  guesses
+ *       4067    0.08/puzzle  back tracks
+ *      55898    1.16/puzzle  digits entered and retracted
+ *      27176    0.55/puzzle  'rounds'
+ *     343175    6.89/puzzle  triads resolved
+ *     931212   18.95/puzzle  triad updates
+ *       2154    0.04/puzzle  Y-wing updates
+ *       2013    0.04/puzzle  W-wing updates
+ *       8940    0.18/puzzle  naked sets found
+ *     243767    4.96/puzzle  naked sets searched
+ *       8454    0.17/puzzle  fishes updated
+ *      77678    1.58/puzzle  fishes detected
+ *       1000  bi-value universal graves avoided (BUG+1)
+ *         41  bi-value universal graves detected
  *         69  board states without bivalues
  *
  */
-#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -132,6 +147,13 @@ const char *compilation_options =
 #endif
 ""
 ;
+// USE_ROW_HIDDEN_SEARCH:
+// if set to 1, provides code to search row hidden singles.
+// if set to 0, triad processing will isolate hidden singles in their column.
+// Turning off row search is a little faster
+#ifndef USE_ROW_HIDDEN_SEARCH
+#define USE_ROW_HIDDEN_SEARCH 0
+#endif
 
 // using type v16us for the built-in vector of unsigned short[16]
 using v16us  = __v16hu;
@@ -406,6 +428,10 @@ const unsigned char index_by_kind[3][81] = {
     6, 6, 6, 7, 7, 7, 8, 8, 8
 } };
 
+    // In this section, there are several lookup tables related to triads and bands.
+    // these are to be absorbed into more comprehensive triad mapping and lookup
+    // classes, see below
+
     // Mapping of the row triads processing order to canonical order (not considering the
     // gaps every 10 elements):
     // [Note: This permutation is its own reverse, which is called an involution]
@@ -433,9 +459,343 @@ const unsigned char index_by_kind[3][81] = {
     const unsigned int bandbits_by_index[9] = {
         0x7, 0x7<<3, 0x7<<6, 0x7<<9, 0x7<<12, 0x7<<15, 0x7<<18, 0x7<<21, 0x7<<24 };
 
+const bit128_t bandbits[6] = {
+                         ((const bit128_t*)&small_index_lut[0][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[1][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[2][Row])->u128,
+                         ((const bit128_t*)&small_index_lut[3][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[4][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[5][Row])->u128,
+                         ((const bit128_t*)&small_index_lut[6][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[7][Row])->u128
+                       | ((const bit128_t*)&small_index_lut[8][Row])->u128,
+                         ((const bit128_t*)&small_index_lut[0][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[1][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[2][Col])->u128,
+                       ((const bit128_t*)&small_index_lut[3][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[4][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[5][Col])->u128,
+                       ((const bit128_t*)&small_index_lut[6][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[7][Col])->u128
+                       | ((const bit128_t*)&small_index_lut[8][Col])->u128};
+
+// for 2 conceptual triads find the third - either completing a row or col,
+// or occupying all rows/cols, or identity if the inputs are equal
+const unsigned char t3rdEl[9][9] {
+    /* 0 */   { 0, 2, 1, 6, 8, 7, 3, 5, 4 },
+    /* 1 */   { 2, 1, 0, 8, 7, 6, 5, 4, 3 },
+    /* 2 */   { 1, 0, 2, 7, 6, 8, 4, 3, 5 },
+    /* 3 */   { 6, 8, 7, 3, 5, 4, 0, 2, 1 },
+    /* 4 */   { 8, 7, 6, 5, 4, 3, 2, 1, 0 },
+    /* 5 */   { 7, 6, 8, 4, 3, 5, 1, 0, 2 },
+    /* 6 */   { 3, 5, 4, 0, 2, 1, 6, 8, 7 },
+    /* 7 */   { 5, 4, 3, 2, 1, 0, 8, 7, 6 },
+    /* 8 */   { 4, 3, 5, 1, 0, 2, 7, 6, 8 } };
+
+    // Band and triad classes, mappings and lookup tables
+    // Triads are somewhat awkward to deal with, since there are three or four different
+    // placement/ numbering schemes:
+    //
+    // 1. On the conceptual level (denoted with the letter 'c'):
+    // there is a group of 9 triads,
+    // numbered from 0..8, that can interact within that group.  These triads are arranged
+    // as three groups of three (a 3x3 matrix) and each element of the group interacts
+    // with triads of its row and the triads of its column.
+    // The Alorithm 3 deals with the interaction between these 9 elements.
+    // In addition, some operations are possible, for example for 2 elements to find a 3rd,
+    // either to complete a row or column or to complete a set of 3 elements so that
+    // all three rows and columns are covered.
+    // On this level there are only ever 9 elements.
+    // Note that there is no orientation prescribed for conceptual triads, which means
+    // that transposing in any mapping still works (for the conceptional operations).
+    //
+    // 2. On the logical level (denoted with the letter 'l'):
+    // there ar overall 27 row triads and 27 column triads.
+    // This level exists to to mentally and visual map triads from the board to this level,
+    // which means the triads are 'logically' enumerated.
+    // a horizontal band consists of 9 row triads and a vertical band consists of
+    // 9 column triads.  The row and column triads are seperately numbered:
+    //   Row N has 3 row triads 3*N .. 2*N+2. (E.g. row 0 has row triads 0..2 etc.)
+    //   The vertical column triads are number 0..8 for the first band, 9..17 for the second etc.
+    //   Col N has 3 col triads 9*I+N for I in {0..2}. (E.g. col 0 has col triads {0,9,18})
+    //
+    // 3. On the physical level, the information gathered about the triads is organized
+    //    in two sets of two arrays of 36 ushort (every 10th element is unused,
+    //    plus 6 unused elements at the end.
+    //    Whereas the col triads follow the same numbering as the logical triad numbers,
+    //    for the physical row triads their addresses are different from the logical
+    //    numbering.  The reason is the computational need to group the triads in groups
+    //    9 triads that are related in a 3x3 matrix.
+    //    In addition, for technical reasons, both row and col physical arrangements
+    //    have an empty 10th element after each 9 elements.
+    //    In terms of groups of 9 triads, given the logical numbering, there are the
+    //    following horizontal bands and their row triads:
+    //        0,  1,  2   ||    9, 10, 11  ||  18, 19, 20
+    //        3,  4,  5   ||   12, 13, 14  ||  21, 22, 23
+    //        6,  7,  8   ||   15, 16, 17  ||  24, 25, 26
+    //    For the vertical bands with volumn triads, this looks as follows:
+    //        0,  1,  2   ||    3,  4,  5  ||   6,  7,  8
+    //        9, 10, 11   ||   12, 13, 14  ||  15, 16, 17
+    //       18, 19, 20   ||   21, 22, 23  ||  24, 25, 26
+    //    Note that the column triads could have been offset by 27 in their numbers
+    //    to distiguish them from row triads, but instead the band information carries
+    //    the necessary context.
+    //    Also note that for 3x3 arrangements, for a horizontal band
+    //    the 3 triads of a row are horizontal neighbors, whereas for a vertical
+    //    band, the 3 triads of a column are vertical neighbors.
+    //
+    // You can see how the mappings get easily out of hand.
+    //
+    // To recap, underlying each band there is a group 3x3 triads, that have a
+    // conceptual relationship.
+    // In order to map these triads to anything tangible (like physical triad info,
+    // board cells etc.) it is necessary to use the band's definition and use appropriate
+    // mappings between the layers:  p <--> l <--> c
+    // That is the job of the Triad and Band classes.
+    // On the side, there are auxiliary methods/tables that will for a cell give the
+    // corresponding triads and bands, and for a given band and triad, the corresponding
+    // starting cell and iterator interval.
+    //
+const unsigned char c2l_h[3][9] = {
+    {  0,  1,  2,   3,  4,  5,   6,  7,  8 },
+    {  9, 10, 11,  12, 13, 14,  15, 16, 17 },
+    { 18, 19, 20,  21, 22, 23,  24, 25, 26 }
+};
+const unsigned char c2l_v[3][9] = {
+    {  0,  1,  2,  9, 10, 11, 18, 19, 20 },
+    {  3,  4,  5, 12, 13, 14, 21, 22, 23 },
+    {  6,  7,  8, 15, 16, 17, 24, 25, 26 }
+};
+const unsigned char l2c_h[27] = {
+    0, 1, 2,  3, 4, 5,  6, 7, 8,
+    0, 1, 2,  3, 4, 5,  6, 7, 8,
+    0, 1, 2,  3, 4, 5,  6, 7, 8,
+};
+const unsigned char p2c_h[30] = {
+    0, 1, 2,  0, 1, 2,  0, 1, 2, 0xff,
+    3, 4, 5,  3, 4, 5,  3, 4, 5, 0xff,
+    6, 7, 8,  6, 7, 8,  6, 7, 8, 0xff
+};
+const unsigned char p2c_v[30] = {
+    0, 1, 2,  0, 1, 2,  0, 1, 2, 0xff,
+    3, 4, 5,  3, 4, 5,  3, 4, 5, 0xff,
+    6, 7, 8,  6, 7, 8,  6, 7, 8, 0xff
+};
+const unsigned char l2c_v[27] = {
+    0, 1, 2,  0, 1, 2,  0, 1, 2,
+    3, 4, 5,  3, 4, 5,  3, 4, 5,
+    6, 7, 8,  6, 7, 8,  6, 7, 8
+};
+const unsigned char c2p_h[3][9] = {
+    { 0, 1, 2,  10, 11, 12,  20, 21, 22 },
+    { 3, 4, 5,  13, 14, 15,  23, 24, 25 },
+    { 6, 7, 8,  16, 17, 18,  26, 27, 28 }
+};
+const unsigned char c2p_v[3][9] = {
+    { 0, 1, 2,  10, 11, 12,  20, 21, 22 },
+    { 3, 4, 5,  13, 14, 15,  23, 24, 25 },
+    { 6, 7, 8,  16, 17, 18,  26, 27, 28 }
+};
+const unsigned char l2p_h[27] = {
+    0, 1, 2,  10, 11, 12,  20, 21, 22,
+    3, 4, 5,  13, 14, 15,  23, 24, 25,
+    6, 7, 8,  16, 17, 18,  26, 27, 28
+};
+const unsigned char l2p_v[27] = {
+    0,  1,  2,   3,  4,  5,   6,  7,  8,
+   10, 11, 12,  13, 14, 15,  16, 17, 18,
+   20, 21, 22,  23, 24, 25,  26, 27, 28
+};
+const unsigned char p2l_h[30] = {
+    0, 1, 2,   9, 10, 11,  18, 19, 20, 0xff,
+    3, 4, 5,  12, 13, 14,  21, 22, 23, 0xff,
+    6, 7, 8,  15, 16, 17,  24, 25, 26, 0xff
+};
+const unsigned char p2l_v[30] = {
+    0,  1,  2,   3,  4,  5,   6,  7,  8, 0xff,
+    9, 10, 11,  12, 13, 14,  15, 16, 17, 0xff,
+   18, 19, 20,  21, 22, 23,  24, 25, 26, 0xff
+};
+
+const unsigned char cell2l_v[81] {
+     0, 1,  2,  3,  4,  5,  6,  7,  8,
+     0, 1,  2,  3,  4,  5,  6,  7,  8,
+     0, 1,  2,  3,  4,  5,  6,  7,  8,
+     9, 10, 11, 12, 13, 14, 15, 16, 17,
+     9, 10, 11, 12, 13, 14, 15, 16, 17,
+     9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26,
+    18, 19, 20, 21, 22, 23, 24, 25, 26,
+    18, 19, 20, 21, 22, 23, 24, 25, 26
+};
+const unsigned char cell2p_v[81] {
+     0,  1,  2,  3,  4,  5,  6,  7,  8,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,
+    10, 11, 12, 13, 14, 15, 16, 17, 18,
+    10, 11, 12, 13, 14, 15, 16, 17, 18,
+    10, 11, 12, 13, 14, 15, 16, 17, 18,
+    20, 21, 22, 23, 24, 25, 26, 27, 28,
+    20, 21, 22, 23, 24, 25, 26, 27, 28,
+    20, 21, 22, 23, 24, 25, 26, 27, 28
+};
+const unsigned char cell2c_v[81] {
+    0,  1,  2,  0,  1,  2,  0,  1,  2,
+    0,  1,  2,  0,  1,  2,  0,  1,  2,
+    0,  1,  2,  0,  1,  2,  0,  1,  2,
+    3,  4,  5,  3,  4,  5,  3,  4,  5,
+    3,  4,  5,  3,  4,  5,  3,  4,  5,
+    3,  4,  5,  3,  4,  5,  3,  4,  5,
+    6,  7,  8,  6,  7,  8,  6,  7,  8,
+    6,  7,  8,  6,  7,  8,  6,  7,  8,
+    6,  7,  8,  6,  7,  8,  6,  7,  8,
+};
+
+static const char invalid_triad = 0xff;  // placeholder for invalid Triad.
+
+enum TriadType {
+    C,
+    L,
+    P
+};
+    // So here is the framework to navigate:
+template<TriadType type=L>
+struct Triad {
+    unsigned char n;
+    Triad() {};
+    inline Triad(unsigned char t) {
+        n = t;
+        assert_tt();
+    }
+    inline operator unsigned char() const { return n; }
+
+    inline void assert_tt() {
+        switch(type) {
+        case C:
+            assert(n < 9);
+            break;
+        case L:
+            assert(n < 27);
+            break;
+        case P:
+            assert(n < 29 && n != 9 && n != 19);
+            break;
+        }
+    }
+};
+
+inline Triad<C> cGet3rdEl(Triad<C> a, Triad<C> b) {
+    return Triad<C>((unsigned int)t3rdEl[a][b]);	// lookup the 3rd element from the matrix.
+}
+
+template<bool horizontal, TriadType type=L>
+inline Triad<type> cell2t(unsigned char cl) {
+    switch(type) {
+    case C:
+        if ( horizontal ) {
+            return l2c_h[cl/3];
+        } else {
+            return cell2c_v[cl];
+        }
+    case L:
+        if ( horizontal ) {
+            return cl/3;
+        } else {
+            return cell2l_v[cl];
+        }
+    case P:
+        if ( horizontal ) {
+            return l2p_h[cl/3];
+        } else {
+            return cell2p_v[cl];
+        }
+    }
+}
+
+template<bool horizontal=true>
+struct Band {
+    unsigned char n;	// 0..2
+    bool h;
+public:
+    Band() {
+        h = horizontal;
+    };
+    inline Band(unsigned char b) {
+        n = b;
+        h = horizontal;
+    }
+    inline operator unsigned char() { return n; }
+
+    inline Triad<L> c2l(Triad<C> c) {
+        unsigned char res;
+        if ( horizontal ) {
+            res = c2l_h[n][c.n];
+        } else {
+            res = c2l_v[n][c.n];
+        }
+        return res;
+    }
+    inline Triad<C> l2c(Triad<L> l) {
+        unsigned char res;
+        if ( horizontal ) {
+            res = l2c_h[l.n];
+        } else {
+            res = l2c_v[l.n];
+        }
+        return res;
+    }
+    inline Triad<P> l2p(Triad<L> l) {
+        unsigned char res;
+        assert(l<27);
+        if ( horizontal ) {
+            res = l2p_h[l.n];
+        } else {
+            res = l2p_v[l.n];
+        }
+        return res;
+    }
+    inline Triad<L> p2l(Triad<P> p) {
+        unsigned char res;
+        assert(p<29);
+        if ( horizontal ) {
+            res = p2l_h[p.n];
+        } else {
+            res = p2l_v[p.n];
+        }
+        return res;
+    }
+    inline Triad<P> c2p(Triad<C> c) {
+        unsigned char res;
+        if ( horizontal ) {
+            res = c2p_h[n][c.n];
+        } else {
+            res = c2p_v[n][c.n];
+        }
+        return res;
+    }
+    inline Triad<C> p2c(Triad<P> p) {
+        unsigned char res;
+        if ( horizontal ) {
+            res = p2c_h[p.n];
+        } else {
+            res = p2c_v[p.n];
+        }
+        return res;
+    }
+
+    inline bit128_t *get_bandbits() {
+        return &bandbits[n];
+    }
+};
+
 const unsigned char *row_index = index_by_kind[Row];
 const unsigned char *column_index = index_by_kind[Col];
 const unsigned char *box_index = index_by_kind[Box];
+
+const unsigned short bitx3_lut[8] = {
+   0x0,      0x7,      0x38,     0x3f,
+   0x1c0,    0x1c7,    0x1f8,    0x1ff
+};
 
 alignas(64)
 // this table provides the bit masks corresponding to each index and each Kind of section.
@@ -530,17 +890,6 @@ const unsigned long long big_index_lut[81][4][2] = {
 {{                0x0,    0x1ff00 }, { 0x4020100804020100,    0x10080 }, { 0x7000000000000000,    0x1c0e0 }, { 0x7020100804020100,     0xffe0 }},
 };
 
-const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
-
-const unsigned char group4x3offsets[12] = { box_offset[0], box_offset[1], box_offset[2], 0xff,
-                                            box_offset[3], box_offset[4], box_offset[5], 0xff,
-                                            box_offset[6], box_offset[7], box_offset[8], 0xff };
-
-const unsigned short bitx3_lut[8] = {
-   0x0,      0x7,      0x38,     0x3f,
-   0x1c0,    0x1c7,    0x1f8,    0x1ff
-};
-
 // For printing a cell location, use the following table.
 // It is mutable so that the 0-based representation can be made 1-based (or 'A'-based) on start-up.
 char cl2txt[81][6] = {
@@ -627,6 +976,12 @@ char cl2txt[81][6] = {
         /*  80 */  "[8,8]"
     };
 
+const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
+
+const unsigned char group4x3offsets[12] = { box_offset[0], box_offset[1], box_offset[2], 0xff,
+                                            box_offset[3], box_offset[4], box_offset[5], 0xff,
+                                            box_offset[6], box_offset[7], box_offset[8], 0xff };
+
 alignas(64)
 // general purpose / multiple locations:
 const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
@@ -689,7 +1044,14 @@ const __m256i fours     = _mm256_set1_epi8 ( 4 );
 const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                            0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
 // used in make_guess
-const __m256i c0 = _mm256_set1_epi16(0xC0);
+const __m256i shuf = _mm256_setr_epi8(0,1,6,7,12,13,2,3,8,9,14,15,4,5,10,11,0,1,6,7,12,13,2,3,8,9,14,15,4,5,10,11);
+const __m256i shuf8x32 = _mm256_setr_epi32(0,1,2,4,5,6,7,3);
+
+// used with fishes
+const __m256i mask_1ff = _mm256_setr_epi16(0x1ff, 0x1ff<<1, 0x1ff<<2, 0x1ff<<3, 0x1ff<<4, 0x1ff<<5, 0x1ff<<6, 0x1ff<<7,
+                                           0x1ff, 0x1ff<<1, 0x1ff<<2, 0x1ff<<3, 0x1ff<<4, 0x1ff<<5, 0x1ff<<6, 0x1ff<<7);
+const __m256i hrs_shifts = _mm256_setr_epi16(0x7fff, 0x8000>>1, 0x8000>>2, 0x8000>>3, 0x8000>>4, 0x8000>>5, 0x8000>>6, (unsigned)0x8000>>7,
+                                             0x7fff, 0x8000>>1, 0x8000>>2, 0x8000>>3, 0x8000>>4, 0x8000>>5, 0x8000>>6, (unsigned)0x8000>>7);
 
 #ifdef OPT_UQR
 // used in UQR processing:
@@ -705,32 +1067,70 @@ const __m256i linerotate[2] = {
                        0,1,2,3,4,5,-1,-1,10,11,12,13,8,9,-1,-1) };
 #endif
 
+class
 alignas(64)
-std::atomic<long long> past_naked_count(0); // how often do we get past the naked single serach
-std::atomic<long long> digits_entered_and_retracted(0); // to measure guessing overhead
-std::atomic<long long> triads_resolved(0);  // how many triads did we resolved
-std::atomic<long long> triad_updates(0);    // how many triads did cancel candidates
-std::atomic<long long> naked_sets_searched(0); // how many naked sets did we search for
-std::atomic<long long> naked_sets_found(0); // how many naked sets did we actually find
-std::atomic<long long> unique_rectangles_checked(0);   // how many unique rectangles were checked
-std::atomic<long long> unique_rectangles_avoided(0);   // how many unique rectangles were avoided
-std::atomic<long long> fishes_detected(0);             // how many fishes were identified
-std::atomic<long long> fishes_excluded(0);             // how many square fishes were found and excluded
-std::atomic<long long> fishes_specials_detected(0);    // how many special fish patterns were identified ((subset of fishes_detected)
-std::atomic<long long> fishes_updated(0);              // how many fishes were updated
-std::atomic<long long> fishes_specials_updated(0);     // how many special fish patterns were updated (subset of fishes_updated)
-std::atomic<long> preset_count(0);          // total presets in the puzzle
-std::atomic<long> ywing_updates(0);         // how many Y-wings were updated
-std::atomic<long> bug_count(0);             // universal grave detected
-std::atomic<long> guesses(0);               // how many guesses did it take
-std::atomic<long> trackbacks(0);            // how often did we back track
-std::atomic<long> solved_count(0);          // puzzles solved
-std::atomic<long> no_guess_cnt(0);          // how many puzzles were solved without guessing
-std::atomic<long> unsolved_count(0);        // puzzles unsolved (no solution exists)
-std::atomic<long> non_unique_count(0);      // puzzles not unique (with -u)
-std::atomic<long> not_verified_count(0);    // puzzles non verified (with -v)
-std::atomic<long> verified_count(0);        // puzzles successfully verified (with -v)
-std::atomic<long> no_bivals_count(0);       // counts board states without bivalues
+Counters {
+public:
+    long long past_naked_count;             // how often do we get past the naked single serach
+    long long digits_entered_and_retracted; // to measure guessing overhead
+    long long triads_resolved;              // how many triads did we resolved
+    long long triad_updates;                // how many triads did cancel candidates
+    long long naked_sets_searched;          // how many naked sets did we search for
+    long long naked_sets_found;             // how many naked sets did we actually find
+    long long unique_rectangles_checked;   // how many unique rectangles were checked
+    long long unique_rectangles_avoided;   // how many unique rectangles were avoided
+    long long fishes_detected;             // how many fishes were identified
+    long long fishes_excluded;             // how many square fishes were found and excluded
+    long long fishes_specials_detected;    // how many special fish patterns were identified ((subset of fishes_detected)
+    long long fishes_updated;              // how many fishes were updated
+    long long fishes_specials_updated;     // how many special fish patterns were updated (subset of fishes_updated)
+    long preset_count;                     // total presets in the puzzle
+    long ywing_updates;                    // how many Y-wings were updated
+    long wwing_updates;                    // how many W-wings were updated
+    long bug_count;                        // universal grave detected
+    long bug_plus1_count;                  // universal grave avoided (bug+1)
+    long guesses;                          // how many guesses did it take
+    long trackbacks;                       // how often did we back track
+    long solved_count;                     // puzzles solved
+    long no_guess_cnt;                     // how many puzzles were solved without guessing
+    long unsolved_count;                   // puzzles unsolved (no solution exists)
+    long non_unique_count;                 // puzzles not unique (with -u)
+    long not_verified_count;               // puzzles non verified (with -v)
+    long verified_count;                   // puzzles successfully verified (with -v)
+    long no_bivals_count;                  // counts board states without bivalues
+inline Counters &operator += (Counters &a) {
+    this->past_naked_count += a.past_naked_count;
+    this->digits_entered_and_retracted += a.digits_entered_and_retracted;
+    this->triads_resolved += a.triads_resolved;
+    this->triad_updates += a.triad_updates;
+    this->naked_sets_searched += a.naked_sets_searched;
+    this->naked_sets_found += a.naked_sets_found;  
+    this->unique_rectangles_checked += a.unique_rectangles_checked;
+    this->unique_rectangles_avoided += a.unique_rectangles_avoided;
+    this->fishes_detected += a.fishes_detected;
+    this->fishes_excluded += a.fishes_excluded;
+    this->fishes_specials_detected += a.fishes_specials_detected;
+    this->fishes_updated += a.fishes_updated;
+    this->fishes_specials_updated += a.fishes_specials_updated;
+    this->preset_count += a.preset_count;
+    this->ywing_updates += a.ywing_updates;
+    this->wwing_updates += a.wwing_updates;
+    this->bug_count += a.bug_count;
+    this->bug_plus1_count += a.bug_plus1_count;
+    this->guesses += a.guesses;
+    this->trackbacks += a.trackbacks;
+    this->solved_count += a.solved_count;
+    this->no_guess_cnt += a.no_guess_cnt;
+    this->unsolved_count += a.unsolved_count;
+    this->non_unique_count += a.non_unique_count; 
+    this->not_verified_count += a.not_verified_count;
+    this->verified_count += a.verified_count;
+    this->no_bivals_count += a.no_bivals_count;
+    return *this;
+}
+};
+
+Counters global_counters;
 
 #if defined(OPT_UQR) || defined(OPT_FSH)
     typedef union {
@@ -804,8 +1204,9 @@ int debug           = 0; // provide step by step output on the solution
 int thorough_check  = 0; // check for back tracking even if no guess was made.
 int numthreads      = 0; // if not 0, number of threads
 int warnings        = 0; // display warnings
+int report_guess_puzzles = 0; // display puzzles that did use guessing
 
-int guess_score_threhold      = 3; // could be tuned dynamically to 2 for guess-intensive test sets
+int guess_score_threshold      = 3; // could be tuned dynamically to 2 for guess-intensive test sets
 
 // puzzle rules
 typedef enum {
@@ -840,6 +1241,7 @@ inline const __uint128_t *cast2cu128(const unsigned long long *from) {
 int dbgprintfilter = 0;       // global filter mask set from env, 
 FILE * dbgprintout = stdout;
 
+__attribute__((format(printf, 2, 3)))
 int dbgprintf(int filter, const char *format...) {
     int ret = 0;
     if ( filter & dbgprintfilter ) {
@@ -853,6 +1255,14 @@ int dbgprintf(int filter, const char *format...) {
 
 inline void dump_m256i(__m256i x, const char *msg="", int filter=-1) {
     dbgprintf(filter, "%s %llx,%llx,%llx,%llx\n", msg, ((__v4du)x)[0],((__v4du)x)[1],((__v4du)x)[2],((__v4du)x)[3]);
+}
+
+inline void dump_m256i_epi16(__m256i x, const char *msg="", int filter=-1) {
+    dbgprintf(filter, "%s %x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x\n", msg, ((__v16hu)x)[0],((__v16hu)x)[1],((__v16hu)x)[2],((__v16hu)x)[3],((__v16hu)x)[4],((__v16hu)x)[5],((__v16hu)x)[6],((__v16hu)x)[7], ((__v16hu)x)[8],((__v16hu)x)[9],((__v16hu)x)[10],((__v16hu)x)[11],((__v16hu)x)[12],((__v16hu)x)[13],((__v16hu)x)[14],((__v16hu)x)[15]);
+}
+
+inline void dump_m128i_epi16(__m128i x, const char *msg="", int filter=-1) {
+    dbgprintf(filter, "%s %x,%x,%x,%x,%x,%x,%x,%x\n", msg, ((__v8hu)x)[0],((__v8hu)x)[1],((__v8hu)x)[2],((__v8hu)x)[3],((__v8hu)x)[4],((__v8hu)x)[5],((__v8hu)x)[6],((__v8hu)x)[7]);
 }
 
 inline void dump_m128i(__m128i x, const char *msg="", int filter=-1) {
@@ -1063,6 +1473,26 @@ inline __m256i andnot_get_next_lsb(__m256i lsb, __m256i &vec) {
         return get_first_lsb<size16>(vec);
 }
 
+// uncompress first eight cells from contiguous bits to one unsigned short per cell
+// The input consists of 8 times 9 bit cell (9 bytes) and each cell must therefore be isolated
+// and then shifted according to its position.
+// The last mask operation isolates the last cell with bits in the highest 9 positions,
+// leading to a possibly negative results from mulhrs, requiring the last mask operation.  
+
+inline __m128i uncompress(__m128i in) {
+        __m128i out =  _mm_and_si128(_mm256_castsi256_si128(mask_1ff),_mm_unpacklo_epi16(in, _mm_bsrli_si128(in, 1)));
+        return _mm_and_si128(_mm256_castsi256_si128(mask1ff), _mm_mulhrs_epi16(out, _mm256_castsi256_si128(hrs_shifts)));
+}
+
+// uncompress first eight cells from contiguous bits to one unsigned short per cell
+// for two inputs in hi and lo lane
+// [ beats manual loading hands down ]
+
+inline __m256i uncompress(__m256i_u in) {
+        __m256i out =  _mm256_and_si256(mask_1ff,_mm256_unpacklo_epi16(in, _mm256_bsrli_epi128(in, 1)));
+        return _mm256_and_si256(mask1ff, _mm256_mulhrs_epi16(out, hrs_shifts));
+}
+
 inline void format_candidate_set(char *ret, unsigned short candidates);
 
 // a helper function to print a sudoku board,
@@ -1271,7 +1701,9 @@ class GridState;
 
 // TriadInfo
 //
-class TriadInfo {
+class
+alignas(64)
+TriadInfo {
 public:
     unsigned short row_triads[36];            //  27 triads, in groups of 9 with a gap of 1
     unsigned short col_triads[36];            //  27 triads, in groups of 9 with a gap of 1
@@ -1288,6 +1720,7 @@ private:
     unsigned char sectionSetUnlocked[3][9];
 public:
     FILE *output;
+    Counters &counters;
 // Note that the candidate_bits_by_value also offers the opportunity to find hidden sets in rows (extensible)
 // Similar to fishes and naked sets, only those sets that are fully expressed for a digit
 // by all position bits will be found (all pairs will be found though).
@@ -1330,11 +1763,12 @@ public:
     bool bivaluesValid;
     bool cbbvsValid;
     bool sectionSetUnlockedValid[3];
+    __m256i *boxes_as_cols;   // stashed in the next grid_state
     TriadInfo triadInfo;
     unsigned char  guess_hint_index;
     unsigned short guess_hint_digit;
 
-    inline SolverData(FILE *out): output(out) {}
+    inline SolverData(Counters &counters, FILE *out): output(out), counters(counters) {}
 
     inline int printf ( const char * format, ... ) {
         va_list args;
@@ -1414,6 +1848,100 @@ public:
             cbbvsValid = true;
         }
         return candidate_bits_by_value;
+    }
+
+    // get_boxes_as_cols returns a tranposition of the candidates such that
+    // each box is represented as a column and each __m256i ('row') represents the same cell of the nine boxes.
+    // This allows for example to count digits within a box, which in return allows
+    // to identify hidden pairs within boxes.
+    inline
+    __m256i *get_boxes_as_cols(unsigned short *candidates, __m256i *p_boxes_as_cols) {
+        if ( boxes_as_cols != 0 ) {
+            return boxes_as_cols;
+        }
+        
+        boxes_as_cols = p_boxes_as_cols;
+
+// Consider this loop:
+// from each box, pick the k-th cell:
+//        unsigned short *candp = candidates;
+//        for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
+//             boxes_as_cols[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
+//                                                  candp[27], candp[30],candp[33],
+//                                                  candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
+//        }
+// Replace the above loop with the code below for efficiency:
+
+        __m128i tmp_align2; // for aligning band 2 row
+        __m128i band1, band2, band3; // to process a row from the given band
+        __m256i tmp_row;     // to combine band1 and band3;
+        __m256i tmp_align;  // for aligning tmp_row, i.e. band 1 and 3 rows
+        unsigned short *inp=candidates;
+
+        // process row 1 of each band
+        //     [6,0], [6,3],  [6,6]
+        band2 = *(__m128i_u*)(inp+27);
+        tmp_align2 = *(__m128i_u*)(inp+27+8);
+        band1 = *(__m128i_u*)inp;
+        band3 = *(__m128i_u*)(inp+54);
+        // first load the rows/cells that aren't laterally or vertically shifted (for now)
+        //     [0,0], [0,3], [0,6] - [3,0], [3,3], [3,6]
+        // --> [0,0], [0,3], [0,6] - [3,1], [3,4], [3,7]
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+8),(__m128i*)(inp+8));
+        boxes_as_cols[0] = _mm256_set_m128i(band3,_mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        
+        //     [0,1], [0,4], [0,7] - [3,1], [3,4], [3,7]
+        // --> [1,0], [1,3], [1,6] - [4,1], [4,4], [4,7] (update to destination rows)
+        boxes_as_cols[1] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [0,2], [0,5], -[0,8] - [3,2], [3,5], -[3,8]
+        // --> [2,0], [2,3], +[2,6] - [5,1], [5,4], +[5,7] (update to destination rows)
+        boxes_as_cols[2] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        // process row 2 of each band
+        band2 = *(__m128i_u*)(inp+27+9);
+        tmp_align2 = *(__m128i_u*)(inp+27+9+8);
+        band1 = *(__m128i_u*)(inp+9);
+        band3 = *(__m128i_u*)(inp+54+9);
+        //     [1,0], [1,3], [1,6] - [4,0], [4,3], [4,6]
+        // --> [3,0], [3,3], [3,6] - [3,1], [3,4], [3,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+9+8),(__m128i*)(inp+9+8));
+        boxes_as_cols[3] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        //     [1,1], [1,4], [1,7] - [4,1], [4,4], [4,7]
+        // --> [4,0], [4,3], [4,6] - [4,1], [4,4], [4,7]
+        boxes_as_cols[4] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [1,2], [1,5], -[1,8] - [4,2], [4,5], -[4,8]
+        // --> [5,0], [5,3],  [5,6] - [5,1], [5,4], +[5,7]
+        boxes_as_cols[5] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        // process row 2 of each band
+        band2 = *(__m128i_u*)(inp+27+18);
+        tmp_align2 = *(__m128i_u*)(inp+27+18+8);
+        band1 = *(__m128i_u*)(inp+18);
+        band3 = *(__m128i_u*)(inp+54+18);
+        //     [2,0], [2,3],  [2,6] - [5,0], [5,3],  [5,6]
+        // --> [6,2], [6,5], +[6,8] - [6,1], [6,4],  [6,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+18+8),(__m128i*)(inp+18+8));
+        boxes_as_cols[6] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        //     [2,1], [2,4],  [2,7] - [5,1], [5,4], [5,7]
+        // --> [7,2], [7,5], +[8,8] - [7,1], [7,4], [7,7] (update to destination rows)
+        boxes_as_cols[7] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [2,2], [2,5], -[2,8] - [5,2], [5,5], -[5,8]
+        // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
+        boxes_as_cols[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
+        boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
+        boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
+        boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
+        boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
+        boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
+        boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
+        boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
+        boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        return boxes_as_cols;
     }
 
     template<Kind kind>
@@ -1534,7 +2062,7 @@ public:
 // initialize the starting state including the puzzle.
 //
 template<Verbosity verbose>
-inline void initialize(signed char grid[81]) {
+inline void initialize(signed char grid[81], Counters &counters) {
     unlocked.u64[1] = 0;
     flags = 0;
 
@@ -1558,8 +2086,8 @@ inline void initialize(signed char grid[81]) {
 
     bit128_t locked = { .u128 = ~unlocked.u128 };
     locked.u64[1] &= 0x1ffff;
-    if ( verbose != VNone && reportstats ) {
-        preset_count += locked.popcount();
+    if ( verbose != VNone ) {
+        counters.preset_count += locked.popcount();
     }
 
     // Grouping the updates by digit beats other methods for number of clues >17.
@@ -1663,7 +2191,7 @@ public:
 // Due to its overhead, it is not the fastest, but the most flexible form to make a guess.
 //
 template<Verbosity verbose, typename F>
-inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater, FILE *output) {
+inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater, Counters &counters, FILE *output) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
     if ( stackpointer >= GRIDSTATE_MAX-2 ) {
@@ -1714,7 +2242,7 @@ inline GridState* make_guess(unsigned char cell_index, F &&gridUpdater, FILE *ou
                    new_grid_state->stackpointer, gridout);
         }
     }
-    guesses++;
+    counters.guesses++;
 
     return new_grid_state;
 }
@@ -1773,13 +2301,8 @@ inline GridState* make_guess(SolverData *solverData) {
         }
     }
 
-    // leverage any guess hints (e.g. by the fish algorithm)
-    if ( solverData->guess_hint_digit != 0 ) {
-        return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->output);
-    }
-
     // if no suitable triad found, find a suitable bi-value.
-    return make_guess<verbose>(solverData->getBivalues(candidates), solverData->output);
+    return make_guess<verbose>(*solverData);
 found:
     // update the current and the new grid_state with their respective candidate to delete
     unsigned short select_cand = 0x8000 >> __lzcnt16(*wo_musts);
@@ -1844,7 +2367,7 @@ found:
                    new_grid_state->stackpointer, gridout);
         }
     }
-    guesses++;
+    solverData->counters.guesses++;
 
     return new_grid_state;
 }
@@ -1852,7 +2375,7 @@ found:
 // this version of make_guess is the simplest and original form of making a guess.
 //
 template<Verbosity verbose>
-inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
+inline GridState* make_guess(SolverData &solverData) {
     // Find a cell with the least candidates.
     // For bivalues, build a score and once done, keep the highest scoring bivalue.
     // If there are no bivalues, score trivalues.
@@ -1860,6 +2383,9 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
 
     // Find the cell with fewest possible candidates
+    bit128_t &bivalues = solverData.getBivalues(candidates);
+    Counters &counters = solverData.counters;
+    FILE *output = solverData.output;
     unsigned char guess_index = 0;
     unsigned char best_index = 0xff;
     short best_score;
@@ -1873,11 +2399,12 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
     if ( bivals ) {
         unsigned char cnt = 0;
         best_score = -1;
+        short score = 0;
         while ( bivals ) {
             unsigned char search_index = tzcnt_and_mask(bivals) + (t<<6);
             bit128_t bv2 = { .u128= bivalues & *(bit128_t*)&big_index_lut[search_index][All][0] };
             search_digit = 0;
-            short score = 0;
+            score = 0;
             cands = candidates[search_index];
             bool malus = false;
             while ( bv2 ) {
@@ -1897,7 +2424,7 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
                     search_digit = cands;
                 }
             }
-            if ( score >= guess_score_threhold ) {
+            if ( score >= guess_score_threshold ) {
                 best_index = search_index;
                 best_digit = search_digit;
                 break;
@@ -1911,32 +2438,37 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
                 break;
             }
         }
+
+        // leverage any guess hints (e.g. by the fish algorithm)
+        if ( solverData.guess_hint_digit != 0 && score < guess_score_threshold ) {
+            return make_guess<verbose>(solverData.guess_hint_index, solverData.guess_hint_digit, solverData.counters, solverData.output);
+        }
+
         guess_index = best_index;
         if ( best_digit == 0 ) {
             best_digit = candidates[guess_index];
         }
         digit = 0x8000 >> __lzcnt16(best_digit); 
-        return make_guess<verbose>(guess_index, digit, output);
+        return make_guess<verbose>(guess_index, digit, counters, output);
     }
 
-    // Trivalue scoring
-    //
-    // very unlikely except for very hard puzzles while under 27 cells solved.
-    // a puzzle with no bivalues is always hard - extra effort and solving algos are
-    // appropriate.
-    //
-        no_bivals_count++;
-        __m256i *box_cols = (__m256i *)(this+1);
+    if ( verbose != VNone ) {
+        counters.no_bivals_count++;
+    }
+
+    {
+
+        __m256i *boxes_as_cols = solverData.get_boxes_as_cols(candidates, (__m256i*)(this+1));
 
         // fudged and sideways carry-save adder
         __m256i accu[3];
         __m256i tmp, cpairs;
-        __m256i carry = box_cols[1];
-        accu[0] = _mm256_xor_si256(box_cols[0], carry);
-        accu[1] = _mm256_and_si256(box_cols[0], carry);
+        __m256i carry = boxes_as_cols[1];
+        accu[0] = _mm256_xor_si256(boxes_as_cols[0], carry);
+        accu[1] = _mm256_and_si256(boxes_as_cols[0], carry);
         accu[2] = _mm256_setzero_si256();
         for (unsigned int i=2; i<9; i++ ) {
-           carry   = box_cols[i];
+           carry   = boxes_as_cols[i];
            tmp     = _mm256_xor_si256(accu[0], carry);
            carry   = _mm256_and_si256(accu[0], carry);
            accu[0] = tmp;
@@ -1992,8 +2524,10 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
                             format_candidate_set(ret, cands);
                             fprintf(output, "hidden pair (box): %-7s %s\n", ret, cl2txt[score_index+pos1]);
                         }
-//dbgprintf(1, "found hidden pair digit=%x in box %d, pos1=%d, lpos1=%d\n", dgti+1, boxi, pos1, lpos1);
-                        return make_guess<verbose>(score_index+pos1, dgt, output);
+                        if ( verbose != VNone ) {
+                            counters.naked_sets_found++;
+                        }
+                        return make_guess<verbose>(score_index+pos1, dgt, counters, output);
                     }
                     // score this conjugate pair
                     mskByStart[lpos1] = mskpos;
@@ -2001,9 +2535,6 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
                     if ( (viewbits_by_i[pos1].u32 & viewbits_by_i[pos2].u32 & 0x300ffff) == 0 ) {
                         score++;
                     }
-//                    if ( mskByStart[pos1] & mskpos) {
-//                        score++;
-//                    }
                     score_index = box_start_by_boxindex[boxi];
                     if ( __popcnt16(candidates[score_index+pos1]) <= 3 ) {
                         score++;
@@ -2014,7 +2545,6 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
                         }
                         score_index += pos1;
                     }
-//dbgprintf(1, "found conjugate pair digit=%x in box %d, pos1=%d, pos2=%d, score=%d\n", dgti+1, boxi, pos1, pos2, score);
                     if ( score > best_score ) {
                         best_index = score_index;
                         best_score = score;
@@ -2030,43 +2560,55 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
             }
 
             if ( best_index != 0xff ) {
-                return make_guess<verbose>(best_index, best_digit, output);
+                return make_guess<verbose>(best_index, best_digit, counters, output);
             }
         }
-        // find a trivalue cell if nothing else helps.
+    }
 
-        unsigned char cnt;
-        unsigned char best_cnt = 16;
-        unsigned char i_rel;
-        unsigned long long to_visit = unlocked.u64[0];
-        while ( best_cnt > 3 && to_visit != 0 ) {
-            i_rel = tzcnt_and_mask(to_visit);
-            cnt = __popcnt16(candidates[i_rel]);
-            if (cnt < best_cnt) {
-                best_cnt = cnt;
-                guess_index = i_rel;
-            }
-        }
+    // leverage any guess hints (e.g. by the fish algorithm)
+    if ( solverData.guess_hint_digit != 0 ) {
+        return make_guess<verbose>(solverData.guess_hint_index, solverData.guess_hint_digit, solverData.counters, solverData.output);
+    }
 
-        to_visit = unlocked.u64[1];
-        while ( best_cnt > 3 && to_visit != 0 ) {
-            i_rel = tzcnt_and_mask(to_visit) + 64;
-            cnt = __popcnt16(candidates[i_rel]);
-            if (cnt < best_cnt) {
-                best_cnt = cnt;
-                guess_index = i_rel;
-            }
+    // Trivalue scoring
+    //
+    // very unlikely except for very hard puzzles while under 27 cells solved.
+    // a puzzle with no bivalues is always hard - extra effort and solving algos are
+    // appropriate.
+    //
+
+    unsigned char cnt;
+    unsigned char best_cnt = 16;
+    unsigned char i_rel;
+    unsigned long long to_visit = unlocked.u64[0];
+    while ( best_cnt > 3 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit);
+        cnt = __popcnt16(candidates[i_rel]);
+        if (cnt < best_cnt) {
+            best_cnt = cnt;
+            guess_index = i_rel;
         }
-        // Find the first candidate in this cell (lsb set)
-        // Note: using tzcnt would be equally valid; this pick is historical
-        digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
-        return make_guess<verbose>(guess_index, digit, output);
+    }
+
+    to_visit = unlocked.u64[1];
+    while ( best_cnt > 3 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit) + 64;
+        cnt = __popcnt16(candidates[i_rel]);
+        if (cnt < best_cnt) {
+            best_cnt = cnt;
+            guess_index = i_rel;
+        }
+    }
+    // Find the first candidate in this cell (lsb set)
+    // Note: using tzcnt would be equally valid; this pick is historical
+    digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+    return make_guess<verbose>(guess_index, digit, counters, output);
 }
 
 // this version of make_guess takes a cell index and digit for the guess
 //
 template<Verbosity verbose>
-inline GridState* make_guess(unsigned char guess_index, unsigned short digit, FILE *output ) {
+inline GridState* make_guess(unsigned char guess_index, unsigned short digit, Counters &counters, FILE *output ) {
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
     if ( stackpointer >= GRIDSTATE_MAX-2 ) {
@@ -2101,7 +2643,7 @@ inline GridState* make_guess(unsigned char guess_index, unsigned short digit, FI
     }
 
     new_grid_state->enter_digit<verbose>( digit, guess_index, output);
-    guesses++;
+    counters.guesses++;
 
     if ( verbose == VDebug && (debug > 1) ) {
         unsigned short *candidates = new_grid_state->candidates;
@@ -2139,7 +2681,7 @@ inline unsigned char *SolverData::getSectionSetUnlocked(GridState &gs) {
 
 
 template <Verbosity verbose>
-Status solve(signed char grid[81], GridState stack[], int line, FILE *out = stdout) {
+Status solve(signed char grid[81], GridState stack[], int line, Counters &counters, FILE *out = stdout) {
 
     GridState *grid_state = &stack[0];
     unsigned long long *unlocked = grid_state->unlocked.u64;
@@ -2147,7 +2689,7 @@ Status solve(signed char grid[81], GridState stack[], int line, FILE *out = stdo
 
     Status status;
 
-    SolverData solverData(out);
+    SolverData solverData(counters, out);
     unsigned short current_entered_count = 81 - grid_state->unlocked.popcount();
 #ifdef OPT_UQR
     // make_guess accepts a lambda, which will use guess_message to pass along
@@ -2176,12 +2718,7 @@ Status solve(signed char grid[81], GridState stack[], int line, FILE *out = stdo
     int unique_check_mode = 0;
     bool nonunique_reported = false;
 
-    unsigned long long my_digits_entered_and_retracted = 0;
-    unsigned long long my_naked_sets_searched = 0;
-    unsigned long long my_unique_rectangles_checked = 0;
     unsigned char no_guess_incr = 1;
-
-    unsigned int my_past_naked_count = 0;
 
     if ( verbose == VDebug ) {
         candidates = grid_state->candidates;
@@ -2231,16 +2768,12 @@ back:
             if ( warnings != 0 ) {
                 solverData.printf("Line %d: No %ssolution found!\n", line, rules==Regular?"unique " : "");
             }
-            unsolved_count++;
+            counters.unsolved_count++;
         }
         // cleanup and return
         if ( verbose != VNone && reportstats ) {
-            past_naked_count += my_past_naked_count;
-            naked_sets_searched += my_naked_sets_searched;
-            digits_entered_and_retracted += my_digits_entered_and_retracted;
-            unique_rectangles_checked += my_unique_rectangles_checked;
             if ( status.unique == false ) {
-                non_unique_count++;
+                counters.non_unique_count++;
             }
         }
         if ( !unique_check_mode ) {
@@ -2254,7 +2787,7 @@ back:
 
     // collect some guessing stats
     if ( verbose != VNone && reportstats ) {
-        my_digits_entered_and_retracted +=
+        counters.digits_entered_and_retracted +=
             (_popcnt64((grid_state-1)->unlocked.u64[0] & ~grid_state->unlocked.u64[0]))
           + (_popcnt32((grid_state-1)->unlocked.u64[1] & ~grid_state->unlocked.u64[1]));
     }
@@ -2266,7 +2799,7 @@ back:
         solverData.printf("back track to level >%d<\n", grid_state->stackpointer-1);
     }
     if ( verbose != VNone && reportstats ) {
-        trackbacks++;
+        counters.trackbacks++;
     }
     grid_state--;
 
@@ -2505,8 +3038,8 @@ enter:
                     if ( verbose != VNone ) {
                         solverData.printf("Line %d: solution to puzzle failed verification\n", line);
                     }
-                    unsolved_count++;
-                    not_verified_count++;
+                    counters.unsolved_count++;
+                    counters.not_verified_count++;
                 } else {     // not supposed to get here
                     if ( verbose != VNone ) {
                         solverData.printf("Line %d: secondary puzzle solution failed verification\n", line);
@@ -2519,14 +3052,14 @@ enter:
                 status.verified = true;
                 if ( reportstats ) {
                     if ( unique_check_mode == 0 ) {
-                        verified_count++;
+                        counters.verified_count++;
                     }
                 }
             }
         }
         if ( verbose != VNone && reportstats ) {
             if ( unique_check_mode == 0 ) {
-                solved_count++;
+                counters.solved_count++;
             }
         }
         
@@ -2553,12 +3086,15 @@ enter:
             grid[80] = '1'+_tzcnt_u32(candidates[80]);
         }
 
-        if ( verbose != VNone && reportstats ) {
-            no_guess_cnt += no_guess_incr;
+        if ( verbose != VNone ) {
+            counters.no_guess_cnt += no_guess_incr;
+        }
+        if ( report_guess_puzzles && no_guess_incr==0 ) {
+            solverData.printf("%d %.81s\n", line, grid-82);
         }
         status.guess = no_guess_incr?false:true;
 
-        if ( grid_state->stackpointer && rules == Multiple && grid_state->flags >= 0 ) {
+        if ( grid_state->stackpointer && rules == Multiple && unique_check_mode == 0 && grid_state->flags >= 0 ) {
             if ( verbose == VDebug ) {
                 solverData.printf("Solution: %.81s\nBack track to determine uniqueness\n", grid);
             }
@@ -2566,14 +3102,8 @@ enter:
             goto back;
         }
         // otherwise uniqueness checking is complete
-        if ( verbose != VNone && reportstats ) {
-            past_naked_count += my_past_naked_count;
-            naked_sets_searched += my_naked_sets_searched;
-            digits_entered_and_retracted += my_digits_entered_and_retracted;
-            unique_rectangles_checked += my_unique_rectangles_checked;
-            if ( !status.unique ) {
-                non_unique_count++;
-            }
+        if ( status.unique == false ) {
+            counters.non_unique_count++;
         }
         return status;
     }
@@ -2585,6 +3115,7 @@ hidden_search:
     solverData.sectionSetUnlockedValid[0] = solverData.sectionSetUnlockedValid[1] = 
                                             solverData.sectionSetUnlockedValid[2] = false;
     solverData.guess_hint_digit = 0;
+    solverData.boxes_as_cols = 0;
 
     // Algorithm 2 - Find hidden singles
     // For all sections (ie. rows/columns/boxes):
@@ -2611,11 +3142,13 @@ hidden_search:
     // Broadcast the nineth cell and or it for good measure, then andnot with 0x1ff
     // to isolate the hidden singles.
     // For the nineth cell, rotate and or one last time and use just one element of the result
-    // to check the nineth cell for a hidden single.
+    // to check the nineth cell for a hidden single.  These are grouped together and then checked.
     //
     // For boxes, loading of the data is the most expensive.
-    // You can follow the 'column' approach or the 'row' approach.  The column approach
-    // performs better, although it is harder to understand.
+    // Either the 'column' approach or the 'row' approach will work.
+    // However, box hidden single search can just be eliminated, an the triad processing
+    // will just eliminate all column/row-based occurrances of the single outside of the box.
+    // This way, the expensive loading of the boxes is eliminated.
     //
     // All checks use compression to a bit vector
     //
@@ -2678,12 +3211,18 @@ hidden_search:
     //
     // Part 2 and 3 are invoked after Algorithm 2 fails to detect any hidden single.
     //
-    // col_triads consist of 9 triads per horizontal band (one vertical triad for each column);
-    // row_triads are captured 3 per row, 3 rows stacked vertically with the subsequent 3 rows
-    // offset by 3 (using the canonical numbering of row triads):
-    //    0,  1,  2,   9, 10, 11, 18, 19, 20, -
-    //    3,  4,  5,  12, 13, 14, 21, 22, 23, -
-    //    6,  7,  8,  15, 16, 17, 24, 25, 26
+    // col_triads are numbered continuously per horizontal band (one vertical triad for each column)
+    // and stored in three arrays of 10 ushort as follows:
+    //    0,  1,  2,  3,  4,  5,  6,  7,  8, -
+    //    9, 10, 11, 12, 13, 14, 15, 16, 17, -
+    //   18, 19, 20, 21, 22, 23, 24, 25, 26
+    //  
+    // row_triads are canonically naturally numbered 0, 1, 2, for the first row, 3, 4, 5 for the second
+    // and so on.  These are stored in three arrays of 10 ushort, captured 3 per row,
+    // 3 rows stacked vertically with the subsequent 3 rows offset by 3:
+    //    0,  1,  2,  9, 10, 11, 18, 19, 20, -
+    //    3,  4,  5, 12, 13, 14, 21, 22, 23, -
+    //    6,  7,  8, 15, 16, 17, 24, 25, 26
     // SIMD Triad processing requires all triads of a given band to be positioned
     // 3 horizontal triads side by side and 3 vertical triads in the same positions
     // of the two other rows.  The ordering described above satisfies this requirement.
@@ -2810,15 +3349,12 @@ hidden_search:
         // P3 P3 P3 P3 P4 P3 P3 P3 C9
         // P4 P4 P4 P4 P4 P4 P4 P4 C9
         // P4 P4 P4 P4 P4 P4 P4 P4 C9
-        // R9 R9 R9 R9 R9 R9 R9 R9 C80
+        // R9 R9 R9 R9 R9 R9 R9 R9 C9
 
         // Px: processed in pairs of rows, for their first 8 cells
-        // C9: the 9th cell of each of the first 8 rows and boxes is prepared
+        // C9: the 9th cell of each of the rows is prepared
         //     and stored in row_9th_cand_vert.  row_9th_cand_vert is then processed at the end.
-        // R9: is processed for 8 cells of each rows and boxes, the cell 80
-        //     is processed using the row and box logic and stored in cand80_row
-        //     and cand80_box
-        // C80: the value of cand80_row is examined last
+        // R9: is processed for 8 cells
 
         // The examination of each row and its cells is made up of three steps:
         // 1 - or the other values of the row
@@ -2829,9 +3365,9 @@ hidden_search:
 
         // row_9th_cand_vert cumulates the 9th row or'ed singleton candidates
         // which are processed in the end.
-        __v8hu row_9th_cand_vert;
-        // the last singleton candidate of the grid.
-        unsigned short cand80_row = 0;
+#if USE_ROW_HIDDEN_SEARCH
+        v16us row_9th_cand_vert;
+#endif
         unsigned char irow = 0;
 
         // find hidden singles in rows
@@ -2839,19 +3375,41 @@ hidden_search:
         for (unsigned char i = 0; i < 72; i += 18, irow+=2) {
             // rows, in pairs
 
-             __m256i c1 = _mm256_set_m128i(*(__m128i_u*) &candidates[i+9],
-                                           *(__m128i_u*) &candidates[i]);
+            __m256i c1 = _mm256_set_m128i(*(__m128i_u*) &candidates[i+9],
+                                          *(__m128i_u*) &candidates[i]);
 
             unsigned short the9thcand_row[2] = { candidates[i+8], candidates[i+17] };
 
             __m256i row_or7 = _mm256_setzero_si256();
+#if USE_ROW_HIDDEN_SEARCH
             __m256i row_or8;
+#endif
             __m256i row_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_row[1]),_mm_set1_epi16(the9thcand_row[0]));
 
+            __m256i row_triad_capture[2];
             {
                 __m256i c1_ = c1;
                 // A2 and A3.1.b
-                for (unsigned char j = 0; j < 7; ++j) {
+                // first lane for the row, 2nd lane for the box
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                row_triad_capture[0] = _mm256_or_si256(row_or7, row_9th);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
+                row_triad_capture[1] = row_or7 = _mm256_or_si256(c1_, row_or7);
+
+#if USE_ROW_HIDDEN_SEARCH
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                     // c1_ holds 2 lanes for two rows
                     c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
@@ -2864,14 +3422,17 @@ hidden_search:
                     if ( !_mm256_testz_si256(mask1ff,_mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff))) {
                         // the current grid has no solution, go back
                         if ( verbose != VNone ) {
+                            __m256i missing = _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff);
                             unsigned int m = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_setzero_si256(),
-                            _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff)));
+                                                                  missing));
+                            unsigned short digit = ((__v16hu)missing)[(m & 0xffff)?8:0];
+
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                                 if ( warnings != 0 ) {
-                                    solverData.printf("Line %d: stack 0, back track - row %d does not contain all digits\n", line, irow+(m & 0xffff)?0:1);
+                                    solverData.printf("Line %d: stack 0, back track - row %d does not contain digit %d\n", line, irow+(m & 0xffff)?0:1, __tzcnt_u16(digit)+1);
                                 }
                             } else if ( debug ) {
-                                solverData.printf("back track - missing digit in row %d\n", irow+(m & 0xffff)?0:1);
+                                solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, irow+((m & 0xffff)?1:0)); // XXX
                             }
                         }
                         goto back;
@@ -2907,142 +3468,25 @@ hidden_search:
                     e_digit = 0;
                     goto back;
                 }
+#endif
             }
-            if ( i == 72 ) {
-                break;
-            }
+            // deal with saved row_triad_capture:
+            // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
+            // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
+            // Blend the two captured vectors to contain all three triads in pos 7, 2 and 5
+            // shuffle the triads from pos 7,2,5 into pos 0,1,2
+            // spending 3 instructions on this: blend, shuffle, storeu
+            // a 'random' 4th unsigned short is overwritten by the next triad store
+            // (or is written into the gap 10th slot).
+            row_triad_capture[0] = _mm256_shuffle_epi8(_mm256_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),shuff725to012);
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture[0]));
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow+1]], _mm256_extracti128_si256(row_triad_capture[0],1));
 
-            if ( irow < 8 ) {
-                row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
-                row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
-            }
+#if USE_ROW_HIDDEN_SEARCH
+            row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
+            row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
+#endif
         }   // for row Px
-
-        __m256i row_triads_1, row_triads_2, row_triads_3;
-        // boxes:
-        //
-        // Note on nomenclature:
-        // The prefix box_perp stands for the special arrangement of the box data:
-        // Just as columns are arranged perpendicular to rows, so the box_perp are
-        // arranged as perpendicular (columns as an analogy) to the box representation
-        // in their canonical sequence of cells (rows as an analogy).
-        // One representation of box cells could be transposed into the other,
-        // in the same manner rows and columns can be transposed.
-        // This whole section follows step by step the algorithm applied to columns
-        // above, which is much easier to grasp.
-        {
-            __m256i box_perp_or_tails[9];
-            __m256i box_perp_or_head = _mm256_setzero_si256();
-            __m256i box_perp_cand_or = _mm256_setzero_si256();
-            // save the loaded 'rows':
-            // the save location is the next gridstate, where we can find it later
-            // for searching for conjugatge pairs (just before they are overwritten there
-            // by the new gridstate):
-            __m256i *box_perp_rows = (__m256i *) (grid_state+1);
-
-            {
-                box_perp_or_tails[8] = _mm256_setzero_si256();
-                // box 'columns' alias box_perp 'rows'
-                // to start, we simply tally the or'ed box_perp 'rows'
-            
-                // A2 (box_perps)
-                // precompute 'tails' of the or'ed box_perp_cand_or only once
-                // working backwords
-                unsigned short *candp = candidates;
-
-                // save the box_perp 'row's for later, at the price of 9 __m256i... 
-                for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
-                    box_perp_rows[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
-                                                          candp[27], candp[30],candp[33],
-                                                          candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
-                }
-                // 3 iterations, 'rows' 8, 7 and 6.
-                row_triads_3 = _mm256_setzero_si256();
-                unsigned char j = 8;
-                for ( ; j > 5; j--) {
-                    row_triads_3 = _mm256_or_si256(row_triads_3, box_perp_rows[j]);
-                    box_perp_or_tails[j-1] = row_triads_3;
-                }
-                // row_triads_3 now contains the third set of column-triads
-
-                // compute fresh row_triads_2
-                // A2 and A3.1.a
-                // 3 iterations, 'rows' 5, 4 and 3.
-                row_triads_2 = _mm256_setzero_si256();
-                for ( ; j > 2; j--) {
-                    row_triads_2 = _mm256_or_si256(row_triads_2, box_perp_rows[j]);
-                    box_perp_or_tails[j-1] = _mm256_or_si256(row_triads_2, row_triads_3);
-                }
-                // row_triads_2 now contains the second set of row-triads
-
-                // compute the remainder of the precomputed tails
-                box_perp_cand_or = box_perp_or_tails[2];
-                for ( ; j > 0; j--) {
-                    box_perp_or_tails[j-1] = box_perp_cand_or = _mm256_or_si256(box_perp_cand_or, box_perp_rows[j]);
-                }
-
-                // or in box_perp[0] and check whether all digits or covered
-                if ( check_back && !_mm256_testz_si256(mask9x1ff, _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_rows[0]), mask9x1ff)) ) {
-                    // the current grid has no solution, go back
-                    if ( verbose != VNone ) {
-                        __m256i missing = _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_rows[0]), mask9x1ff);
-                        unsigned int m  = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
-                        int idx = __tzcnt_u32(m)>>1;
-                        unsigned short digit = ((__v16hu)missing)[idx];
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                solverData.printf("Line %d: stack 0, back track - box %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
-                            }
-                        } else if ( debug ) {
-                            solverData.printf("back track - missing digit %d in box %d\n", __tzcnt_u16(digit)+1, idx);
-                        }
-                    }
-                    goto back;
-                }
-
-                for (unsigned int j = 0; j < 9; j++ ) {
-                    // computing the bitmask of unlocked box cells is too expensive,
-                    // instead mask out all singles (which are necessarily locked).
-                    __m256i box_perp_j_singles = _mm256_cmpeq_epi16(_mm256_and_si256(box_perp_rows[j], _mm256_sub_epi16(box_perp_rows[j], ones)), _mm256_setzero_si256());
-                    box_perp_cand_or = _mm256_or_si256(box_perp_or_tails[j], box_perp_cand_or);
-                    unsigned int mask = compress_epi16_boolean<false>(_mm256_andnot_si256(box_perp_j_singles, _mm256_cmpgt_epi16(mask9x1ff, box_perp_cand_or)));
-                    if ( mask) {
-                        int idx = __tzcnt_u32(mask);
-                        // idx gives us the box and j gives us the cell within the box.
-                        e_i = box_start_by_boxindex[idx] + box_offset[j];
-                        e_digit = 0x1ff & ~((v16us)box_perp_cand_or)[idx];
-                        if ( check_back && (e_digit & (e_digit-1)) ) {
-                            if ( verbose != VNone ) {
-                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    if ( warnings != 0 ) {
-                                        solverData.printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
-                                    }
-                                } else if ( debug ) {
-                                    solverData.printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
-                                }
-                            }
-                            goto back;
-                        }
-                        if ( verbose == VDebug ) {
-                            solverData.printf("hidden single (box)");
-                        }
-                        goto enter;
-                    }
-
-                    if ( j == 8 ) {
-                        break;
-                    }
-
-                    // leverage previously computed or'ed box_perp 'rows' in head and tails.
-                    box_perp_cand_or = box_perp_or_head = _mm256_or_si256(box_perp_rows[j], box_perp_or_head);            
-
-                    if ( j == 2 ) {
-                        // A3.1.c
-                        row_triads_1 = box_perp_or_head;
-                    }
-                }
-            }
-        }
 
         // 9th row
         {
@@ -3051,13 +3495,34 @@ hidden_search:
             unsigned short the9thcand_row = candidates[80];
 
             __m128i row_or7 = _mm_setzero_si128();
+#if USE_ROW_HIDDEN_SEARCH
             __m128i row_or8;
+#endif
             __m128i row_9th_elem = _mm_set1_epi16(the9thcand_row);
 
+            __m128i row_triad_capture[2];
             {
                 __m128i c_ = c;
                 // A2 and A3.1.b
-                for (unsigned char j = 0; j < 7; ++j) {
+                // first lane for the row, 2nd lane for the box
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                row_triad_capture[0] = _mm_or_si128(row_or7, row_9th_elem);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
+                row_triad_capture[1] = row_or7 = _mm_or_si128(c_, row_or7);
+#if USE_ROW_HIDDEN_SEARCH
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                     c_ = _mm_alignr_epi8(c_, c_, 2);
                     row_or7 = _mm_or_si128(c_, row_or7);
@@ -3070,9 +3535,7 @@ hidden_search:
                         // the current grid has no solution, go back
                         if ( verbose != VNone ) {
                             __m128i missing = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff));
-                            unsigned int m = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_setzero_si128(), missing));
-                            //  unsigned char s_idx = __tzcnt_u32(m)>>1;
-                            unsigned short digit = ((__v8hu)missing)[(m & 0xffff)?8:0];
+                            unsigned short digit = ((__v8hu)missing)[0];
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                                 if ( warnings != 0 ) {
                                     solverData.printf("Line %d: stack 0, back track - row %d misses digit %d\n", line, 8, __tzcnt_u16(digit)+1);
@@ -3117,19 +3580,31 @@ hidden_search:
                         goto back;
                     }
                 }
+#endif
             } // row
+            // deal with saved row_triad_capture:
+            // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
+            // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
+            // Blend the two captured vectors to contain all three triads in pos 7, 2 and 5
+            // shuffle the triads from pos 7,2,5 into pos 0,1,2
+            // spending 3 instructions on this: blend, shuffle, storeu
+            // a 'random' 4th unsigned short is overwritten by the next triad store
+            // (or is written into the gap 10th slot).
+            row_triad_capture[0] = _mm_shuffle_epi8(_mm_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),_mm256_castsi256_si128(shuff725to012));
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[8]], row_triad_capture[0]);
 
-            cand80_row = ~((v8us)row_or8)[0] & the9thcand_row;
-
+#if USE_ROW_HIDDEN_SEARCH
+            row_9th_cand_vert[8]     = ~((v8us)row_or8)[0] & the9thcand_row;
+#endif
         } // row R9
-
+#if USE_ROW_HIDDEN_SEARCH
         // check saved row singleton candidates (9th column)
 
-        unsigned int mask = _mm_movemask_epi8(_mm_cmpgt_epi16((__m128i)row_9th_cand_vert, _mm_setzero_si128()));
+        unsigned int mask = _mm256_movemask_epi8(_mm256_cmpgt_epi16((__m256i)row_9th_cand_vert, _mm256_setzero_si256())) & 0x3ffff;
         while (mask) {
             int s_idx = __tzcnt_u32(mask) >> 1;
             unsigned char celli = s_idx*9+8;
-            unsigned short cand = ((v8us)row_9th_cand_vert)[s_idx];
+            unsigned short cand = row_9th_cand_vert[s_idx];
             if ( ((bit128_t*)unlocked)->check_indexbit(celli) ) {
                 // check for a single.
                 // This is rare as it can only occur when a wrong guess was made.
@@ -3155,45 +3630,14 @@ hidden_search:
             }
             mask &= ~(3<<(s_idx<<1));
         }
-
-        // check cell 80
-        if ( cand80_row && ((bit128_t*)unlocked)->check_indexbit(80) ) {
-            // check for a single.
-            // This is rare as it can only occur when a wrong guess was made.
-            // the current grid has no solution, go back
-            if ( check_back && (cand80_row & (cand80_row-1)) ) {
-                if ( verbose != VNone ) {
-                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        if ( warnings != 0 ) {
-                            solverData.printf("Line %d: stack 0, multiple hidden singles in row cell %s\n", line, cl2txt[80]);
-                        }
-                    } else if ( debug ) {
-                        solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[80]);
-                    }
-                }
-                goto back;
-            }
-            if ( verbose == VDebug ) {
-                solverData.printf("hidden single (row)");
-            }
-            e_i = 80;
-            e_digit = cand80_row;
-            goto enter;
-        } // cell 80
-
-        // Store all column and row triads sequentially, paying attention to overlap.
+#endif
+        // Store all column triads sequentially, paying attention to overlap.
         //
         // A3.1.c
         _mm256_storeu_si256((__m256i *)triad_info.col_triads, col_triads_1);
         _mm256_storeu_si256((__m256i *)(triad_info.col_triads+10), col_triads_2);
         // mask 5 hi triads to 0xffff, which will not trigger any checks
         _mm256_storeu_si256((__m256i *)(triad_info.col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
-
-        _mm256_storeu_si256((__m256i *)triad_info.row_triads, row_triads_1);
-        _mm256_storeu_si256((__m256i *)(triad_info.row_triads+10), row_triads_2);
-        // mask 5 hi triads to 0xffff, which will not trigger any checks
-        _mm256_storeu_si256((__m256i *)(triad_info.row_triads+20), _mm256_or_si256(row_triads_3, mask11hi));
-
 
     } // Algo 2 and Algo 3.1
 
@@ -3229,6 +3673,9 @@ hidden_search:
 
         triad_info.triads_selection[Col] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, fours));
         unsigned long long m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(res, threes)) & grid_state->triads_unlocked[Col];
+        if ( verbose != VNone ) {
+            counters.triads_resolved += _popcnt64(m);
+        }
         while (m) {
             unsigned char tidx = tzcnt_and_mask(m);
             unsigned short cands_triad = triad_info.col_triads[tidx];
@@ -3242,9 +3689,6 @@ hidden_search:
             unsigned char off = tidx%10+tidx/10*27;
             grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
             grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
-            if ( verbose != VNone && reportstats ) {
-                triads_resolved++;
-            }
         }
 
         // A3.2.2 (check row-triads)
@@ -3281,6 +3725,9 @@ hidden_search:
                 continue;
             }
 
+            if ( verbose != VNone ) {
+                counters.triads_resolved++;
+            }
             if ( verbose == VDebug ) {
                 char ret[32];
                 format_candidate_set(ret, triad_info.row_triads[tidx]);
@@ -3291,9 +3738,6 @@ hidden_search:
             grid_state->triads_unlocked[Row] &= ~(1LL << tidx);
             grid_state->set23_found[Row].set_indexbits(0x7,off,3);
             grid_state->set23_found[Box].set_indexbits(0x7,off,3);
-            if ( verbose != VNone && reportstats ) {
-                triads_resolved++;
-            }
         } // while
     }   // Algo 3 Part 2
 
@@ -3515,6 +3959,9 @@ hidden_search:
 
                 }
                 // iterate over triads to update
+                if ( verbose != VNone ) {
+                     counters.triad_updates += _popcnt64(m);
+                }
                 while (m) {
                     // 1. Check for triad resolution
                     // 2. log the triad update from above
@@ -3529,8 +3976,8 @@ hidden_search:
                         } else {
                             rslvd_col_combo_tpos |= 0x40201<<i_rel;
                         }
-                        if ( verbose != VNone && reportstats ) {
-                            triads_resolved++;
+                        if ( verbose != VNone ) {
+                            counters.triads_resolved++;
                         }
                     }
                     if ( verbose == VDebug ) {
@@ -3538,9 +3985,6 @@ hidden_search:
                         format_candidate_set(ret, ((__v16hu)to_remove_v)[i_rel]);
                         solverData.printf("remove %-5s from %s triad at %s\n", ret, type == 0? "row":"col",
                                cl2txt[type==0?row_triad_canonical_map[ltidx]*3:col_canonical_triad_pos[ltidx]] );
-                    }
-                    if ( verbose != VNone && reportstats ) {
-                        triad_updates++;
                     }
                 }
                 if ( type == 1 ) {
@@ -3571,7 +4015,9 @@ hidden_search:
 
     // here we are beyond the enter/single search/triad/, on to the more complex algos,
     // so we count this as a 'round'.
-    my_past_naked_count++;
+    if ( verbose != VNone ) {
+        counters.past_naked_count++;
+    }
 
     {
         // Before making a guess,
@@ -3594,6 +4040,9 @@ hidden_search:
             int sum2 = _popcnt64(bivalues.u64[0]) + _popcnt32(bivalues.u64[1]);
             if ( sum2 == N ) {
                 grid_state->flags |= 1U<<31;	// set sign bit
+                if ( verbose != VNone ) {
+                    counters.bug_count++;
+                }
                 if ( rules != Regular ) {
                     if ( verbose == VDebug ) {
                         if ( grid_state->stackpointer == 0 && !unique_check_mode ) {
@@ -3648,9 +4097,11 @@ hidden_search:
                     cand3 &= ~canddigit;
                 }
                 if ( digit ) {
-                    bug_count++;
+                    if ( verbose != VNone ) {
+                        counters.bug_plus1_count++;
+                    }
                     if ( verbose == VDebug ) {
-                        solverData.printf("bi-value universal grave pivot:");
+                        solverData.printf("bi-value universal grave + 1: pivot:");
                     }
                     if ( rules == Regular ) {
                         e_i = target;
@@ -3660,7 +4111,7 @@ hidden_search:
                         if ( verbose == VDebug ) {
                             solverData.printf("\n");
                         }
-                        grid_state = grid_state->make_guess<verbose>(target, digit, solverData.output);
+                        grid_state = grid_state->make_guess<verbose>(target, digit, counters, solverData.output);
                     }
                     goto start;
                 }
@@ -3726,32 +4177,36 @@ hidden_search:
         while ( s0_it.u128 ) {
             unsigned char idx1 = tzcnt_and_mask(s0_it);  // candidate "A"
             unsigned short cl_vl = candidates[idx1];
-            my_naked_sets_searched++;
+            if (verbose != VNone ) {
+                counters.naked_sets_searched++;
+            }
             bit128_t s1 = { .u128= *(bit128_t*)&big_index_lut[idx1][All][0] };
             bit128_t s1_it = { .u128= s1 & s0_it };
             while ( s1_it.u128 ) {
                 unsigned char idx2 = tzcnt_and_mask(s1_it);
                 unsigned short cl_vl_is = cl_vl & candidates[idx2];
-                if ( cl_vl == cl_vl_is ) {   // found a naked pair, true subset of their section(s)
+                if ( cl_vl == cl_vl_is ) {   // found a naked pair
                     if ( !allKindSet23.check_indexbit(idx1) ) {
                         // at this point there are locations idx1 and idx2 with the same bivalues.
                         // build set t2 for iterating their intersection of target cells to update.
                         bit128_t t2 = { .u128= *(bit128_t*)&big_index_lut[idx2][All][0] & s1 & grid_state->unlocked.u128 };
                         bool upd = false;
-                        unsigned short elim = cl_vl;
+                        // unsigned short elim = cl_vl;
                         while ( t2.u128 ) {
                             unsigned char idx3 = tzcnt_and_mask(t2);
-                            if ( candidates[idx3] & elim ) {
-                                candidates[idx3] &= ~elim;
+                            if ( candidates[idx3] & cl_vl ) {
+                                candidates[idx3] &= ~cl_vl;
                                 grid_state->updated.set_indexbit(idx3);
                                 upd = true;
                             }
                         }
                         if ( upd ) {
-                            naked_sets_found++;
+                            if (verbose != VNone ) {
+                                counters.naked_sets_found++;
+                            }
                             if ( verbose == VDebug ) {
                                 char ret[32];
-                                format_candidate_set(ret, elim);
+                                format_candidate_set(ret, cl_vl);
                                 solverData.printf("naked  pair:       %-7s %s\n", ret, cl2txt[idx1]);
                             }
                             goto search;
@@ -3770,6 +4225,8 @@ hidden_search:
                     }
                 } else if ( cl_vl_is ) {
                     // looking for either a Y-wing or a naked triple
+                    // Idea: If we also searched for trivalues instead of just bivalues,
+                    // we would find additional triples and XYZ-wings.
                     // Approach:
                     // Search area is the union of s2_it and s3_it based on idx2 (downstream only!)
                     // the cell value to search is dictated by cl_vl and cl_vl_is.
@@ -3809,6 +4266,7 @@ hidden_search:
                                 wing1 = idx1;
 //dbgprintf(1, "v3=%x, v2=%x, wing=idx1, stem=idx2\n", v3.u32, viewbits_by_i[idx2].u32);
                             } else {
+                                // last distinction, if all three share a section, then it's a triple
                                 is_triple = true;
                                 stem = 0xff;
 //dbgprintf(1, "is_triple\n");
@@ -3818,13 +4276,13 @@ hidden_search:
                         unsigned short wing_dgt = candidates[idx3] & candidates[wing1];
 
 //dbgprintf(4, "found stashed half-wing for stem=%x at %d, leaf=%x at %d, list=%d for wing_dgt=%x, at %d, cell value=%x at %x\n", cl_vl, idx, candidates[idx2], idx2, wing_pick, wing_dgt, wing_d, (cl_vl&~cl_vl_is)|wing_dgt, idx3);
+                        bool upd = false;
                         bit128_t t3_it = { .u128= *(bit128_t*)&big_index_lut[wing1][All][0]
                                          & *(bit128_t*)&big_index_lut[idx3][All][0]
                                          & grid_state->unlocked.u128 };
-                        // last distinction, if all three share a section, then it's a triple
-                        bool upd = false;
-                        unsigned short elim = is_triple ? (cl_vl | candidates[idx3]) : wing_dgt;
+                        unsigned short elim;
                         if ( is_triple ) {
+                            elim = cl_vl | candidates[idx3];
                             t3_it.u128 &= *(bit128_t*)&big_index_lut[wing1==idx2?idx1:idx2][All][0];
 //dbgprintf(1, "idx1=%d, idx2=%d, idx3=%d, wing1=%d, stem=%d\n", idx1, idx2, idx3);
 #ifdef OPT_SETS
@@ -3840,6 +4298,8 @@ hidden_search:
                                 }
                             }
 #endif
+                        } else {
+                            elim = wing_dgt;
                         }
 //dump_bits(t3_it, "t3_it", 1);
                         unsigned char pos[6] = {0};
@@ -3858,19 +4318,27 @@ hidden_search:
                         }
                         if ( upd ) {
                                 if ( is_triple ) {
-                                    naked_sets_found++;
+                                    if (verbose != VNone ) {
+                                        counters.naked_sets_found++;
+                                    }
                                 } else {
-                                    ywing_updates++;
+                                    if (verbose != VNone ) {
+                                        counters.ywing_updates++;
+                                    }
                                 }
                             if ( verbose == VDebug ) {
                                 char ret[32];
                                 format_candidate_set(ret, elim);
                                 if ( is_triple ) {
-                                    naked_sets_found++;
+                                    if (verbose != VNone ) {
+                                        counters.naked_sets_found++;
+                                    }
                                     v3.u32 &= viewbits_by_i[idx1].u32 & viewbits_by_i[idx2].u32;
                                     solverData.printf("naked  set  (%s): %-7s %s\n", kinds[v3.kindof()], ret, cl2txt[idx1]);
                                 } else {
-                                    ywing_updates++;
+                                    if (verbose != VNone ) {
+                                        counters.ywing_updates++;
+                                    }
                                     solverData.printf("Y-wing at %s <= %s => %s\nremove %s at ", cl2txt[wing1], cl2txt[stem], cl2txt[idx3], ret);
                                     for ( int k=0; k<posi; k++ ) {
                                         solverData.printf(" %s", cl2txt[pos[k]]);
@@ -3882,8 +4350,125 @@ hidden_search:
                         } else if ( !is_triple && solverData.guess_hint_digit == 0) {    
                             // record a good guess:
                             solverData.guess_hint_index = stem;
-                            solverData.guess_hint_digit = cl_vl_is;  // either candidate would do
+                            solverData.guess_hint_digit = cl_vl_is;
                         }
+                    }
+                }
+            }
+
+            // W-Wing (type D)
+            // for two pairs that share a band but aren't visible to each other,
+            // (i.e. they share a chute and are in different boxes, therefore there is
+            // just one triad T in the band that is not visible to both)
+            // check for that triad whether is has a 'must' candidate shared with the two pairs.
+            //
+            // for horizontal bands:
+            unsigned char hband = idx1/27;
+            s1_it.u128 = bivalues.u128 & bandbits[hband].u128 
+                         & ~*(bit128_t*)&big_index_lut[idx1][All][0]
+                         & s0_it;
+            s1_it.unset_indexbit(idx1);
+            while ( s1_it.u128 ) {
+                unsigned char idx2 = tzcnt_and_mask(s1_it);
+                if ( cl_vl == candidates[idx2] ) {  // found the two pairs
+                    // determine triad
+                    Band<true> b(hband);
+                    Triad<C> c1 = cell2t<true,C>(idx1);
+                    Triad<C> c2 = cell2t<true,C>(idx2);
+                    Triad<C> c3 = cGet3rdEl(c1, c2);
+                    Triad<P> p3 = b.c2p(c3);
+//dbgprintf(1, "idx2=%d, l=%d\n", idx2, idx2/3);
+//dbgprintf(1, "c1=%d, c2=%d, c3rd=%d, p3=%d\n", (unsigned int)c1, (unsigned int)c2, (unsigned int)c3, (unsigned int)p3);
+                    unsigned short dgt;
+                    // test the 3rd triad to determine which dgt can be eliminated
+//                            char ret[32];
+//                            format_candidate_set(ret, triad_info.row_triads[p3]);
+//dbgprintf(1, "triad_info.row_triads[p3] = %x %s\n", triad_info.row_triads[p3],ret);
+//dbgprintf(1, "cl_vl & triad_info.row_triads[p3] = %x\n", cl_vl & triad_info.row_triads[p3]);
+                    if ( ( dgt = cl_vl & triad_info.row_triads[p3] ) && __popcnt16(dgt) == 1) {
+                        // determine the 6 cells to clean:
+                        bit128_t clean_bits = { .u128 =   *(bit128_t*)&big_index_lut[idx1][All][0]
+                                                        & *(bit128_t*)&big_index_lut[idx2][All][0] };
+                        bit128_t upd_bits {};
+                        while ( clean_bits ) {
+                            unsigned char cl = tzcnt_and_mask(clean_bits);
+                            if ( candidates[cl] & dgt ) {
+                                candidates[cl] &= ~dgt;
+                                add_indices<All>(&grid_state->updated, cl);
+                                upd_bits.set_indexbit(cl);
+                            }
+                        }
+                        if ( upd_bits ) {
+                            if (verbose != VNone ) {
+                                counters.wwing_updates++;
+                            }
+                            if ( verbose == VDebug ) {
+                                char ret[32];
+                                format_candidate_set(ret, cl_vl);
+                                solverData.printf("W-Wing %s at cells %s, %s\nremove %d at ", ret, cl2txt[idx1], cl2txt[idx2], __tzcnt_u16(dgt)+1);
+                                while (upd_bits) {
+                                    unsigned char cl = tzcnt_and_mask(upd_bits);
+                                    solverData.printf("%s ", cl2txt[cl]);
+                                }
+                                solverData.printf("\n");
+                                goto search;
+                            }
+                        }                    
+                    }
+                }
+            }
+            // for vertical bands:
+            unsigned char vband = idx1%9/3;
+            s1_it.u128 = bivalues.u128 & bandbits[vband+3].u128 
+                         & ~*(bit128_t*)&big_index_lut[idx1][All][0]
+                         & s0_it;
+            s1_it.unset_indexbit(idx1);
+            while ( s1_it.u128 ) {
+                unsigned char idx2 = tzcnt_and_mask(s1_it);
+                if ( cl_vl == candidates[idx2] ) {  // found the two pairs
+                    // determine triad
+                    Band<false> b(vband);
+                    Triad<C> c1 = cell2t<false,C>(idx1);
+                    Triad<C> c2 = cell2t<false,C>(idx2);
+                    Triad<C> c3 = cGet3rdEl(c1, c2);
+                    Triad<P> p3 = b.c2p(c3);
+//dbgprintf(1, "idx1=%d, idx2=%d, l(idx1)=%d, l(idx2)=%d\n", idx1, idx2, (unsigned int)cell2t<false,L>(idx1), (unsigned int)cell2t<false,L>(idx2));
+//dbgprintf(1, "c1=%d, c2=%d, c3rd=%d, p3=%d\n", (unsigned int)c1, (unsigned int)c2, (unsigned int)c3, (unsigned int)p3);
+                    unsigned short dgt;
+//                            char ret[32];
+//                            format_candidate_set(ret, triad_info.col_triads[p3]);
+//dbgprintf(1, "triad_info.col_triads[p3] = %x %s\n", triad_info.col_triads[p3],ret);
+//dbgprintf(1, "cl_vl & triad_info.col_triads[p3] = %x\n", cl_vl & triad_info.col_triads[p3]);
+                    // test the 3rd triad to determine which dgt can be eliminated
+                    if ( ( dgt = cl_vl & triad_info.col_triads[p3] ) && __popcnt16(dgt) == 1) {
+                        // determine the 6 cells to clean:
+                        bit128_t clean_bits = { .u128 =   *(bit128_t*)&big_index_lut[idx1][All][0]
+                                                        & *(bit128_t*)&big_index_lut[idx2][All][0] };
+                        bit128_t upd_bits {};
+                        while ( clean_bits ) {
+                            unsigned char cl = tzcnt_and_mask(clean_bits);
+                            if ( candidates[cl] & dgt ) {
+                                candidates[cl] &= ~dgt;
+                                add_indices<All>(&grid_state->updated, cl);
+                                upd_bits.set_indexbit(cl);
+                            }
+                        }
+                        if ( upd_bits ) {
+                            if (verbose != VNone ) {
+                                counters.wwing_updates++;
+                            }
+                            if ( verbose == VDebug ) {
+                                char ret[32];
+                                format_candidate_set(ret, cl_vl);
+                                solverData.printf("W-Wing %s at cells %s, %s\nremove %d at ", ret, cl2txt[idx1], cl2txt[idx2], __tzcnt_u16(dgt)+1);
+                                while (upd_bits) {
+                                    unsigned char cl = tzcnt_and_mask(upd_bits);
+                                    solverData.printf("%s ", cl2txt[cl]);
+                                }
+                                solverData.printf("\n");
+                                goto search;
+                            }
+                        }                    
                     }
                 }
             }
@@ -3924,6 +4509,12 @@ hidden_search:
 //
 // Note that this search has it's own built-in heuristic to tackle only recently updated cells.
 // The algorithm will keep that list to revisit later, which is fine of course.
+//
+// Critique:
+// The approach is questionable, as it does not schedule the full section for revisit...
+// It would be better to examine the full section and then only revisit when necessary.
+// To be section centric as opposed to cell centric should allow for better performance as well.
+//
 // The number of cells to visit can be high (e.g. in the beginning).
 // Additional tracking mechanisms are used to reduce the number of searches:
 // - previously found sets (and their complements) of size 2 and 3 as well as found triads
@@ -3989,7 +4580,9 @@ hidden_search:
                         ul = ul<=8? 4:5;
                     }
                     if (check_back || (cnt+2 <= ul) ) {
-                        my_naked_sets_searched++;
+                        if (verbose != VNone ) {
+                            counters.naked_sets_searched++;
+                        }
                         res = _mm_cmpeq_epi16(_mm256_castsi256_si128(a_i), _mm_or_si128(_mm256_castsi256_si128(a_i), *(__m128i_u*) &candidates[9*ri]));
                         unsigned int m = compress_epi16_boolean128(res);
                         bool bit9 = candidates[i] == (candidates[i] | candidates[9*ri+8]);
@@ -4049,7 +4642,9 @@ hidden_search:
                                     }
                                 }
                             }
-                            naked_sets_found++;
+                            if ( verbose != VNone ) {
+                                counters.naked_sets_found++;
+                            }
                             add_indices<Row>(&to_change, i);
                             if ( cnt==4 || delta==4 ) {
                                 grid_state->flags |= (1<<ri);
@@ -4119,7 +4714,9 @@ hidden_search:
                             if ( !chk[j] ) {
                                 continue;
                             }
-                            my_naked_sets_searched++;
+                            if (verbose != VNone ) {
+                                counters.naked_sets_searched++;
+                            }
                             if ( bit9s[j] ) {
                                 ms[j] |= 3<<16;    // fake the 9th mask position
                             }
@@ -4153,7 +4750,9 @@ hidden_search:
                             // while having to manage set23_found bit by bit.
                             //
                             if ( (ss[j] == cnt) && (cnt+2 <= uls[j]) ) {
-                                naked_sets_found++;
+                                if ( verbose != VNone ) {
+                                    counters.naked_sets_found++;
+                                }
                                 if ( cnt==4 || uls[j]-cnt==4) {
                                     grid_state->flags |= (1<<9)<<(j?bi+9:ci);
                                 }
@@ -4292,7 +4891,7 @@ hidden_search:
     //   (their base portion removed) and the fish is complete,
     // - or exactly N lines that overlap with the base, then all these lines
     //   can be purged (their non-base portion removed).
-    // Note that these two possibilities are same, except the second is transposed.
+    // Note that these two possibilities are the same, except the second is transposed.
     // 
     // The search operates just as the naked set search does, i.e. it will not discover
     // fishes where all lines have less than N candidates.  This can be remedied by augmenting
@@ -4306,8 +4905,8 @@ hidden_search:
     // be subdivided and therefore need not be searched further.
     //
     // Variants:
-    // All variants start with N-1 matching fish lines and they are regular fishes
-    // as described above.
+    // All variants start with N-1 matching fish lines (subsets of regular fishes
+    // as described above).
     //
     // Finned Fish:
     // identify from the excess lines overlapping the base, one that:
@@ -4347,13 +4946,19 @@ hidden_search:
         if ( candidate_bits_by_value[dgt].popcount() < 14 ) {
             continue;
         }
-        // load a vector
+        // load a vector eliminating solved cells
         bit128_t cbbv_digit = { .u128= candidate_bits_by_value[dgt].u128 & grid_state->unlocked.u128 };
-        unsigned long long lo = cbbv_digit.u64[0];
-        unsigned long long hi = cbbv_digit.u64[1];
 
         // load cbbv_v
-        cbbv_v.m256 = _mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo>>36, lo>>45, lo>>54, (lo>>63)|(hi<<1), hi>>8, 0, 0, 0, 0, 0, 0, 0),mask1ff);
+        __m128i off0 = uncompress(cbbv_digit.m128);
+        cbbv_v.m256 = _mm256_insert_epi16(_mm256_and_si256(mask1ff,_mm256_castsi128_si256(off0)), *(__int16*)&cbbv_digit.u8[9], 8);
+        unsigned long long hi = cbbv_digit.u64[1];
+#if 0
+        unsigned long long lo = cbbv_digit.u64[0];
+
+dump_m256i_grid(cbbv_v.m256, "new");
+dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo>>36, lo>>45, lo>>54, (lo>>63)|(hi<<1), hi>>8, 0, 0, 0, 0, 0, 0, 0),mask1ff), "old");
+#endif
 
         // do a quick popcnt of all rows or'ed together to determine the maximum fish size
         __m128i max_v = _mm256_castsi256_si128(_mm256_or_si256(cbbv_v.m256, _mm256_bsrli_epi128(cbbv_v.m256,8)));
@@ -4396,7 +5001,9 @@ hidden_search:
                     if ( cnt <= 3 ) {
                         exclude_row[dgt] |= base_x;
                         exclude_col[dgt] |= subs_prp_x; // the orthogonal grid base
-                        fishes_excluded++;   // counted but not currently included in summary
+                        if ( verbose != VNone ) {
+                            counters.fishes_excluded++;   // counted but not currently included in summary
+                        }
                     }
                     continue;
                 }
@@ -4418,8 +5025,8 @@ hidden_search:
                 if ( nsubs == cnt || _popcnt32(hassubs_prp_x) == cnt ) {
                     // this part is efficient to find and easy to deal with - however, the yield is very low.
                     unsigned short excess_x = nsubs == cnt ? base_x : (0x1ff & ~base_x);
-                    if ( verbose != VNone && reportstats ) {
-                        fishes_detected++;
+                    if ( verbose != VNone ) {
+                        counters.fishes_detected++;
                     }
                     unsigned int rows2clean = hassubs_prp_x & ~subs_prp_x;
                     while (rows2clean) {
@@ -4513,9 +5120,9 @@ hidden_search:
                             if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
                                  && _popcnt32(cbbv_v.v16[fin_subs_prp[0]] & base_x) == 1
                                  && _popcnt32(cbbv_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
-                                if ( verbose != VNone && reportstats ) {
-                                    fishes_detected++;
-                                    fishes_specials_detected++;
+                                if ( verbose != VNone ) {
+                                    counters.fishes_detected++;
+                                    counters.fishes_specials_detected++;
                                 }
                                 fincells[0] =  fin_subs_prp[0]*9 + fin_subs_pos_prl[0];
                                 fincells[1] =  fin_subs_prp[1]*9 + fin_subs_pos_prl[1];
@@ -4536,7 +5143,9 @@ hidden_search:
                                 clean_bits.unset_indexbit(fincells[0]);
                                 clean_bits.unset_indexbit(fincells[1]);
                                 if ( clean_bits ) {
-                                    fishes_specials_updated++;
+                                    if ( verbose != VNone ) {
+                                        counters.fishes_specials_updated++;
+                                    }
                                     if ( verbose == VDebug ) {
                                         subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
                                         unsigned char celli = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
@@ -4551,7 +5160,9 @@ hidden_search:
                         }
 
                         if ( clean_bits ) {
-                            fishes_updated++;
+                            if ( verbose != VNone ) {
+                                counters.fishes_updated++;
+                            }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
                             unsigned short dgt_mask_bit = 1<<dgt;
                             while (clean_bits) {
@@ -4604,10 +5215,10 @@ hidden_search:
                                 }
                                 continue;
                             }
-                            if ( verbose != VNone && reportstats ) {
-                                fishes_specials_detected++;
-                                fishes_detected++;
-                             }
+                            if ( verbose != VNone ) {
+                                counters.fishes_specials_detected++;
+                                counters.fishes_detected++;
+                            }
 
                             unsigned int boxbase_x = base_x & box_bits;
                             clean_bits.u128 = 0;
@@ -4619,7 +5230,9 @@ hidden_search:
                             clean_bits.u128 &= dgt_bits.u128;
 
                             if ( clean_bits ) {
-                                fishes_specials_updated++;
+                                if ( verbose != VNone ) {
+                                    counters.fishes_specials_updated++;
+                                }
                                 if ( verbose == VDebug ) {
                                     unsigned char celli = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
                                     unsigned char celli2 = (15-__lzcnt16(subsx))*9 + (15-__lzcnt16(base_x));
@@ -4634,7 +5247,9 @@ hidden_search:
                     } // Case 2
                 } // else
                 if ( clean_bits ) {
-                    fishes_updated++;
+                    if ( verbose != VNone ) {
+                        counters.fishes_updated++;
+                    }
                     if ( clean_bits.check_indexbit(fincells[0]) ) {
                         e_digit = 1<<dgt;
                         e_i = fincells[1];
@@ -4760,8 +5375,8 @@ done:
                 if ( nsubs == cnt || _popcnt32(hassubs_prp_x) == cnt ) {
                     // this part is efficient to find and easy to deal with - however the yield very low.
                     unsigned short excess_x = nsubs == cnt ? base_x : (0x1ff & ~base_x);
-                    if ( verbose != VNone && reportstats ) {
-                        fishes_detected++;
+                    if ( verbose != VNone ) {
+                        counters.fishes_detected++;
                     }
                     hassubs_prp_x = compress_epi16_boolean(hassub_v);
                     unsigned int cols2clean = hassubs_prp_x & ~subs_prp_x;
@@ -4810,9 +5425,9 @@ done:
                             if (    fin_subs_pos_prl[0] != fin_subs_pos_prl[1]                // Case 1 B
                                  && _popcnt32(cbbv_col_v.v16[fin_subs_prp[0]] & base_x) == 1
                                  && _popcnt32(cbbv_col_v.v16[fin_subs_prp[1]] & base_x) == 1 ) {
-                                if ( verbose != VNone && reportstats ) {
-                                    fishes_detected++;
-                                    fishes_specials_detected++;
+                                if ( verbose != VNone ) {
+                                    counters.fishes_detected++;
+                                    counters.fishes_specials_detected++;
                                 }
                                 fincells[0] =  fin_subs_prp[0] + fin_subs_pos_prl[0]*9;
                                 fincells[1] =  fin_subs_prp[1] + fin_subs_pos_prl[1]*9;
@@ -4832,7 +5447,9 @@ done:
                                 clean_bits.unset_indexbit(fincells[0]);
                                 clean_bits.unset_indexbit(fincells[1]);
                                 if ( clean_bits ) {
-                                    fishes_specials_updated++;
+                                    if ( verbose != VNone ) {
+                                        counters.fishes_specials_updated++;
+                                    }
                                     if ( verbose == VDebug ) {
                                         subsx = subs_prp_x | (1<<fin_subs_prp[0]) | (1<<fin_subs_prp[1]);
                                         unsigned char celli = __tzcnt_u16(subsx) + __tzcnt_u16(base_x)*9;
@@ -4847,7 +5464,9 @@ done:
                         }
 
                         if ( clean_bits ) {
-                            fishes_updated++;
+                            if ( verbose != VNone ) {
+                                counters.fishes_updated++;
+                            }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
                             unsigned short dgt_mask_bit = 1<<dgt;
                             while (clean_bits) {
@@ -4896,9 +5515,9 @@ done:
                                 }
                                 continue;
                             }
-                            if ( verbose != VNone && reportstats ) {
-                                fishes_specials_detected++;
-                                fishes_detected++;
+                            if ( verbose != VNone ) {
+                                counters.fishes_specials_detected++;
+                                counters.fishes_detected++;
                             }
 
                             unsigned int boxbase_x = base_x & box_bits;
@@ -4916,7 +5535,9 @@ done:
                             clean_bits.u128 &= dgt_bits.u128;
 
                             if ( clean_bits ) {
-                                fishes_specials_updated++;
+                                if ( verbose != VNone ) {
+                                    counters.fishes_specials_updated++;
+                                }
                                 if ( verbose == VDebug ) {
                                     if ( debug > 2 ) {
                                         show_fish<true>(cbbv_col_v, base_x, subsx, hassubs_prp_x, clean_bits, dgt_bits, solverData, "finned col fish");
@@ -4931,7 +5552,9 @@ done:
                     }  // Case 2
                 }
                 if ( clean_bits ) {
-                    fishes_updated++;
+                    if ( verbose != VNone ) {
+                        counters.fishes_updated++;
+                    }
                     if ( clean_bits.check_indexbit(fincells[0]) ) {
                         e_digit = 1<<dgt;
                         e_i = fincells[1];
@@ -5382,7 +6005,9 @@ if ( mode_uqr )
                         unsigned char celli = uqr_corners[ix].indx;
                         unsigned short single = candidates[uqr_corners[(ix+2)&3].indx];
                         if ( (candidates[celli] & single) && __popcnt16(candidates[celli]) > 1 ) {
-                            unique_rectangles_avoided++;
+                            if ( verbose != VNone ) {
+                                counters.unique_rectangles_avoided++;
+                            }
                             grid_state->updated.set_indexbit(celli);
                             // unless under 'Regular' rules, capture the avoidable UQR as a guess
                             // provide 'resolution' in form of a guess
@@ -5407,7 +6032,7 @@ if ( mode_uqr )
                                     // the GridState to back track to:
                                     oldgs.candidates[celli]  &= ~newgs.candidates[celli];
                                     msg[1] = guess_message[1];
-                                }, solverData.output);
+                                }, solverData.counters, solverData.output);
                                 goto guess_made_with_incr;
                             }
                             // otherwise simply avoid the UQR:
@@ -5461,9 +6086,9 @@ if ( mode_uqr )
                     if ( (solverData.getBivalues(candidates) & corner_bits) == (__uint128_t)0 ) {
                         continue;
                     }
-
-                    my_unique_rectangles_checked++;
-
+                    if ( verbose != VNone ) {
+                        counters.unique_rectangles_checked++;
+                    }
                     // complete corner infos, including edges and uqr_pairs infos
                     for ( int i=0; i<4; i++ ) {
                         unsigned short dgts = candidates[uqr_corners[i].indx];
@@ -5509,7 +6134,9 @@ if ( mode_uqr )
                             unsigned short pair = uqr_pairs[pi].digits;
                             if ( candidates[corner4_index] != pair ) {
                                 // unless under 'Regular' rules, provide 'resolution' in form of a guess
-                                unique_rectangles_avoided++;
+                                if ( verbose != VNone ) {
+                                    counters.unique_rectangles_avoided++;
+                                }
                                 if ( rules != Regular ) {
                                     unsigned short other_cands = candidates[corner4_index] & ~pair;
                                     if ( verbose == VDebug ) {
@@ -5536,7 +6163,7 @@ if ( mode_uqr )
                                         // the GridState to back track to:
                                         oldgs.candidates[corner4_index]  &= ~other_cands;
                                         msg[1] = guess_message[1];
-                                    }, solverData.output);
+                                    }, solverData.counters, solverData.output);
                                     goto guess_made_with_incr;
                                 }
                                 // simply avoid the UQR
@@ -5670,7 +6297,9 @@ if ( mode_uqr )
                                         weak_corner_y =  uqr_cand ^ uqr_pairs[pi].digits;
                                         if ( (candidates[weak_corner_indx] & weak_corner_y) ) {
                                             grid_state->updated.set_indexbit(weak_corner_indx);
-                                            unique_rectangles_avoided++;
+                                            if ( verbose != VNone ) {
+                                                counters.unique_rectangles_avoided++;
+                                            }
                                             // unless under 'Regular' rules, capture the avoidable UQR
                                             // provide 'resolution' in form of a guess
                                             char ret[32];
@@ -5698,7 +6327,7 @@ if ( mode_uqr )
                                                     // the GridState to back track to:
                                                     oldgs.candidates[weak_corner_indx] = weak_corner_y;
                                                     msg[1] = guess_message[1];
-                                                }, solverData.output);
+                                                }, solverData.counters, solverData.output);
                                                 goto guess_made_with_incr;
                                             }
                                             // simply avoid the UQR
@@ -5751,7 +6380,9 @@ if ( mode_uqr )
                                         format_candidate_set(ret, uqr_pairs[pi].digits);
                                     }
                                     found_update = true;
-                                    unique_rectangles_avoided++;
+                                    if ( verbose != VNone ) {
+                                        counters.unique_rectangles_avoided++;
+                                    }
                                     if ( rules == Regular ) {
                                         candidates[indx2upd[0]] &= ~uqr_cand;
                                         candidates[indx2upd[1]] &= ~uqr_cand;
@@ -5801,7 +6432,7 @@ if ( mode_uqr )
                                                             oldgs.candidates[indx2upd[0]] &= ~other_cand;
                                                             oldgs.candidates[indx2upd[1]] &= ~other_cand;
                                                             msg[1] = guess_message[1];
-                                                        }, solverData.output);
+                                                        }, solverData.counters, solverData.output);
                                              goto guess_made_with_incr;
                                         } else {
                                             if ( verbose == VDebug ) {
@@ -5826,7 +6457,7 @@ if ( mode_uqr )
                                                             // the GridState to back track to:
                                                             oldgs.candidates[indx2upd[0]] = uqr_cand;
                                                             msg[1] = guess_message[1];
-                                                        }, solverData.output);
+                                                        }, solverData.counters, solverData.output);
                                              goto guess_made_with_incr;
                                         }
                                     }
@@ -5929,7 +6560,9 @@ if ( mode_uqr )
 
                                 // iterate over cells and remove the candidate to avoid
                                 if ( check_set && cand_removal_indx != (__uint128_t)0 ) {
-                                    unique_rectangles_avoided++;
+                                    if ( verbose != VNone ) {
+                                        counters.unique_rectangles_avoided++;
+                                    }
                                     found_update = true;
                                     if ( verbose == VDebug ) {
                                         char ret[32];
@@ -6003,7 +6636,9 @@ if ( mode_uqr )
                                 // simply eliminate y from the opposite corner
 
                                 if ( candidates[indx] & uqr_alt_cand ) {
-                                    unique_rectangles_avoided++;
+                                    if ( verbose != VNone ) {
+                                        counters.unique_rectangles_avoided++;
+                                    }
                                     grid_state->updated.set_indexbit(indx);
                                     // unless under 'Regular' rules, capture the avoidable UQR
                                     // provide 'resolution' in form of a guess
@@ -6049,7 +6684,7 @@ if ( mode_uqr )
                                                     // the GridState to back track to:
                                                     oldgs.candidates[indx] = uqr_alt_cand;
                                                     msg[1] = guess_message[1];
-                                                }, solverData.output);
+                                                }, solverData.counters, solverData.output);
                                         goto guess_made_with_incr;
                                     }
                                 }
@@ -6151,6 +6786,12 @@ using namespace Schoku;
             sscanf(&schoku_dbg_filter[off+1], "%x", &dbgprintfilter);
        } else {
             sscanf(&schoku_dbg_filter[off], "%d", &dbgprintfilter);
+       }
+    }
+    const char *schoku_report_guess = getenv("SCHOKU_GUESS_REPORT");
+    if ( schoku_report_guess ) {
+       if ( schoku_report_guess[0] == '1' ) {
+            report_guess_puzzles = 1;
        }
     }
 
@@ -6415,14 +7056,14 @@ using namespace Schoku;
         signed char *grid = &output[82];
 
         if ( debug != 0) {
-            stack[0].initialize<VDebug>(output);
-            solve<VDebug>(grid, stack, line_to_solve);
+            stack[0].initialize<VDebug>(output, global_counters);
+            solve<VDebug>(grid, stack, line_to_solve, global_counters);
         } else if ( reportstats !=0) {
-            stack[0].initialize<VStats>(output);
-            solve<VStats>(grid, stack, line_to_solve);
+            stack[0].initialize<VStats>(output, global_counters);
+            solve<VStats>(grid, stack, line_to_solve, global_counters);
         } else {
-            stack[0].initialize<VNone>(output);
-            solve<VNone>(grid, stack, line_to_solve);
+            stack[0].initialize<VNone>(output, global_counters);
+            solve<VNone>(grid, stack, line_to_solve, global_counters);
         }
     } else {
         seqBuf.setLast((imax-1)/(120*82));
@@ -6433,7 +7074,9 @@ using namespace Schoku;
         //   are assigned dynmically (to minimize random effects of difficult puzzles)
         // shared(...) lists the variables that are shared (as opposed to separate copies per thread)
         //
-#pragma omp parallel firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads)
+#pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in)
+
+#pragma omp parallel reduction(counters_reduction:global_counters) firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads)
         {
             if ( numthreads == 0 ) {
                 numthreads = omp_get_num_threads();
@@ -6458,14 +7101,14 @@ using namespace Schoku;
                 output[i*2 + 163] = 10;
                 // solve the grid in place
                 if ( debug != 0) {
-                    stack[0].initialize<VDebug>(&output[i*2]);
-                    solve<VDebug>(grid, stack, i/82+1, memstream->outf);
+                    stack[0].initialize<VDebug>(&output[i*2], global_counters);
+                    solve<VDebug>(grid, stack, i/82+1, global_counters, memstream->outf);
                 } else if ( reportstats !=0) {
-                    stack[0].initialize<VStats>(&output[i*2]);
-                    solve<VStats>(grid, stack, i/82+1, memstream->outf);
+                    stack[0].initialize<VStats>(&output[i*2], global_counters);
+                    solve<VStats>(grid, stack, i/82+1, global_counters, memstream->outf);
                 } else {
-                    stack[0].initialize<VNone>(&output[i*2]);
-                    solve<VNone>(grid, stack, i/82+1, memstream->outf);
+                    stack[0].initialize<VNone>(&output[i*2], global_counters);
+                    solve<VNone>(grid, stack, i/82+1, global_counters, memstream->outf);
                 }
                 // strictly align this with the chunk size of 120
                 if ( debug && (numthreads > 1) && ((i/82)%120 == 119 || (i==imax-82) )) {
@@ -6510,61 +7153,62 @@ using namespace Schoku;
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
         printf("schoku version: %s\ncommand options: %s\ncompile options: %s\n", version_string, opts, compilation_options);
-        printf("%10ld  %6.1f/puzzle  puzzles entered and presets\n", npuzzles, (double)preset_count.load()/npuzzles);
-        unsigned long solved_cnt = solved_count.load();
-        printf("%10ld  %.0lf/s  puzzles solved\n", solved_cnt, (double)solved_cnt/((double)duration/1000000000LL));
-        if ( duration/npuzzles > 1000 ) {
-            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
+        printf("%10ld  %6.1f/puzzle  puzzles entered and presets\n", npuzzles, (double)global_counters.preset_count/outnpuzzles);
+        printf("%10ld  %.0lf/s  puzzles solved\n", global_counters.solved_count, (double)global_counters.solved_count/((double)duration/1000000000LL));
+        if ( duration/outnpuzzles > 1000 ) {
+            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(outnpuzzles*1000LL));
         } else {
-            printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/npuzzles));
+            printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/outnpuzzles));
         }
-        if ( unsolved_count.load() && rules != Regular) {
-            printf("%10ld  puzzles had no solution\n", unsolved_count.load());
+        if ( global_counters.unsolved_count && rules != Regular) {
+            printf("%10ld  puzzles had no solution\n", global_counters.unsolved_count);
         }
         if ( rules == Multiple ) {
-            printf("%10ld  puzzles had multiple solutions\n", non_unique_count.load());
+            printf("%10ld  puzzles had multiple solutions\n", global_counters.non_unique_count);
         }
         if ( verify ) {
-            printf("%10ld  puzzle solutions were verified\n", verified_count.load());
+            printf("%10ld  puzzle solutions were verified\n", global_counters.verified_count);
         }
-        printf( "%10ld  %6.2f%%  puzzles solved without guessing\n", no_guess_cnt.load(), (double)no_guess_cnt.load()/solved_cnt*100);
-        printf( "%10ld  %6.2f/puzzle  guesses\n", guesses.load(), (double)guesses.load()/(double)solved_cnt);
-        printf( "%10ld  %6.2f/puzzle  back tracks\n", trackbacks.load(), (double)trackbacks.load()/solved_cnt);
-        printf("%10lld  %6.2f/puzzle  digits entered and retracted\n", digits_entered_and_retracted.load(), (double)digits_entered_and_retracted.load()/solved_cnt);
-        printf("%10lld  %6.2f/puzzle  'rounds'\n", past_naked_count.load(), (double)past_naked_count.load()/solved_cnt);
-        printf("%10lld  %6.2f/puzzle  triads resolved\n", triads_resolved.load(), (double)triads_resolved.load()/solved_cnt);
-        printf("%10lld  %6.2f/puzzle  triad updates\n", triad_updates.load(), (double)triad_updates.load()/solved_cnt);
+        printf( "%10ld  %6.2f%%  puzzles solved without guessing\n", global_counters.no_guess_cnt, (double)global_counters.no_guess_cnt/global_counters.solved_count*100);
+        printf( "%10ld  %6.2f/puzzle  guesses\n", global_counters.guesses, (double)global_counters.guesses/(double)global_counters.solved_count);
+        printf( "%10ld  %6.2f/puzzle  back tracks\n", global_counters.trackbacks, (double)global_counters.trackbacks/global_counters.solved_count);
+        printf("%10lld  %6.2f/puzzle  digits entered and retracted\n", global_counters.digits_entered_and_retracted, (double)global_counters.digits_entered_and_retracted/global_counters.solved_count);
+        printf("%10lld  %6.2f/puzzle  'rounds'\n", global_counters.past_naked_count, (double)global_counters.past_naked_count/global_counters.solved_count);
+        printf("%10lld  %6.2f/puzzle  triads resolved\n", global_counters.triads_resolved, (double)global_counters.triads_resolved/global_counters.solved_count);
+        printf("%10lld  %6.2f/puzzle  triad updates\n", global_counters.triad_updates, (double)global_counters.triad_updates/global_counters.solved_count);
 #ifdef OPT_BIVALS
         if ( mode_bivals ) {
-            printf("%10ld  %6.2f/puzzle  Y-wing updates\n", ywing_updates.load(), (double)ywing_updates.load()/solved_cnt);
+            printf("%10ld  %6.2f/puzzle  Y-wing updates\n", global_counters.ywing_updates, (double)global_counters.ywing_updates/global_counters.solved_count);
+            printf("%10ld  %6.2f/puzzle  W-wing updates\n", global_counters.wwing_updates, (double)global_counters.	wwing_updates/global_counters.solved_count);
         }
 #endif
 
 #if defined(OPT_SETS) || defined(OPT_BIVALS)
         if ( mode_sets || mode_bivals ) {
-            printf("%10lld  %6.2f/puzzle  naked sets found\n", naked_sets_found.load(), (double)naked_sets_found.load()/solved_cnt);
-            printf("%10lld  %6.2f/puzzle  naked sets searched\n", naked_sets_searched.load(), (double)naked_sets_searched.load()/solved_cnt);
+            printf("%10lld  %6.2f/puzzle  naked sets found\n", global_counters.naked_sets_found, (double)global_counters.naked_sets_found/global_counters.solved_count);
+            printf("%10lld  %6.2f/puzzle  naked sets searched\n", global_counters.naked_sets_searched, (double)global_counters.naked_sets_searched/global_counters.solved_count);
         }
 #endif
 #ifdef OPT_FSH
         if ( mode_fish ) {
-            unsigned long long fsh_detected = fishes_detected.load(); // fishes_specials_detected is a subset of fishes_detected
-            unsigned long long fsh_updates = fishes_updated.load(); // fishes_specials_updated is a subset of fishes_updated;
-            printf("%10lld  %6.2f/puzzle  fishes updated\n", fsh_updates, (double)fsh_updates/solved_cnt);
-            printf("%10lld  %6.2f/puzzle  fishes detected\n", fsh_detected, (double)fsh_detected/solved_cnt);
+            printf("%10lld  %6.2f/puzzle  fishes updated\n", global_counters.fishes_updated, (double)global_counters.fishes_updated/global_counters.solved_count);
+            printf("%10lld  %6.2f/puzzle  fishes detected\n", global_counters.fishes_detected, (double)global_counters.fishes_detected/global_counters.solved_count);
          }
 #endif
 #ifdef OPT_UQR
         if ( mode_uqr ) {
-            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", unique_rectangles_avoided.load(), (double)unique_rectangles_avoided.load()/solved_cnt);
-            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", unique_rectangles_checked.load(), (double)unique_rectangles_checked.load()/solved_cnt);
+            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", global_counters.unique_rectangles_avoided, (double)global_counters.unique_rectangles_avoided/global_counters.solved_count);
+            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", global_counters.unique_rectangles_checked, (double)global_counters.unique_rectangles_checked/global_counters.solved_count);
         }
 #endif
-        if ( bug_count.load() ) {
-            printf("%10ld  bi-value universal graves detected\n", bug_count.load());
+        if ( global_counters.bug_plus1_count ) {
+            printf("%10ld  bi-value universal graves avoided (BUG+1)\n", global_counters.bug_plus1_count);
         }
-        if ( no_bivals_count.load() ) {
-            printf("%10ld  board states without bivalues\n", no_bivals_count.load());
+        if ( global_counters.bug_count ) {
+            printf("%10ld  bi-value universal graves detected\n", global_counters.bug_count);
+        }
+        if ( global_counters.no_bivals_count ) {
+            printf("%10ld  board states without bivalues\n", global_counters.no_bivals_count);
         }
     } else if ( reporttimings ) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
@@ -6575,17 +7219,17 @@ using namespace Schoku;
         }
     }
 
-    if ( !reportstats && rules == Multiple && non_unique_count.load()) {
-        printf("%10ld  puzzles had more than one solution\n", non_unique_count.load());
+    if ( !reportstats && rules == Multiple && global_counters.non_unique_count) {
+        printf("%10ld  puzzles had more than one solution\n", global_counters.non_unique_count);
     }
-    if ( verify && not_verified_count.load()) {
-        printf("%10ld  puzzle solutions verified as not correct\n", not_verified_count.load());
+    if ( verify && global_counters.not_verified_count) {
+        printf("%10ld  puzzle solutions verified as not correct\n", global_counters.not_verified_count);
     }
-    if ( !reportstats && unsolved_count.load()) {
-        printf("%10ld puzzles had no solution\n", unsolved_count.load());
+    if ( !reportstats && global_counters.unsolved_count) {
+        printf("%10ld puzzles had no solution\n", global_counters.unsolved_count);
     }
-    if ( rules == Regular && warnings && unsolved_count.load() ) {
-        printf("\n\tIf a puzzle may have multiple solutions use either\n\t-mo (find one solution) or -mm (check for multiple solutions)!\n");
+    if ( rules == Regular && (reportstats || warnings) && ( global_counters.unsolved_count || global_counters.non_unique_count || global_counters.not_verified_count) ) {
+        printf("\n\tIf a puzzle may have multiple solutions use either\n\t -ro (find one solution) or -rm (check for multiple solutions)!\n");
     }
 
     return 0;
