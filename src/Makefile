@@ -9,8 +9,8 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
-#DFLAGS := -DNDEBUG -DOPT_BIVALS
-DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_SETS -DOPT_FSH -DOPT_UQR
+DFLAGS := -DNDEBUG -DOPT_BIVALS
+#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_SETS -DOPT_FSH -DOPT_UQR
 # OPT_BIVALS
 #     opportunistic bi-values processing (naked pairs and triples, Y-wings)
 #     on by default, when compiled.
