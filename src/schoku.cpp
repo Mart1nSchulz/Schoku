@@ -17,9 +17,12 @@
  * Version 0.9.5
  *
  * Performance changes:
+ * make_guess was updated to provide scoring for bivalue and trivalue searches.
+ * This reduces guesses significantly for hard puzzles and improves speed.
  *
  * Functional changes:
  * OPT_TRIAD_RES is gone! This functionality is now the default.
+ * The hidden single search for boxes is gone(!).
  *
  * Produce a readable hint with -w in case the puzzle file may have
  * puzzles with multiple solutions counted as unsolvable.
@@ -47,25 +50,25 @@
  *      38596   78.53%  puzzles solved without guessing
  *      21548    0.44/puzzle  guesses
  *      13497    0.27/puzzle  back tracks
- *     170602    3.47/puzzle  digits entered and retracted
+ *     170549    3.47/puzzle  digits entered and retracted
  *      22431    0.46/puzzle  'rounds'
- *     114463    2.33/puzzle  triads resolved
- *     209017    4.25/puzzle  triad updates
+ *     200866    4.09/puzzle  triads resolved
+ *     417341    8.49/puzzle  triad updates
  *        709  bi-value universal graves detected
  *        134  board states without bivalues
  *
  * command options: -x -mfs
  * compile options: OPT_SETS OPT_FSH OPT_UQR
  *      49151    17.0/puzzle  puzzles entered and presets
- *      49151  2060942/s  puzzles solved
- *     23.8ms   483ns/puzzle  solving time
+ *      49151  2044755/s  puzzles solved
+ *     24.2ms   489ns/puzzle  solving time
  *      45509   92.59%  puzzles solved without guessing
  *       5051    0.10/puzzle  guesses
  *       2698    0.05/puzzle  back tracks
- *      36229    0.74/puzzle  digits entered and retracted
+ *      36228    0.74/puzzle  digits entered and retracted
  *      25720    0.52/puzzle  'rounds'
- *     102523    2.09/puzzle  triads resolved
- *     200282    4.07/puzzle  triad updates
+ *     1866018   3.78/puzzle  triads resolved
+ *     403436    8.21/puzzle  triad updates
  *      15457    0.31/puzzle  naked sets found
  *     495225   10.08/puzzle  naked sets searched
  *       8335    0.17/puzzle  fishes updated
@@ -115,6 +118,13 @@ const char *compilation_options =
 #endif
 ""
 ;
+// USE_ROW_HIDDEN_SEARCH:
+// if set to 1, provides code to search row hidden singles.
+// if set to 0, triad processing will isolate hidden singles in their column.
+// Turning off row search is a little faster
+#ifndef USE_ROW_HIDDEN_SEARCH
+#define USE_ROW_HIDDEN_SEARCH 0
+#endif
 
 // using type v16us for the built-in vector of unsigned short[16]
 using v16us  = __v16hu;
@@ -672,7 +682,8 @@ const __m256i fours     = _mm256_set1_epi8 ( 4 );
 const __m256i lookup    = _mm256_setr_epi8(0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4,
                                            0 ,1 ,1 ,2 ,1 ,2 ,2 ,3 ,1 ,2 ,2 ,3 ,2 ,3 ,3 ,4);
 // used in make_guess
-const __m256i c0 = _mm256_set1_epi16(0xC0);
+const __m256i shuf = _mm256_setr_epi8(0,1,6,7,12,13,2,3,8,9,14,15,4,5,10,11,0,1,6,7,12,13,2,3,8,9,14,15,4,5,10,11);
+const __m256i shuf8x32 = _mm256_setr_epi32(0,1,2,4,5,6,7,3);
 
 #ifdef OPT_UQR
 // used in UQR processing:
@@ -848,7 +859,7 @@ inline void dump_m256i_grid(__m256i v, const char *msg="", int filter=-1) {
     }
     dbgprintf(filter, "%s\n", msg);
     for (unsigned char r=0; r<9; r++) {
-        unsigned short b = ((__v16hu)v)[r];
+        unsigned short b = ((v16us)v)[r];
         for ( unsigned char i=0; i<9; i++) {
             dbgprintf(filter, "%s", (b&(1<<i))? "x":"-");
             if ( i%3 == 2 ) {
@@ -1251,7 +1262,9 @@ class GridState;
 
 // TriadInfo
 //
-class TriadInfo {
+class
+alignas(64)
+TriadInfo {
 public:
     unsigned short row_triads[36];            //  27 triads, in groups of 9 with a gap of 1
     unsigned short col_triads[36];            //  27 triads, in groups of 9 with a gap of 1
@@ -1906,6 +1919,91 @@ inline GridState* make_guess(bit128_t &bivalues, FILE *output) {
     // appropriate.
     //
         no_bivals_count++;
+
+        // save the box_perp 'row's for later, at the price of 9 __m256i...
+        // the save location is the next gridstate.
+        // This is of no particular interest for now but could be made part of SolverData
+
+        __m256i *box_perp_rows = (__m256i *) (this+1);
+
+    {
+#if 0
+// This is what we want, yet the load is extraordinarily slow...
+        unsigned short *candp = candidates;
+	    for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
+             box_perp_rows[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
+                                                  candp[27], candp[30],candp[33],
+                                                  candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
+        }
+#else
+
+// ... instead, work the SIMD muscles
+        __m256i tmp_align, tmp_row;
+        __m128i band2;
+        __m128i tmp_1, tmp_3, tmp_align2;
+        unsigned short *inp=candidates;
+        //     [6,0], [6,3],  [6,6]
+        band2 = *(__m128i_u*)(inp+27);
+        tmp_align2 = *(__m128i_u*)(inp+27+8);
+        tmp_1 = *(__m128i_u*)inp;
+        tmp_3 = *(__m128i_u*)(inp+54);
+        // first load the rows/cells that aren't laterally or vertically shifted (for now)
+        //     [0,0], [0,3], [0,6] - [3,0], [3,3], [3,6]
+        // --> [0,0], [0,3], [0,6] - [3,1], [3,4], [3,7]
+        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+8),(__m128i*)(inp+8));
+        box_perp_rows[0] = _mm256_set_m128i(tmp_3,_mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
+        
+        //     [0,1], [0,4], [0,7] - [3,1], [3,4], [3,7]
+        // --> [1,0], [1,3], [1,6] - [4,1], [4,4], [4,7] (update to destination rows)
+        box_perp_rows[1] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [0,2], [0,5], -[0,8] - [3,2], [3,5], -[3,8]
+        // --> [2,0], [2,3], +[2,6] - [5,1], [5,4], +[5,7] (update to destination rows)
+        box_perp_rows[2] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        band2 = *(__m128i_u*)(inp+27+9);
+        tmp_align2 = *(__m128i_u*)(inp+27+9+8);
+        tmp_1 = *(__m128i_u*)(inp+9);
+        tmp_3 = *(__m128i_u*)(inp+54+9);
+        //     [1,0], [1,3], [1,6] - [4,0], [4,3], [4,6]
+        // --> [3,0], [3,3], [3,6] - [3,1], [3,4], [3,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+9+8),(__m128i*)(inp+9+8));
+        box_perp_rows[3] = _mm256_set_m128i(tmp_3, _mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
+        //     [1,1], [1,4], [1,7] - [4,1], [4,4], [4,7]
+        // --> [4,0], [4,3], [4,6] - [4,1], [4,4], [4,7]
+        box_perp_rows[4] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [1,2], [1,5], -[1,8] - [4,2], [4,5], -[4,8]
+        // --> [5,0], [5,3],  [5,6] - [5,1], [5,4], +[5,7]
+        box_perp_rows[5] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        band2 = *(__m128i_u*)(inp+27+18);
+        tmp_align2 = *(__m128i_u*)(inp+27+18+8);
+        tmp_1 = *(__m128i_u*)(inp+18);
+        tmp_3 = *(__m128i_u*)(inp+54+18);
+        //     [2,0], [2,3],  [2,6] - [5,0], [5,3],  [5,6]
+        // --> [6,2], [6,5], +[6,8] - [6,1], [6,4],  [6,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+18+8),(__m128i*)(inp+18+8));
+        box_perp_rows[6] = _mm256_set_m128i(tmp_3, _mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
+        //     [2,1], [2,4],  [2,7] - [5,1], [5,4], [5,7]
+        // --> [7,2], [7,5], +[8,8] - [7,1], [7,4], [7,7] (update to destination rows)
+        box_perp_rows[7] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [2,2], [2,5], -[2,8] - [5,2], [5,5], -[5,8]
+        // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
+        box_perp_rows[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        box_perp_rows[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[0], shuf), shuf8x32);
+        box_perp_rows[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[1], shuf), shuf8x32);
+        box_perp_rows[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[2], shuf), shuf8x32);
+        box_perp_rows[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[3], shuf), shuf8x32);
+        box_perp_rows[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[4], shuf), shuf8x32);
+        box_perp_rows[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[5], shuf), shuf8x32);
+        box_perp_rows[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[6], shuf), shuf8x32);
+        box_perp_rows[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[7], shuf), shuf8x32);
+        box_perp_rows[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[8], shuf), shuf8x32);
+#endif
+    }
         __m256i *box_cols = (__m256i *)(this+1);
 
         // fudged and sideways carry-save adder
@@ -2591,11 +2689,13 @@ hidden_search:
     // Broadcast the nineth cell and or it for good measure, then andnot with 0x1ff
     // to isolate the hidden singles.
     // For the nineth cell, rotate and or one last time and use just one element of the result
-    // to check the nineth cell for a hidden single.
+    // to check the nineth cell for a hidden single.  These are grouped together and then checked.
     //
     // For boxes, loading of the data is the most expensive.
-    // You can follow the 'column' approach or the 'row' approach.  The column approach
-    // performs better, although it is harder to understand.
+    // Either the 'column' approach or the 'row' approach will work.
+    // However, box hidden single search can just be eliminated, an the triad processing
+    // will just eliminate all column/row-based occurrances of the single outside of the box.
+    // This way, the expensive loading of the boxes is eliminated.
     //
     // All checks use compression to a bit vector
     //
@@ -2729,7 +2829,7 @@ hidden_search:
                     __m256i missing = _mm256_andnot_si256(_mm256_or_si256(column_cand_or, *(__m256i*) &candidates[0]), mask9x1ff);
                     unsigned int m  = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
                     int idx = __tzcnt_u32(m)>>1;
-                    unsigned short digit = ((__v16hu)missing)[idx];
+                    unsigned short digit = ((v16us)missing)[idx];
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                         if ( warnings != 0 ) {
                             solverData.printf("Line %d: stack 0, back track - column %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
@@ -2796,15 +2896,12 @@ hidden_search:
         // P3 P3 P3 P3 P4 P3 P3 P3 C9
         // P4 P4 P4 P4 P4 P4 P4 P4 C9
         // P4 P4 P4 P4 P4 P4 P4 P4 C9
-        // R9 R9 R9 R9 R9 R9 R9 R9 C80
+        // R9 R9 R9 R9 R9 R9 R9 R9 C9
 
         // Px: processed in pairs of rows, for their first 8 cells
-        // C9: the 9th cell of each of the first 8 rows and boxes is prepared
+        // C9: the 9th cell of each of the rows is prepared
         //     and stored in row_9th_cand_vert.  row_9th_cand_vert is then processed at the end.
-        // R9: is processed for 8 cells of each rows and boxes, the cell 80
-        //     is processed using the row and box logic and stored in cand80_row
-        //     and cand80_box
-        // C80: the value of cand80_row is examined last
+        // R9: is processed for 8 cells
 
         // The examination of each row and its cells is made up of three steps:
         // 1 - or the other values of the row
@@ -2815,9 +2912,9 @@ hidden_search:
 
         // row_9th_cand_vert cumulates the 9th row or'ed singleton candidates
         // which are processed in the end.
-        __v8hu row_9th_cand_vert;
-        // the last singleton candidate of the grid.
-        unsigned short cand80_row = 0;
+#if USE_ROW_HIDDEN_SEARCH
+        v16us row_9th_cand_vert;
+#endif
         unsigned char irow = 0;
 
         // find hidden singles in rows
@@ -2831,13 +2928,35 @@ hidden_search:
             unsigned short the9thcand_row[2] = { candidates[i+8], candidates[i+17] };
 
             __m256i row_or7 = _mm256_setzero_si256();
+#if USE_ROW_HIDDEN_SEARCH
             __m256i row_or8;
+#endif
             __m256i row_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_row[1]),_mm_set1_epi16(the9thcand_row[0]));
 
+            __m256i row_triad_capture[2];
             {
                 __m256i c1_ = c1;
                 // A2 and A3.1.b
-                for (unsigned char j = 0; j < 7; ++j) {
+                // first lane for the row, 2nd lane for the box
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                row_or7 = _mm256_or_si256(c1_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                row_triad_capture[0] = _mm256_or_si256(row_or7, row_9th);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
+                // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
+                row_triad_capture[1] = row_or7 = _mm256_or_si256(c1_, row_or7);
+
+#if USE_ROW_HIDDEN_SEARCH
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                     // c1_ holds 2 lanes for two rows
                     c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
@@ -2850,14 +2969,17 @@ hidden_search:
                     if ( !_mm256_testz_si256(mask1ff,_mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff))) {
                         // the current grid has no solution, go back
                         if ( verbose != VNone ) {
+                            __m256i missing = _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff);
                             unsigned int m = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_setzero_si256(),
-                            _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff)));
+                                                                  missing));
+                            unsigned short digit = ((v16us)missing)[(m & 0xffff)?8:0];
+
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                                 if ( warnings != 0 ) {
-                                    solverData.printf("Line %d: stack 0, back track - row %d does not contain all digits\n", line, irow+(m & 0xffff)?0:1);
+                                    solverData.printf("Line %d: stack 0, back track - row %d does not contain digit %d\n", line, irow+(m & 0xffff)?0:1, __tzcnt_u16(digit)+1);
                                 }
                             } else if ( debug ) {
-                                solverData.printf("back track - missing digit in row %d\n", irow+(m & 0xffff)?0:1);
+                                solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, irow+((m & 0xffff)?1:0)); // XXX
                             }
                         }
                         goto back;
@@ -2893,142 +3015,25 @@ hidden_search:
                     e_digit = 0;
                     goto back;
                 }
+#endif
             }
-            if ( i == 72 ) {
-                break;
-            }
+            // deal with saved row_triad_capture:
+            // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
+            // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
+            // Blend the two captured vectors to contain all three triads in pos 7, 2 and 5
+            // shuffle the triads from pos 7,2,5 into pos 0,1,2
+            // spending 3 instructions on this: blend, shuffle, storeu
+            // a 'random' 4th unsigned short is overwritten by the next triad store
+            // (or is written into the gap 10th slot).
+            row_triad_capture[0] = _mm256_shuffle_epi8(_mm256_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),shuff725to012);
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture[0]));
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow+1]], _mm256_extracti128_si256(row_triad_capture[0],1));
 
-            if ( irow < 8 ) {
-                row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
-                row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
-            }
+#if USE_ROW_HIDDEN_SEARCH
+            row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
+            row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
+#endif
         }   // for row Px
-
-        __m256i row_triads_1, row_triads_2, row_triads_3;
-        // boxes:
-        //
-        // Note on nomenclature:
-        // The prefix box_perp stands for the special arrangement of the box data:
-        // Just as columns are arranged perpendicular to rows, so the box_perp are
-        // arranged as perpendicular (columns as an analogy) to the box representation
-        // in their canonical sequence of cells (rows as an analogy).
-        // One representation of box cells could be transposed into the other,
-        // in the same manner rows and columns can be transposed.
-        // This whole section follows step by step the algorithm applied to columns
-        // above, which is much easier to grasp.
-        {
-            __m256i box_perp_or_tails[9];
-            __m256i box_perp_or_head = _mm256_setzero_si256();
-            __m256i box_perp_cand_or = _mm256_setzero_si256();
-            // save the loaded 'rows':
-            // the save location is the next gridstate, where we can find it later
-            // for searching for conjugatge pairs (just before they are overwritten there
-            // by the new gridstate):
-            __m256i *box_perp_rows = (__m256i *) (grid_state+1);
-
-            {
-                box_perp_or_tails[8] = _mm256_setzero_si256();
-                // box 'columns' alias box_perp 'rows'
-                // to start, we simply tally the or'ed box_perp 'rows'
-            
-                // A2 (box_perps)
-                // precompute 'tails' of the or'ed box_perp_cand_or only once
-                // working backwords
-                unsigned short *candp = candidates;
-
-                // save the box_perp 'row's for later, at the price of 9 __m256i... 
-                for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
-                    box_perp_rows[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
-                                                          candp[27], candp[30],candp[33],
-                                                          candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
-                }
-                // 3 iterations, 'rows' 8, 7 and 6.
-                row_triads_3 = _mm256_setzero_si256();
-                unsigned char j = 8;
-                for ( ; j > 5; j--) {
-                    row_triads_3 = _mm256_or_si256(row_triads_3, box_perp_rows[j]);
-                    box_perp_or_tails[j-1] = row_triads_3;
-                }
-                // row_triads_3 now contains the third set of column-triads
-
-                // compute fresh row_triads_2
-                // A2 and A3.1.a
-                // 3 iterations, 'rows' 5, 4 and 3.
-                row_triads_2 = _mm256_setzero_si256();
-                for ( ; j > 2; j--) {
-                    row_triads_2 = _mm256_or_si256(row_triads_2, box_perp_rows[j]);
-                    box_perp_or_tails[j-1] = _mm256_or_si256(row_triads_2, row_triads_3);
-                }
-                // row_triads_2 now contains the second set of row-triads
-
-                // compute the remainder of the precomputed tails
-                box_perp_cand_or = box_perp_or_tails[2];
-                for ( ; j > 0; j--) {
-                    box_perp_or_tails[j-1] = box_perp_cand_or = _mm256_or_si256(box_perp_cand_or, box_perp_rows[j]);
-                }
-
-                // or in box_perp[0] and check whether all digits or covered
-                if ( check_back && !_mm256_testz_si256(mask9x1ff, _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_rows[0]), mask9x1ff)) ) {
-                    // the current grid has no solution, go back
-                    if ( verbose != VNone ) {
-                        __m256i missing = _mm256_andnot_si256(_mm256_or_si256(box_perp_cand_or, box_perp_rows[0]), mask9x1ff);
-                        unsigned int m  = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
-                        int idx = __tzcnt_u32(m)>>1;
-                        unsigned short digit = ((__v16hu)missing)[idx];
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                solverData.printf("Line %d: stack 0, back track - box %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
-                            }
-                        } else if ( debug ) {
-                            solverData.printf("back track - missing digit %d in box %d\n", __tzcnt_u16(digit)+1, idx);
-                        }
-                    }
-                    goto back;
-                }
-
-                for (unsigned int j = 0; j < 9; j++ ) {
-                    // computing the bitmask of unlocked box cells is too expensive,
-                    // instead mask out all singles (which are necessarily locked).
-                    __m256i box_perp_j_singles = _mm256_cmpeq_epi16(_mm256_and_si256(box_perp_rows[j], _mm256_sub_epi16(box_perp_rows[j], ones)), _mm256_setzero_si256());
-                    box_perp_cand_or = _mm256_or_si256(box_perp_or_tails[j], box_perp_cand_or);
-                    unsigned int mask = compress_epi16_boolean<false>(_mm256_andnot_si256(box_perp_j_singles, _mm256_cmpgt_epi16(mask9x1ff, box_perp_cand_or)));
-                    if ( mask) {
-                        int idx = __tzcnt_u32(mask);
-                        // idx gives us the box and j gives us the cell within the box.
-                        e_i = box_start_by_boxindex[idx] + box_offset[j];
-                        e_digit = 0x1ff & ~((v16us)box_perp_cand_or)[idx];
-                        if ( check_back && (e_digit & (e_digit-1)) ) {
-                            if ( verbose != VNone ) {
-                                if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                    if ( warnings != 0 ) {
-                                        solverData.printf("Line %d: stack 0, back track - col cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
-                                    }
-                                } else if ( debug ) {
-                                    solverData.printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
-                                }
-                            }
-                            goto back;
-                        }
-                        if ( verbose == VDebug ) {
-                            solverData.printf("hidden single (box)");
-                        }
-                        goto enter;
-                    }
-
-                    if ( j == 8 ) {
-                        break;
-                    }
-
-                    // leverage previously computed or'ed box_perp 'rows' in head and tails.
-                    box_perp_cand_or = box_perp_or_head = _mm256_or_si256(box_perp_rows[j], box_perp_or_head);            
-
-                    if ( j == 2 ) {
-                        // A3.1.c
-                        row_triads_1 = box_perp_or_head;
-                    }
-                }
-            }
-        }
 
         // 9th row
         {
@@ -3037,13 +3042,34 @@ hidden_search:
             unsigned short the9thcand_row = candidates[80];
 
             __m128i row_or7 = _mm_setzero_si128();
+#if USE_ROW_HIDDEN_SEARCH
             __m128i row_or8;
+#endif
             __m128i row_9th_elem = _mm_set1_epi16(the9thcand_row);
 
+            __m128i row_triad_capture[2];
             {
                 __m128i c_ = c;
                 // A2 and A3.1.b
-                for (unsigned char j = 0; j < 7; ++j) {
+                // first lane for the row, 2nd lane for the box
+                // step j=0
+                // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // step j=1
+                // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                row_or7 = _mm_or_si128(c_, row_or7);
+                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                row_triad_capture[0] = _mm_or_si128(row_or7, row_9th_elem);
+                // step j=2
+                // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
+                c_ = _mm_alignr_epi8(c_, c_, 2);
+                // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
+                row_triad_capture[1] = row_or7 = _mm_or_si128(c_, row_or7);
+#if USE_ROW_HIDDEN_SEARCH
+                // continue the rotate/or routine for this row
+                for (unsigned char j = 3; j < 7; ++j) {
                     // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                     c_ = _mm_alignr_epi8(c_, c_, 2);
                     row_or7 = _mm_or_si128(c_, row_or7);
@@ -3056,9 +3082,7 @@ hidden_search:
                         // the current grid has no solution, go back
                         if ( verbose != VNone ) {
                             __m128i missing = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff));
-                            unsigned int m = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_setzero_si128(), missing));
-                            //  unsigned char s_idx = __tzcnt_u32(m)>>1;
-                            unsigned short digit = ((__v8hu)missing)[(m & 0xffff)?8:0];
+                            unsigned short digit = ((v8us)missing)[0];
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                                 if ( warnings != 0 ) {
                                     solverData.printf("Line %d: stack 0, back track - row %d misses digit %d\n", line, 8, __tzcnt_u16(digit)+1);
@@ -3103,19 +3127,31 @@ hidden_search:
                         goto back;
                     }
                 }
+#endif
             } // row
+            // deal with saved row_triad_capture:
+            // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
+            // - captured triads 0 and 1 in pos 7 and 2 of row_triad_capture[1]
+            // Blend the two captured vectors to contain all three triads in pos 7, 2 and 5
+            // shuffle the triads from pos 7,2,5 into pos 0,1,2
+            // spending 3 instructions on this: blend, shuffle, storeu
+            // a 'random' 4th unsigned short is overwritten by the next triad store
+            // (or is written into the gap 10th slot).
+            row_triad_capture[0] = _mm_shuffle_epi8(_mm_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),_mm256_castsi256_si128(shuff725to012));
+            _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[8]], row_triad_capture[0]);
 
-            cand80_row = ~((v8us)row_or8)[0] & the9thcand_row;
-
+#if USE_ROW_HIDDEN_SEARCH
+            row_9th_cand_vert[8]     = ~((v8us)row_or8)[0] & the9thcand_row;
+#endif
         } // row R9
-
+#if USE_ROW_HIDDEN_SEARCH
         // check saved row singleton candidates (9th column)
 
-        unsigned int mask = _mm_movemask_epi8(_mm_cmpgt_epi16((__m128i)row_9th_cand_vert, _mm_setzero_si128()));
+        unsigned int mask = _mm256_movemask_epi8(_mm256_cmpgt_epi16((__m256i)row_9th_cand_vert, _mm256_setzero_si256())) & 0x3ffff;
         while (mask) {
             int s_idx = __tzcnt_u32(mask) >> 1;
             unsigned char celli = s_idx*9+8;
-            unsigned short cand = ((v8us)row_9th_cand_vert)[s_idx];
+            unsigned short cand = row_9th_cand_vert[s_idx];
             if ( ((bit128_t*)unlocked)->check_indexbit(celli) ) {
                 // check for a single.
                 // This is rare as it can only occur when a wrong guess was made.
@@ -3141,45 +3177,14 @@ hidden_search:
             }
             mask &= ~(3<<(s_idx<<1));
         }
-
-        // check cell 80
-        if ( cand80_row && ((bit128_t*)unlocked)->check_indexbit(80) ) {
-            // check for a single.
-            // This is rare as it can only occur when a wrong guess was made.
-            // the current grid has no solution, go back
-            if ( check_back && (cand80_row & (cand80_row-1)) ) {
-                if ( verbose != VNone ) {
-                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        if ( warnings != 0 ) {
-                            solverData.printf("Line %d: stack 0, multiple hidden singles in row cell %s\n", line, cl2txt[80]);
-                        }
-                    } else if ( debug ) {
-                        solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[80]);
-                    }
-                }
-                goto back;
-            }
-            if ( verbose == VDebug ) {
-                solverData.printf("hidden single (row)");
-            }
-            e_i = 80;
-            e_digit = cand80_row;
-            goto enter;
-        } // cell 80
-
-        // Store all column and row triads sequentially, paying attention to overlap.
+#endif
+        // Store all column triads sequentially, paying attention to overlap.
         //
         // A3.1.c
         _mm256_storeu_si256((__m256i *)triad_info.col_triads, col_triads_1);
         _mm256_storeu_si256((__m256i *)(triad_info.col_triads+10), col_triads_2);
         // mask 5 hi triads to 0xffff, which will not trigger any checks
         _mm256_storeu_si256((__m256i *)(triad_info.col_triads+20), _mm256_or_si256(col_triads_3, mask11hi));
-
-        _mm256_storeu_si256((__m256i *)triad_info.row_triads, row_triads_1);
-        _mm256_storeu_si256((__m256i *)(triad_info.row_triads+10), row_triads_2);
-        // mask 5 hi triads to 0xffff, which will not trigger any checks
-        _mm256_storeu_si256((__m256i *)(triad_info.row_triads+20), _mm256_or_si256(row_triads_3, mask11hi));
-
 
     } // Algo 2 and Algo 3.1
 
@@ -3509,7 +3514,7 @@ hidden_search:
                     unsigned char ltidx = i_rel + 9*i;  // logical triad index (within band, different layouts for row/col)
                     // compute bit offsets of the resolved triad
                     // and save the mask
-                    if ( _popcnt32(((__v16hu)tmustnt[i])[i_rel]) == 6 ) {
+                    if ( _popcnt32(((v16us)tmustnt[i])[i_rel]) == 6 ) {
                         if ( type == 0 ) {
                             rslvd_row_combo_tpos[i_rel/3] |= bandbits_by_index[row_triad_canonical_map[ltidx]%9];
                         } else {
@@ -3521,7 +3526,7 @@ hidden_search:
                     }
                     if ( verbose == VDebug ) {
                         char ret[32];
-                        format_candidate_set(ret, ((__v16hu)to_remove_v)[i_rel]);
+                        format_candidate_set(ret, ((v16us)to_remove_v)[i_rel]);
                         solverData.printf("remove %-5s from %s triad at %s\n", ret, type == 0? "row":"col",
                                cl2txt[type==0?row_triad_canonical_map[ltidx]*3:col_canonical_triad_pos[ltidx]] );
                     }
