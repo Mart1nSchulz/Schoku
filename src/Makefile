@@ -9,8 +9,9 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
-DFLAGS := -DNDEBUG
-#DFLAGS := -DNDEBUG -DOPT_SETS -DOPT_FSH -DOPT_UQR
+#DFLAGS := -DNDEBUG
+DFLAGS := -DNDEBUG -DOPT_NEWSETS
+#DFLAGS := -DNDEBUG -DOPT_NEWSETS -DOPT_FSH -DOPT_UQR
 # OPT_SETS
 #     resolves naked sets (complementary sets are labeled hidden sets
 # OPT_FSH
