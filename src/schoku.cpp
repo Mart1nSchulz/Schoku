@@ -1124,7 +1124,6 @@ inline __m256i andnot_get_next_lsb(__m256i lsb, __m256i &vec) {
 // The last mask operation isolates the last cell with bits in the highest 9 positions,
 // leading to a possibly negative results from mulhrs, requiring the last mask operation.  
 
-// [ beats manual loading hands down ]
 inline __m128i uncompress(__m128i in) {
         __m128i out =  _mm_and_si128(_mm256_castsi256_si128(mask_1ff),_mm_unpacklo_epi16(in, _mm_bsrli_si128(in, 1)));
         return _mm_and_si128(_mm256_castsi256_si128(mask1ff), _mm_mulhrs_epi16(out, _mm256_castsi256_si128(hrs_shifts)));
@@ -1132,11 +1131,17 @@ inline __m128i uncompress(__m128i in) {
 
 // uncompress first eight cells from contiguous bits to one unsigned short per cell
 // for two inputs in hi and lo lane
-inline __m256i uncompress(__m256i in) {
+// [ beats manual loading hands down ]
+
+inline __m256i uncompress(__m256i_u in) {
         __m256i out =  _mm256_and_si256(mask_1ff,_mm256_unpacklo_epi16(in, _mm256_bsrli_epi128(in, 1)));
         return _mm256_and_si256(mask1ff, _mm256_mulhrs_epi16(out, hrs_shifts));
 }
 
+// unscramble a 'row' from its intermediate representation [ see get_boxes_as_cols ]
+__m256i unscramble(__m256i in) {
+   return _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(in, shuf), shuf8x32);
+}
 inline void format_candidate_set(char *ret, unsigned short candidates);
 
 // a helper function to print a sudoku board,
@@ -1407,6 +1412,7 @@ public:
     bool bivaluesValid;
     bool cbbvsValid;
     bool sectionSetUnlockedValid[3];
+    __m256i *boxes_as_cols;   // stashed in the next grid_state
     TriadInfo triadInfo;
     unsigned char  guess_hint_index;
     unsigned short guess_hint_digit;
@@ -1491,6 +1497,105 @@ public:
             cbbvsValid = true;
         }
         return candidate_bits_by_value;
+    }
+
+    // get_boxes_as_cols (by default) returns a tranposition of the candidates such that
+    // each box is represented as a column and each __m256i ('row') represents the same cell of the nine boxes.
+    // This allows for example to count digits within a box, which in return allows
+    // to identify hidden pairs within boxes.
+    // The template parameter 'unscramble' indicates whether the final or the interim representation
+    // of the 'rows' is returned.
+    template< bool unscramble=true >
+    inline
+    __m256i *get_boxes_as_cols(unsigned short *candidates, __m256i *p_boxes_as_cols) {
+        if ( boxes_as_cols != 0 ) {
+            return boxes_as_cols;
+        }
+        
+        boxes_as_cols = p_boxes_as_cols;
+
+// Consider this loop:
+// from each box, pick the k-th cell:
+//        unsigned short *candp = candidates;
+//        for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
+//             boxes_as_cols[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
+//                                                  candp[27], candp[30],candp[33],
+//                                                  candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
+//        }
+// Replace the above loop with the code below for efficiency:
+
+        __m128i tmp_align2; // for aligning band 2 row
+        __m128i band1, band2, band3; // to process a row from the given band
+        __m256i tmp_row;     // to combine band1 and band3;
+        __m256i tmp_align;  // for aligning tmp_row, i.e. band 1 and 3 rows
+        unsigned short *inp=candidates;
+
+        // process row 1 of each band
+        //     [6,0], [6,3],  [6,6]
+        band2 = *(__m128i_u*)(inp+27);
+        tmp_align2 = *(__m128i_u*)(inp+27+8);
+        band1 = *(__m128i_u*)inp;
+        band3 = *(__m128i_u*)(inp+54);
+        // first load the rows/cells that aren't laterally or vertically shifted (for now)
+        //     [0,0], [0,3], [0,6] - [3,0], [3,3], [3,6]
+        // --> [0,0], [0,3], [0,6] - [3,1], [3,4], [3,7]
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+8),(__m128i*)(inp+8));
+        boxes_as_cols[0] = _mm256_set_m128i(band3,_mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        
+        //     [0,1], [0,4], [0,7] - [3,1], [3,4], [3,7]
+        // --> [1,0], [1,3], [1,6] - [4,1], [4,4], [4,7] (update to destination rows)
+        boxes_as_cols[1] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [0,2], [0,5], -[0,8] - [3,2], [3,5], -[3,8]
+        // --> [2,0], [2,3], +[2,6] - [5,1], [5,4], +[5,7] (update to destination rows)
+        boxes_as_cols[2] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        // process row 2 of each band
+        band2 = *(__m128i_u*)(inp+27+9);
+        tmp_align2 = *(__m128i_u*)(inp+27+9+8);
+        band1 = *(__m128i_u*)(inp+9);
+        band3 = *(__m128i_u*)(inp+54+9);
+        //     [1,0], [1,3], [1,6] - [4,0], [4,3], [4,6]
+        // --> [3,0], [3,3], [3,6] - [3,1], [3,4], [3,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+9+8),(__m128i*)(inp+9+8));
+        boxes_as_cols[3] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        //     [1,1], [1,4], [1,7] - [4,1], [4,4], [4,7]
+        // --> [4,0], [4,3], [4,6] - [4,1], [4,4], [4,7]
+        boxes_as_cols[4] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [1,2], [1,5], -[1,8] - [4,2], [4,5], -[4,8]
+        // --> [5,0], [5,3],  [5,6] - [5,1], [5,4], +[5,7]
+        boxes_as_cols[5] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        // process row 2 of each band
+        band2 = *(__m128i_u*)(inp+27+18);
+        tmp_align2 = *(__m128i_u*)(inp+27+18+8);
+        band1 = *(__m128i_u*)(inp+18);
+        band3 = *(__m128i_u*)(inp+54+18);
+        //     [2,0], [2,3],  [2,6] - [5,0], [5,3],  [5,6]
+        // --> [6,2], [6,5], +[6,8] - [6,1], [6,4],  [6,7] (update to destination rows)
+        tmp_row = _mm256_set_m128i(band3, band1);
+        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+18+8),(__m128i*)(inp+18+8));
+        boxes_as_cols[6] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        //     [2,1], [2,4],  [2,7] - [5,1], [5,4], [5,7]
+        // --> [7,2], [7,5], +[8,8] - [7,1], [7,4], [7,7] (update to destination rows)
+        boxes_as_cols[7] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
+        //     [2,2], [2,5], -[2,8] - [5,2], [5,5], -[5,8]
+        // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
+        boxes_as_cols[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
+
+        if ( unscramble ) {
+            boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
+            boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
+            boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
+            boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
+            boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
+            boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
+            boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
+            boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
+            boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        }
+        return boxes_as_cols;
     }
 
     template<Kind kind>
@@ -1877,7 +1982,7 @@ inline GridState* make_guess(SolverData *solverData) {
     }
 
     // if no suitable triad found, find a suitable bi-value.
-    return make_guess_bv<verbose>(solverData, solverData->output);
+    return make_guess<verbose>(*solverData);
 found:
     // update the current and the new grid_state with their respective candidate to delete
     unsigned short select_cand = 0x8000 >> __lzcnt16(*wo_musts);
@@ -1950,16 +2055,17 @@ found:
 // this version of make_guess is the simplest and original form of making a guess.
 //
 template<Verbosity verbose>
-inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
+inline GridState* make_guess(SolverData &solverData) {
     // Find a cell with the least candidates.
     // For bivalues, build a score and once done, keep the highest scoring bivalue.
     // If there are no bivalues, score trivalues.
     // Pick the candidate with the highest value as the guess.
     // Save the current grid state (with the chosen candidate eliminated) for tracking back.
 
-    bit128_t &bivalues = solverData->getBivalues(candidates);
-
     // Find the cell with fewest possible candidates
+    bit128_t &bivalues = solverData.getBivalues(candidates);
+    Counters &counters = solverData.counters;
+    FILE *output = solverData.output;
     unsigned char guess_index = 0;
     unsigned char best_index = 0xff;
     short best_score;
@@ -2014,8 +2120,8 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
         }
 
         // leverage any guess hints (e.g. by the fish algorithm)
-        if ( solverData->guess_hint_digit != 0 && score < guess_score_threshold ) {
-            return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->counters, solverData->output);
+        if ( solverData.guess_hint_digit != 0 && score < guess_score_threshold ) {
+            return make_guess<verbose>(solverData.guess_hint_index, solverData.guess_hint_digit, solverData.counters, solverData.output);
         }
 
         guess_index = best_index;
@@ -2023,7 +2129,7 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
             best_digit = candidates[guess_index];
         }
         digit = 0x8000 >> __lzcnt16(best_digit); 
-        return make_guess<verbose>(guess_index, digit, solverData->counters, output);
+        return make_guess<verbose>(guess_index, digit, counters, output);
     }
 
     // Trivalue scoring
@@ -2032,102 +2138,22 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
     // a puzzle with no bivalues is always hard - extra effort and solving algos are
     // appropriate.
     //
-        if ( verbose != VNone ) {
-            solverData->counters.no_bivals_count++;
-        }
+    if ( verbose != VNone ) {
+        counters.no_bivals_count++;
+    }
 
-        // save the box_perp 'row's for later, at the price of 9 __m256i...
-        // the save location is the next gridstate.
-        // This is of no particular interest for now but could be made part of SolverData
-
-        __m256i *box_perp_rows = (__m256i *) (this+1);
+    __m256i *boxes_as_cols = solverData.get_boxes_as_cols<false>(candidates, (__m256i*)(this+1));
 
     {
-
-// Replace this loop with the code below for efficiency:
-//        unsigned short *candp = candidates;
-//        for ( int k=0; k<9; candp += box_perp_ind_incr[k++]) {
-//             box_perp_rows[k] = _mm256_setr_epi16(candp[0], candp[3],candp[6],
-//                                                  candp[27], candp[30],candp[33],
-//                                                  candp[54], candp[57],candp[60], 0, 0, 0, 0, 0, 0, 0);
-//        }
-
-        __m256i tmp_align, tmp_row;
-        __m128i band2;
-        __m128i tmp_1, tmp_3, tmp_align2;
-        unsigned short *inp=candidates;
-        //     [6,0], [6,3],  [6,6]
-        band2 = *(__m128i_u*)(inp+27);
-        tmp_align2 = *(__m128i_u*)(inp+27+8);
-        tmp_1 = *(__m128i_u*)inp;
-        tmp_3 = *(__m128i_u*)(inp+54);
-        // first load the rows/cells that aren't laterally or vertically shifted (for now)
-        //     [0,0], [0,3], [0,6] - [3,0], [3,3], [3,6]
-        // --> [0,0], [0,3], [0,6] - [3,1], [3,4], [3,7]
-        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
-        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+8),(__m128i*)(inp+8));
-        box_perp_rows[0] = _mm256_set_m128i(tmp_3,_mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
-        
-        //     [0,1], [0,4], [0,7] - [3,1], [3,4], [3,7]
-        // --> [1,0], [1,3], [1,6] - [4,1], [4,4], [4,7] (update to destination rows)
-        box_perp_rows[1] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
-        //     [0,2], [0,5], -[0,8] - [3,2], [3,5], -[3,8]
-        // --> [2,0], [2,3], +[2,6] - [5,1], [5,4], +[5,7] (update to destination rows)
-        box_perp_rows[2] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
-
-        band2 = *(__m128i_u*)(inp+27+9);
-        tmp_align2 = *(__m128i_u*)(inp+27+9+8);
-        tmp_1 = *(__m128i_u*)(inp+9);
-        tmp_3 = *(__m128i_u*)(inp+54+9);
-        //     [1,0], [1,3], [1,6] - [4,0], [4,3], [4,6]
-        // --> [3,0], [3,3], [3,6] - [3,1], [3,4], [3,7] (update to destination rows)
-        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
-        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+9+8),(__m128i*)(inp+9+8));
-        box_perp_rows[3] = _mm256_set_m128i(tmp_3, _mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
-        //     [1,1], [1,4], [1,7] - [4,1], [4,4], [4,7]
-        // --> [4,0], [4,3], [4,6] - [4,1], [4,4], [4,7]
-        box_perp_rows[4] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
-        //     [1,2], [1,5], -[1,8] - [4,2], [4,5], -[4,8]
-        // --> [5,0], [5,3],  [5,6] - [5,1], [5,4], +[5,7]
-        box_perp_rows[5] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
-
-        band2 = *(__m128i_u*)(inp+27+18);
-        tmp_align2 = *(__m128i_u*)(inp+27+18+8);
-        tmp_1 = *(__m128i_u*)(inp+18);
-        tmp_3 = *(__m128i_u*)(inp+54+18);
-        //     [2,0], [2,3],  [2,6] - [5,0], [5,3],  [5,6]
-        // --> [6,2], [6,5], +[6,8] - [6,1], [6,4],  [6,7] (update to destination rows)
-        tmp_row = _mm256_set_m128i(tmp_3, tmp_1);
-        tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+18+8),(__m128i*)(inp+18+8));
-        box_perp_rows[6] = _mm256_set_m128i(tmp_3, _mm_blend_epi16(tmp_1, _mm_slli_si128(band2,2), 0x92));
-        //     [2,1], [2,4],  [2,7] - [5,1], [5,4], [5,7]
-        // --> [7,2], [7,5], +[8,8] - [7,1], [7,4], [7,7] (update to destination rows)
-        box_perp_rows[7] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
-        //     [2,2], [2,5], -[2,8] - [5,2], [5,5], -[5,8]
-        // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
-        box_perp_rows[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
-
-        box_perp_rows[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[0], shuf), shuf8x32);
-        box_perp_rows[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[1], shuf), shuf8x32);
-        box_perp_rows[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[2], shuf), shuf8x32);
-        box_perp_rows[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[3], shuf), shuf8x32);
-        box_perp_rows[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[4], shuf), shuf8x32);
-        box_perp_rows[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[5], shuf), shuf8x32);
-        box_perp_rows[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[6], shuf), shuf8x32);
-        box_perp_rows[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[7], shuf), shuf8x32);
-        box_perp_rows[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(box_perp_rows[8], shuf), shuf8x32);
-    }
-        __m256i *box_cols = (__m256i *)(this+1);
-
         // fudged and sideways carry-save adder
         __m256i accu[3];
         __m256i tmp, cpairs;
-        __m256i carry = box_cols[1];
-        accu[0] = _mm256_xor_si256(box_cols[0], carry);
-        accu[1] = _mm256_and_si256(box_cols[0], carry);
+        __m256i carry = boxes_as_cols[1];
+        accu[0] = _mm256_xor_si256(boxes_as_cols[0], carry);
+        accu[1] = _mm256_and_si256(boxes_as_cols[0], carry);
         accu[2] = _mm256_setzero_si256();
         for (unsigned int i=2; i<9; i++ ) {
-           carry   = box_cols[i];
+           carry   = boxes_as_cols[i];
            tmp     = _mm256_xor_si256(accu[0], carry);
            carry   = _mm256_and_si256(accu[0], carry);
            accu[0] = tmp;
@@ -2141,6 +2167,7 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
         if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
             // cpairs contains, for each box, the digits that are conjugate pairs
             // (i.e. bilocated digits) in this box.
+            cpairs = unscramble(cpairs);
 
             unsigned char boxi = 0;
             for ( ; boxi < 9; boxi++ ) {
@@ -2185,9 +2212,9 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
                             fprintf(output, "hidden pair (box): %-7s %s\n", ret, cl2txt[score_index+pos1]);
                         }
                         if ( verbose != VNone ) {
-                            solverData->counters.naked_sets_found++;
+                            counters.naked_sets_found++;
                         }
-                        return make_guess<verbose>(score_index+pos1, dgt, solverData->counters, output);
+                        return make_guess<verbose>(score_index+pos1, dgt, counters, output);
                     }
                     // score this conjugate pair
                     mskByStart[lpos1] = mskpos;
@@ -2220,43 +2247,44 @@ inline GridState* make_guess_bv(SolverData *solverData, FILE *output) {
             }
 
             if ( best_index != 0xff ) {
-                return make_guess<verbose>(best_index, best_digit, solverData->counters, output);
+                return make_guess<verbose>(best_index, best_digit, counters, output);
             }
         }
+    }
 
-        // leverage any guess hints (e.g. by the fish algorithm)
-        if ( solverData->guess_hint_digit != 0 ) {
-            return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->counters, solverData->output);
+    // leverage any guess hints (e.g. by the fish algorithm)
+    if ( solverData.guess_hint_digit != 0 ) {
+        return make_guess<verbose>(solverData.guess_hint_index, solverData.guess_hint_digit, solverData.counters, solverData.output);
+    }
+
+    // find a trivalue cell if nothing else helps.
+
+    unsigned char cnt;
+    unsigned char best_cnt = 16;
+    unsigned char i_rel;
+    unsigned long long to_visit = unlocked.u64[0];
+    while ( best_cnt > 3 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit);
+        cnt = __popcnt16(candidates[i_rel]);
+        if (cnt < best_cnt) {
+            best_cnt = cnt;
+            guess_index = i_rel;
         }
+    }
 
-        // find a trivalue cell if nothing else helps.
-
-        unsigned char cnt;
-        unsigned char best_cnt = 16;
-        unsigned char i_rel;
-        unsigned long long to_visit = unlocked.u64[0];
-        while ( best_cnt > 3 && to_visit != 0 ) {
-            i_rel = tzcnt_and_mask(to_visit);
-            cnt = __popcnt16(candidates[i_rel]);
-            if (cnt < best_cnt) {
-                best_cnt = cnt;
-                guess_index = i_rel;
-            }
+    to_visit = unlocked.u64[1];
+    while ( best_cnt > 3 && to_visit != 0 ) {
+        i_rel = tzcnt_and_mask(to_visit) + 64;
+        cnt = __popcnt16(candidates[i_rel]);
+        if (cnt < best_cnt) {
+            best_cnt = cnt;
+            guess_index = i_rel;
         }
-
-        to_visit = unlocked.u64[1];
-        while ( best_cnt > 3 && to_visit != 0 ) {
-            i_rel = tzcnt_and_mask(to_visit) + 64;
-            cnt = __popcnt16(candidates[i_rel]);
-            if (cnt < best_cnt) {
-                best_cnt = cnt;
-                guess_index = i_rel;
-            }
-        }
-        // Find the first candidate in this cell (lsb set)
-        // Note: using tzcnt would be equally valid; this pick is historical
-        digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
-        return make_guess<verbose>(guess_index, digit, solverData->counters, output);
+    }
+    // Find the first candidate in this cell (lsb set)
+    // Note: using tzcnt would be equally valid; this pick is historical
+    digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+    return make_guess<verbose>(guess_index, digit, counters, output);
 }
 
 // this version of make_guess takes a cell index and digit for the guess
@@ -2769,6 +2797,7 @@ hidden_search:
     solverData.sectionSetUnlockedValid[0] = solverData.sectionSetUnlockedValid[1] = 
                                             solverData.sectionSetUnlockedValid[2] = false;
     solverData.guess_hint_digit = 0;
+    solverData.boxes_as_cols = 0;
 
     // Algorithm 2 - Find hidden singles
     // For all sections (ie. rows/columns/boxes):
@@ -4238,12 +4267,37 @@ hidden_search:
     // Roofed X-wings are labeled as 'skyscraper'.
     // Skyscrapers are quite frequent.
     //
+    // Note: while the term skyscraper is used appropriately, it is noteworthy to point
+    //       out that the the skyscrapers detected here all come with a 'strong' base.
+    //       This means that:
+    //       A. not all skyscrapers are detected
+    //       B. the skyscrapers' detected roof fins are mutually exclusive
+    //          whereas for regular skyscrapers the roof fins can both be true.
+    //       A more comprehensive detection of skyscrapers should be added in the future.
+    //
     // with the cbbvs in place, look for simple 'fishes'
 
     cbbv_t cbbv_v;
 
     bit128_t *candidate_bits_by_value = solverData.getCbbvs(candidates);
+    __m256i cbbv_digits;
+    __m256i unlocked_x2 = _mm256_set_m128i (grid_state->unlocked.m128, grid_state->unlocked.m128);
     for ( unsigned char dgt = 0; dgt < 9; dgt++) {
+        bit128_t cbbv_digit;
+        // load a vector eliminating solved cells
+        cbbv_digit.m128  = _mm_and_si128(candidate_bits_by_value[dgt].m128, grid_state->unlocked.m128);
+        if ( dgt & 1 ) {
+            // load cbbv_v from hi lane
+            cbbv_v.m256 = _mm256_zextsi128_si256(_mm256_extracti128_si256(cbbv_digits, 1));
+        } else {
+            // load candidate_bits for two digits.
+            cbbv_digits = uncompress(_mm256_and_si256(unlocked_x2,*(__m256i_u*)&candidate_bits_by_value[dgt].m128));
+            // load cbbv_v from low lane
+            cbbv_v.m256 = _mm256_zextsi128_si256(_mm256_castsi256_si128(cbbv_digits));
+        }
+        // add last element to cbbv_v
+        cbbv_v.m256 = _mm256_insert_epi16(_mm256_and_si256(mask1ff,cbbv_v.m256), *(__int16*)&candidate_bits_by_value[dgt].u8[9], 8);
+
         // don't bother with six cells already resolved, a swordfish cannot be subdivided.
         // a jellyfish is final with 8 candidates (4 x 2), so 8 + 5 = 13 cannot be divided
         // unless it is already.
@@ -4251,12 +4305,6 @@ hidden_search:
         if ( candidate_bits_by_value[dgt].popcount() < 14 ) {
             continue;
         }
-        // load a vector eliminating solved cells
-        bit128_t cbbv_digit = { .u128= candidate_bits_by_value[dgt].u128 & grid_state->unlocked.u128 };
-
-        // load cbbv_v
-        __m128i off0 = uncompress(cbbv_digit.m128);
-        cbbv_v.m256 = _mm256_insert_epi16(_mm256_and_si256(mask1ff,_mm256_castsi128_si256(off0)), *(__int16*)&cbbv_digit.u8[9], 8);
         unsigned long long hi = cbbv_digit.u64[1];
 #if 0
         unsigned long long lo = cbbv_digit.u64[0];
@@ -4264,6 +4312,7 @@ hidden_search:
 dump_m256i_grid(cbbv_v.m256, "new");
 dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo>>36, lo>>45, lo>>54, (lo>>63)|(hi<<1), hi>>8, 0, 0, 0, 0, 0, 0, 0),mask1ff), "old");
 #endif
+
         // do a quick popcnt of all rows or'ed together to determine the maximum fish size
         __m128i max_v = _mm256_castsi256_si128(_mm256_or_si256(cbbv_v.m256, _mm256_bsrli_epi128(cbbv_v.m256,8)));
         max_v = _mm_or_si128(max_v, _mm_bsrli_si128(max_v,4));
@@ -4581,8 +4630,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 }
                             }
                             if ( verbose != VNone ) {
-                                counters.fishes_specials_detected++;
                                 counters.fishes_detected++;
+                                counters.fishes_specials_detected++;
                             }
 
                             unsigned int boxbase_x = base_x & box_bits;
@@ -4958,8 +5007,8 @@ done:
                             }
                             // skyscraper is not singled out in statistics
                             if ( verbose != VNone ) {
-                                counters.fishes_specials_detected++;
                                 counters.fishes_detected++;
+                                counters.fishes_specials_detected++;
                             }
 
                             unsigned int boxbase_x = base_x & box_bits;
