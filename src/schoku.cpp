@@ -1076,7 +1076,9 @@ public:
     long long triads_resolved;              // how many triads did we resolved
     long long triad_updates;                // how many triads did cancel candidates
     long long naked_sets_searched;          // how many naked sets did we search for
-    long long naked_sets_found;             // how many naked sets did we actually find
+//    long hidden_sets_searched;            // how many hidden sets did we search for
+    long long naked_sets_found;            // how many naked sets did we actually find
+    long hidden_sets_found;                // how many hidden sets did we actually find
     long long unique_rectangles_checked;   // how many unique rectangles were checked
     long long unique_rectangles_avoided;   // how many unique rectangles were avoided
     long long fishes_detected;             // how many fishes were identified
@@ -1104,7 +1106,9 @@ inline Counters &operator += (Counters &a) {
     this->triads_resolved += a.triads_resolved;
     this->triad_updates += a.triad_updates;
     this->naked_sets_searched += a.naked_sets_searched;
+//    this->hidden_sets_searched += a.hidden_sets_searched;
     this->naked_sets_found += a.naked_sets_found;  
+    this->hidden_sets_found += a.hidden_sets_found;  
     this->unique_rectangles_checked += a.unique_rectangles_checked;
     this->unique_rectangles_avoided += a.unique_rectangles_avoided;
     this->fishes_detected += a.fishes_detected;
@@ -1493,6 +1497,10 @@ inline __m256i uncompress(__m256i_u in) {
         return _mm256_and_si256(mask1ff, _mm256_mulhrs_epi16(out, hrs_shifts));
 }
 
+// unscramble a 'row' from its intermediate representation [ see get_boxes_as_cols ]
+__m256i unscramble(__m256i in) {
+   return _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(in, shuf), shuf8x32);
+}
 inline void format_candidate_set(char *ret, unsigned short candidates);
 
 // a helper function to print a sudoku board,
@@ -1850,10 +1858,13 @@ public:
         return candidate_bits_by_value;
     }
 
-    // get_boxes_as_cols returns a tranposition of the candidates such that
+    // get_boxes_as_cols (by default) returns a tranposition of the candidates such that
     // each box is represented as a column and each __m256i ('row') represents the same cell of the nine boxes.
     // This allows for example to count digits within a box, which in return allows
     // to identify hidden pairs within boxes.
+    // The template parameter 'unscramble' indicates whether the final or the interim representation
+    // of the 'rows' is returned.
+    template< bool unscramble=true >
     inline
     __m256i *get_boxes_as_cols(unsigned short *candidates, __m256i *p_boxes_as_cols) {
         if ( boxes_as_cols != 0 ) {
@@ -1932,16 +1943,46 @@ public:
         // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
         boxes_as_cols[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
 
-        boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
-        boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
-        boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
-        boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
-        boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
-        boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
-        boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
-        boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
-        boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        if ( unscramble ) {
+            boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
+            boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
+            boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
+            boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
+            boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
+            boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
+            boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
+            boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
+            boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        }
         return boxes_as_cols;
+    }
+
+    template<bool do_unscramble=false>
+    inline
+    __m256i get_column_bilocates(__m256i_u *candidates_cols) {
+        // fudged and sideways carry-save adder
+        __m256i accu[3];
+        __m256i tmp, cpairs;
+        __m256i carry = candidates_cols[1];
+        accu[0] = _mm256_xor_si256(candidates_cols[0], carry);
+        accu[1] = _mm256_and_si256(candidates_cols[0], carry);
+        accu[2] = _mm256_setzero_si256();
+        for (unsigned int i=2; i<9; i++ ) {
+           carry   = candidates_cols[i];
+           tmp     = _mm256_xor_si256(accu[0], carry);
+           carry   = _mm256_and_si256(accu[0], carry);
+           accu[0] = tmp;
+           tmp     = _mm256_xor_si256(accu[1], carry);
+           carry   = _mm256_and_si256(accu[1], carry);
+           accu[1] = tmp;
+           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
+        }
+        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+        if ( do_unscramble ) {
+            cpairs = unscramble(cpairs);
+        }
+
+        return _mm256_and_si256(cpairs, mask9x1ff);
     }
 
     template<Kind kind>
@@ -2458,26 +2499,9 @@ inline GridState* make_guess(SolverData &solverData) {
 
     {
 
-        __m256i *boxes_as_cols = solverData.get_boxes_as_cols(candidates, (__m256i*)(this+1));
+        __m256i *boxes_as_cols = solverData.get_boxes_as_cols<false>(candidates, (__m256i*)(this+1));
 
-        // fudged and sideways carry-save adder
-        __m256i accu[3];
-        __m256i tmp, cpairs;
-        __m256i carry = boxes_as_cols[1];
-        accu[0] = _mm256_xor_si256(boxes_as_cols[0], carry);
-        accu[1] = _mm256_and_si256(boxes_as_cols[0], carry);
-        accu[2] = _mm256_setzero_si256();
-        for (unsigned int i=2; i<9; i++ ) {
-           carry   = boxes_as_cols[i];
-           tmp     = _mm256_xor_si256(accu[0], carry);
-           carry   = _mm256_and_si256(accu[0], carry);
-           accu[0] = tmp;
-           tmp     = _mm256_xor_si256(accu[1], carry);
-           carry   = _mm256_and_si256(accu[1], carry);
-           accu[1] = tmp;
-           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
-        }
-        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+        __m256i cpairs = solverData.get_column_bilocates<true>(boxes_as_cols);
 
         if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
             // cpairs contains, for each box, the digits that are conjugate pairs
@@ -2688,6 +2712,7 @@ Status solve(signed char grid[81], GridState stack[], int line, Counters &counte
     unsigned short* candidates;
 
     Status status;
+    bool hidden_pair_once = true;
 
     SolverData solverData(counters, out);
     unsigned short current_entered_count = 81 - grid_state->unlocked.popcount();
@@ -3877,6 +3902,7 @@ hidden_search:
                 tmustnt[2] = _mm256_or_si256(tmustnt[2], tmust2);
 
             ptriads = triads;
+            // Do triad updates:
             // compare tmustnt with the triads.
             unsigned int row_combo_tpos[3] {};
             unsigned int rslvd_row_combo_tpos[3] {};
@@ -4122,6 +4148,173 @@ hidden_search:
     }
 
 #ifdef OPT_BIVALS
+//
+// opportunistically resolve some hidden pairs from boxes
+//
+// This is a fair win in terms of solves without guesses.
+// The problem is that it somewhat conflicts with naked sets (but which is subject to
+// configuration.)  Speed is OK, but it could use some throttling, notably with very hard puzzles.
+// Conceptually this fits with the other bivalues stuff, but technically it is completely separate.
+//
+// The OPT_BIVALS algorithms could be further made configurable. 
+//
+    if ( mode_bivals ) {
+    {
+//    if ( hidden_pair_once )
+        __m256i *boxes_as_cols = solverData.get_boxes_as_cols<false>(candidates, (__m256i*)(grid_state+1));
+        __m256i cpairs = solverData.get_column_bilocates<true>(boxes_as_cols);
+
+        hidden_pair_once = false;
+
+            bool do_search = false;
+        if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
+            // cpairs contains, for each box, the digits that are conjugate pairs
+            // (i.e. bilocated digits) in this box.
+
+            unsigned char boxi = 0;
+            for ( ; boxi < 9; boxi++ ) {
+                // extract the boxes conjugate pair digits
+                unsigned int dgtit = ((v16us)cpairs)[boxi];
+                if ( __popcnt16(dgtit) < 2 ) {
+                     continue;
+                }
+                unsigned char bs = box_start_by_boxindex[boxi];
+                unsigned short *boxp = candidates+bs;
+                __m256i box = _mm256_setr_epi64x(*(unsigned long long *)(boxp),
+                                                 *(unsigned long long *)(boxp+9),
+                                                 *(unsigned long long *)(boxp+18), 0);
+                unsigned int mskByStart[9] {};
+                unsigned short dgtByStart[9] {};
+                unsigned char pos1, pos2;
+                unsigned short dgt;
+                while ( dgtit ) {
+                    dgt  = __blsi_u32(dgtit);
+                    tzcnt_and_mask(dgtit);
+                    unsigned int mskpos = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(box,_mm256_set1_epi16(dgt)), _mm256_setzero_si256())) & 0x3f3f3f;
+                    unsigned char lpos1 = _tzcnt_u32(mskpos)>>1;
+                    pos1 = group4x3offsets[lpos1];
+                    lpos1 = lpos1 - lpos1/4;
+                    pos2 = group4x3offsets[(62-__lzcnt64(mskpos))>>1];
+                    // check for hidden pair
+                    if ( mskByStart[lpos1] == mskpos ) {
+                        // this is a hidden pair, simply guess dgti in pos1
+                        // this will resolve at minimum 2 cells
+                        unsigned short cands = dgtByStart[lpos1] | dgt; 
+                        bool is_hidden_pair = false;
+#ifdef OPT_SETS
+                        viewbits_t v;
+                        v.u32 = viewbits_by_i[bs+pos1].u32 & viewbits_by_i[bs+pos2].u32;
+                        Kind where = v.kindof();
+                        grid_state->set23_found[Box].set_indexbit(bs+pos1);
+                        grid_state->set23_found[Box].set_indexbit(bs+pos2);
+                        if ( where != Box ) {
+                            grid_state->set23_found[where].set_indexbit(bs+pos1);
+                            grid_state->set23_found[where].set_indexbit(bs+pos2);
+                        }
+#endif
+                        if ( candidates[bs+pos1] != cands ) {
+                            is_hidden_pair = true;
+                            do_search = true;
+                            candidates[bs+pos1] &= cands;
+                        }
+                        if ( candidates[bs+pos2] != cands ) {
+                            is_hidden_pair = true;
+                            do_search = true;
+                            candidates[bs+pos2] &= cands;
+                        }
+                        if ( verbose == VDebug && is_hidden_pair ) {
+                            char ret[32];
+                            format_candidate_set(ret, cands);
+                            solverData.printf("hidden pair (box): %-7s %s\n", ret, cl2txt[bs+pos1]);
+                        }
+                        if ( verbose != VNone && is_hidden_pair ) {
+                            counters.hidden_sets_found++;
+                        }
+                    }
+                    mskByStart[lpos1] = mskpos;
+                    dgtByStart[lpos1] = dgt;
+                }
+            }
+        }
+
+        // and the same for cols:
+        __m256i_u rows[9] = { *(__m256i_u*)&candidates[0], *(__m256i_u*)&candidates[9], *(__m256i_u*)&candidates[18],
+                            *(__m256i_u*)&candidates[27], *(__m256i_u*)&candidates[36], *(__m256i_u*)&candidates[45],
+                            *(__m256i_u*)&candidates[54], *(__m256i_u*)&candidates[63], *(__m256i_u*)&candidates[72] };
+        cpairs = solverData.get_column_bilocates(rows);
+
+        if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
+            // cpairs contains, for each box, the digits that are conjugate pairs
+            // (i.e. bilocated digits) in this box.
+
+            unsigned char coli = 0;
+            for ( ; coli < 9; coli++ ) {
+                // extract the boxes conjugate pair digits
+                unsigned int dgtit = ((v16us)cpairs)[coli];
+                if ( __popcnt16(dgtit) < 2 ) {
+                     continue;
+                }
+                unsigned short *colp = candidates+coli;
+// slow?
+                __m256i col = _mm256_setr_epi16(colp[0], colp[9], colp[18], 
+                                                colp[27], colp[36], colp[45],
+                                                colp[54], colp[63], colp[72], 0, 0, 0, 0, 0, 0, 0);
+                unsigned int mskByStart[9] {};
+                unsigned short dgtByStart[9] {};
+                unsigned char pos1, pos2;
+                unsigned short dgt;
+                while ( dgtit ) {
+                    dgt  = __blsi_u32(dgtit);
+                    tzcnt_and_mask(dgtit);
+                    unsigned int mskpos = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(col,_mm256_set1_epi16(dgt)), _mm256_setzero_si256()));
+                    unsigned char lpos1 = _tzcnt_u32(mskpos)>>1;
+                    pos1 = lpos1*9;
+                    pos2 = ((62-__lzcnt64(mskpos))>>1)*9;
+                    // check for hidden pair
+                    if ( mskByStart[lpos1] == mskpos ) {
+                        // this is a hidden pair, simply guess dgti in pos1
+                        // this will resolve at minimum 2 cells
+                        unsigned short cands = dgtByStart[lpos1] | dgt; 
+                        bool is_hidden_pair = false;
+#ifdef OPT_SETS
+                        viewbits_t v;
+                        v.u32 = viewbits_by_i[coli+pos1].u32 & viewbits_by_i[coli+pos2].u32;
+                        grid_state->set23_found[Col].set_indexbit(coli+pos1);
+                        grid_state->set23_found[Col].set_indexbit(coli+pos2);
+                        if ( v.u32 & 0x4ff0000 ) {
+                            grid_state->set23_found[Box].set_indexbit(coli+pos1);
+                            grid_state->set23_found[Box].set_indexbit(coli+pos2);
+                        }
+#endif
+                        if ( candidates[coli+pos1] != cands ) {
+                            is_hidden_pair = true;
+                            do_search = true;
+                            candidates[coli+pos1] &= cands;
+                        }
+                        if ( candidates[coli+pos2] != cands ) {
+                            is_hidden_pair = true;
+                            do_search = true;
+                            candidates[coli+pos2] &= cands;
+                        }
+                        if ( verbose == VDebug && is_hidden_pair ) {
+                            char ret[32];
+                            format_candidate_set(ret, cands);
+                            solverData.printf("hidden pair (col): %-7s %s\n", ret, cl2txt[coli+pos1]);
+                        }
+                        if ( verbose != VNone && is_hidden_pair ) {
+                            counters.hidden_sets_found++;
+                        }
+                    }
+                    mskByStart[lpos1] = mskpos;
+                    dgtByStart[lpos1] = dgt;
+                }
+            }
+        }
+            if ( do_search ) {
+                goto search;
+            }
+    }
+
 // This approach is based on bivalue cells.
 // It is rather opportunistic, as it combines a search for naked pairs and triples
 // (consisting of bivalue cells) and Y-wings consisting also of threee bivalue cells
@@ -4170,7 +4363,7 @@ hidden_search:
 //  II.     W-wings, since at their starting point depends on bi-value cells.
 //          
 
-    if ( mode_bivals ) {
+//    if ( mode_bivals ) {
         bit128_t bivalues = solverData.getBivalues(candidates);
         bit128_t allKindSet23 = { .u128= grid_state->set23_found[Row] & grid_state->set23_found[Col] & grid_state->set23_found[Box] };
         bit128_t s0_it = bivalues;
@@ -5216,8 +5409,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 continue;
                             }
                             if ( verbose != VNone ) {
-                                counters.fishes_specials_detected++;
                                 counters.fishes_detected++;
+                                counters.fishes_specials_detected++;
                             }
 
                             unsigned int boxbase_x = base_x & box_bits;
@@ -5516,8 +5709,8 @@ done:
                                 continue;
                             }
                             if ( verbose != VNone ) {
-                                counters.fishes_specials_detected++;
                                 counters.fishes_detected++;
+                                counters.fishes_specials_detected++;
                             }
 
                             unsigned int boxbase_x = base_x & box_bits;
@@ -7180,6 +7373,7 @@ using namespace Schoku;
         if ( mode_bivals ) {
             printf("%10ld  %6.2f/puzzle  Y-wing updates\n", global_counters.ywing_updates, (double)global_counters.ywing_updates/global_counters.solved_count);
             printf("%10ld  %6.2f/puzzle  W-wing updates\n", global_counters.wwing_updates, (double)global_counters.	wwing_updates/global_counters.solved_count);
+            printf("%10ld  %6.2f/puzzle  hidden sets found\n", global_counters.hidden_sets_found, (double)global_counters.hidden_sets_found/global_counters.solved_count);
         }
 #endif
 
