@@ -6518,9 +6518,20 @@ using namespace Schoku;
         argv++;
     }
 
-    char opts[80] = { 0 };
+    // Buffer holds the reflected command line for "-x" stats output (may
+    // be silently truncated for very long argv; truncation is harmless to
+    // solver behavior). Original was [80] which overflows on realistic
+    // absolute paths and triggers SIGABRT under fortified libcs (Apple
+    // clang/macOS). Sized to accommodate typical CLI plus two long file
+    // paths; snprintf bounds the writes regardless of argv length.
+    char opts[1024] = { 0 };
+    size_t used = 0;
     for (int i = 0; i < argc; i++) {
-        sprintf(opts+strlen(opts), "%s ", argv[i]);
+        if (used >= sizeof(opts) - 1) break;
+        int n = snprintf(opts + used, sizeof(opts) - used, "%s ", argv[i]);
+        if (n < 0) break;
+        used += (size_t)n;
+        if (used >= sizeof(opts) - 1) { opts[sizeof(opts) - 1] = 0; break; }
     }
 
     while ( argc && argv[0][0] == '-' ) {
@@ -6792,7 +6803,11 @@ using namespace Schoku;
         // reduction(...) allows to aggregate results from all threads using a single declaration of the aggregate
         // declare reduction defines a reduction constructs (name, data type, operation)
 
-#pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in)
+// initializer is required to zero-init per-thread copies; without it clang
+// leaves them indeterminate (parity bug observed on clang/Linux x86_64 and
+// Apple clang/macOS aarch64). gcc happened to zero-init via calloc by chance.
+#pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in) \
+    initializer(omp_priv = Counters())
 
 #pragma omp parallel reduction(counters_reduction:global_counters) firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads)
         {
