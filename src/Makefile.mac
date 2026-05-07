@@ -1,0 +1,55 @@
+# macOS / Apple Silicon build: clang++ + libomp (Homebrew) + simde for AVX2->NEON.
+# Usage:  make -f Makefile.mac
+#         make -f Makefile.mac XCC=/usr/bin/clang++   # override compiler
+#
+# Assumes Homebrew prefix /opt/homebrew with simde and libomp installed.
+TARGET   := schoku
+
+# Compiler is overridable. Either CXX=... or XCC=... on the make command line.
+XCC      ?= /usr/bin/clang++
+CXX      ?= $(XCC)
+
+BREW     ?= /opt/homebrew
+SIMDE    ?= $(BREW)/opt/simde/include
+LIBOMP   ?= $(BREW)/opt/libomp
+SDK      ?= $(shell xcrun --show-sdk-path)
+
+DFLAGS   := -DNDEBUG -DOPT_NEWSETS
+OFLAGS   := -O3
+WFLAGS   := -Wall -Wextra -Wno-missing-braces -Wno-unused-const-variable \
+            -Wno-unneeded-internal-declaration -Wno-deprecated-declarations \
+            -Wno-c++11-narrowing -Wno-constant-conversion
+ARCHFLAGS:=
+
+# -isysroot pins the SDK so a stale /usr/local/include can't shadow libc++.
+# -stdlib=libc++ + explicit libc++ include is the user-tested override that
+# also works around environments with mixed GCC/libstdc++ on /opt/homebrew.
+CXXFLAGS := -std=gnu++17 $(OFLAGS) $(WFLAGS) $(DFLAGS) $(ARCHFLAGS) \
+            -stdlib=libc++ \
+            -isysroot $(SDK) \
+            -I$(SDK)/usr/include/c++/v1 \
+            -I. -isystem $(SIMDE) -Xpreprocessor -fopenmp -isystem $(LIBOMP)/include
+LDFLAGS  := -stdlib=libc++ -isysroot $(SDK) \
+            -L$(SDK)/usr/lib -L$(LIBOMP)/lib -lomp -pthread
+
+SRC      := schoku.cpp
+OBJ      := schoku.o
+
+.PHONY: all clean check-prereqs
+all: check-prereqs $(TARGET)
+
+# Fail early with a clear message if Homebrew prereqs / SDK are missing,
+# instead of producing cryptic include errors halfway through the build.
+check-prereqs:
+	@test -d "$(SIMDE)"  || { echo "ERROR: simde headers not found at $(SIMDE). Install with: brew install simde" >&2; exit 1; }
+	@test -d "$(LIBOMP)" || { echo "ERROR: libomp not found at $(LIBOMP). Install with: brew install libomp" >&2; exit 1; }
+	@test -n "$(SDK)" && test -d "$(SDK)" || { echo "ERROR: macOS SDK not found via xcrun --show-sdk-path. Install Xcode Command Line Tools." >&2; exit 1; }
+
+$(TARGET): $(OBJ)
+	$(CXX) $(OBJ) -o $@ $(LDFLAGS)
+
+$(OBJ): $(SRC) compat/x86_intrin.hpp compat/msvc_intrin.hpp compat/bmi_shim.hpp
+	$(CXX) $(CXXFLAGS) -c $(SRC) -o $(OBJ)
+
+clean:
+	$(RM) $(TARGET) $(OBJ)

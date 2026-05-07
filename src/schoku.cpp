@@ -90,8 +90,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <omp.h>
-#include <stdbool.h>
-#include <intrin.h>
+#include "compat/x86_intrin.hpp"
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <condition_variable>
@@ -656,11 +655,11 @@ const __m256i lut_hi = _mm256_set_epi8('?', '?', '?', '?', '?', '?', '?', '8', '
 const __m256i ones = _mm256_set1_epi16(1);
 
 // used in verify:
-const __m256i mask9 { -1LL, -1LL, 0xffffLL, 0 };
+const __m256i mask9 = _mm256_setr_epi64x(-1LL, -1LL, 0xffffLL, 0);
 const __m256i ones9 = _mm256_and_si256(ones, mask9);
 
 // used in triads:
-const __m256i mask11hi { 0LL, 0LL, 0xffffLL<<48, ~0LL };
+const __m256i mask11hi = _mm256_setr_epi64x(0LL, 0LL, 0xffffLL<<48, ~0LL);
 const __m256i mask1ff   = _mm256_set1_epi16(0x1ff);
 const __m256i mask9x1ff = _mm256_and_si256(mask1ff, mask9);
 
@@ -683,7 +682,7 @@ const __m256i shuff_row_mask2 = _mm256_setr_epi8( 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 
                                                   8, 9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
 
 // used in triad resolution
-const __m256i mask27 { -1LL, (long long int)0xffffffffffff00ffLL, (long long int)0xffffffff00ffffffLL, 0xffffffffffLL };
+const __m256i mask27 = _mm256_setr_epi64x(-1LL, (long long int)0xffffffffffff00ffLL, (long long int)0xffffffff00ffffffLL, 0xffffffffffLL);
 const __m256i threes    = _mm256_set1_epi8 ( 3 );
 const __m256i fours     = _mm256_set1_epi8 ( 4 );
 //   popcnt by nibble
@@ -745,7 +744,7 @@ public:
     long not_verified_count;               // puzzles non verified (with -v)
     long verified_count;                   // puzzles successfully verified (with -v)
     long no_bivals_count;                  // counts board states without bivalues
-inline Counters &operator += (Counters &a) {
+inline Counters &operator += (const Counters &a) {
     this->past_naked_count += a.past_naked_count;
     this->digits_entered_and_retracted += a.digits_entered_and_retracted;
     this->triads_resolved += a.triads_resolved;
