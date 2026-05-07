@@ -1,0 +1,16 @@
+# Parity matrix: each row is one test case.
+# Format:  dataset_basename<TAB>flags<TAB>label
+# The flags string is appended verbatim to the schoku command line.
+# `label` is a slug used in golden filenames (golden/<dataset>_<label>.sha256).
+puzzles_tiny50	-x -t1	t1
+puzzles_tiny50	-x -t8	t8
+puzzles_big5000	-x -t1	t1
+puzzles_big5000	-x -t4	t4
+puzzles_big5000	-x -t8	t8
+# puzzles_solved10 is intentionally omitted: original solver loops on already-
+# solved boards (Regular rules expect at least one empty cell). Same input
+# under -rO can also misbehave. Don't bench on degenerate inputs.
+puzzles_invalid5	-x -t1 -rO	t1_rO
+puzzles_invalid5	-x -t8 -rO	t8_rO
+puzzles_big5000	-x -t8 -ms	t8_ms
+puzzles_big5000	-x -t8 -mn	t8_mn
