@@ -6714,6 +6714,10 @@ using namespace Schoku;
         line_to_solve = 0;
     }
     size_t outnpuzzles = line_to_solve ? 1 : npuzzles;
+    // Single source of truth for the output mapping size — used by
+    // ftruncate, mmap, and munmap below. Splitting these used to allow
+    // a npuzzles/outnpuzzles mismatch under -l# (see git log for fix).
+    const size_t output_bytes = outnpuzzles * 164;
 
 	if ( (fsize -pre -post + 1) % 82 ) {
 		fprintf(stderr, "found %ld puzzles with %ld(start)+%ld(end) extra characters\n", (fsize - pre - post + 1)/82, pre, post);
@@ -6727,7 +6731,7 @@ using namespace Schoku;
 			exit(0);
 		}
 	}
-    if ( ftruncate(fdout, (size_t)outnpuzzles*164) == -1 ) {
+    if ( ftruncate(fdout, output_bytes) == -1 ) {
 		if (errno ) {
 			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
 		}
@@ -6735,7 +6739,7 @@ using namespace Schoku;
 	}
 
 	// map the output file
-    output = (signed char *)mmap((void*)0, outnpuzzles*164, PROT_WRITE, MAP_SHARED, fdout, 0);
+    output = (signed char *)mmap((void*)0, output_bytes, PROT_WRITE, MAP_SHARED, fdout, 0);
 	if ( output == MAP_FAILED ) {
 		if (errno ) {
 			printf("Error mmap of output file %s: %s\n", ofn, strerror(errno));
@@ -6858,7 +6862,13 @@ using namespace Schoku;
 			fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
 		}
 	}
-	err = munmap(output, (size_t)npuzzles*164);
+	// Pass the exact length used by mmap. POSIX permits a larger len here
+	// (it unmaps every page in [output, output+len)), but the extra range
+	// can fall on pages later allocated by libc/libomp/etc. and tear them
+	// down — observed as SIGSEGV under -l# on both gcc/Linux and
+	// clang/macOS, where outnpuzzles=1 but the original code passed
+	// npuzzles*164.
+	err = munmap(output, output_bytes);
 	if ( err == -1 ) {
 		if (errno ) {
 			fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
