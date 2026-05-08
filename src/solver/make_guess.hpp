@@ -107,7 +107,8 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
     unsigned short *wo_musts;  // pointer to triads' 'without must' candidates
     TriadInfo &triad_info = solverData->triadInfo;
 
-    for ( int i=0; i<2; i++ ) {
+    bool found_triad = false;
+    for ( int i=0; i<2 && !found_triad; i++ ) {
         type = i;
         unsigned long long totest = triad_info.triads_selection[i];
         wo_musts  = type==0?triad_info.row_triads_wo_musts:triad_info.col_triads_wo_musts;
@@ -131,19 +132,22 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
                 }
                 // found the right candidate
                 wo_musts += ti;
-                goto found;
+                found_triad = true;
+                break;
             }
         }
     }
 
-    // leverage any guess hints (e.g. by the fish algorithm)
-    if ( solverData->guess_hint_digit != 0 ) {
-        return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->counters, solverData->output);
+    if ( !found_triad ) {
+        // leverage any guess hints (e.g. by the fish algorithm)
+        if ( solverData->guess_hint_digit != 0 ) {
+            return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->counters, solverData->output);
+        }
+
+        // if no suitable triad found, find a suitable bi-value.
+        return make_guess<verbose>(*solverData);
     }
 
-    // if no suitable triad found, find a suitable bi-value.
-    return make_guess<verbose>(*solverData);
-found:
     // update the current and the new grid_state with their respective candidate to delete
     unsigned short select_cand = 0x8000 >> __lzcnt16(*wo_musts);
 
