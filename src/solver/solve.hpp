@@ -16,11 +16,12 @@
 // The existing single-TU layout (everything inlined into schoku.cpp)
 // is preserved.
 //
-// Future work can subdivide this header into per-strategy modules
-// (hidden-single, triad, naked-sets, fishes, UQR) once the goto
-// control flow that crosses those boundaries is converted into
-// structured control. That conversion is non-trivial and was kept
-// out of this strict-restructuring commit.
+// The function body is structured as a state machine: an enum
+// SolverPhase + outer `for(;;) switch(phase)` replaced the original
+// labels-and-gotos. Future work can subdivide this header into
+// per-strategy modules (hidden-single, triad, naked-sets, fishes,
+// UQR) by lifting each case body into its own function returning
+// the next SolverPhase.
 #pragma once
 
 template <Verbosity verbose>
@@ -76,7 +77,7 @@ Status solve(signed char grid[81], GridState stack[], int line, Counters &counte
         solverData.printf("Line %d: %.81s\n", line, gridout);
     }
 
-    // The 'API' for code that uses the 'goto enter:' method of entering digits
+    // The 'API' for code that transitions to Phase_Enter to enter a digit:
     unsigned short e_digit = 0;
     unsigned char e_i = 0;
 
@@ -91,9 +92,21 @@ Status solve(signed char grid[81], GridState stack[], int line, Counters &counte
     unsigned short flip = 1;  // for naked sets search to support a search with 50% reduction of tests
 #endif
 
-    goto start;
+    enum SolverPhase {
+        Phase_Back,
+        Phase_Start,
+        Phase_Search,
+        Phase_Enter,
+        Phase_HiddenSearch,
+        Phase_Guess,
+#ifdef OPT_UQR
+        Phase_GuessMadeWithIncr,
+#endif
+    };
+    SolverPhase phase = Phase_Start;
 
-back:
+    for (;;) switch (phase) {
+    case Phase_Back: {
 
     // Each algorithm (naked single, hidden single, naked set)
     // has its own non-solvability detecting trap door to detect if the grid is bad.
@@ -146,7 +159,8 @@ back:
     }
     grid_state--;
 
-start:
+    } [[fallthrough]];
+    case Phase_Start: {
 
     e_digit = 0;
 
@@ -163,7 +177,8 @@ start:
     }
 #endif
 
-search:
+    } [[fallthrough]];
+    case Phase_Search: {
     // find a naked single (first one will do)
     {
         __m256i c1;
@@ -188,7 +203,7 @@ search:
                         solverData.printf("back track - cell %s is 0\n", cl2txt[pos]);
                     }
                 }
-                goto back;
+                phase = Phase_Back; continue;
             }
             // test for singletons
             c1 = _mm256_cmpeq_epi16(_mm256_and_si256(c1, _mm256_sub_epi16(c1, ones)), _mm256_setzero_si256());
@@ -200,12 +215,12 @@ search:
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  single      ");
                 }
-                goto enter;
+                phase = Phase_Enter; continue;
             }
         }
     }
     // if no single found:
-    goto hidden_search;
+    phase = Phase_HiddenSearch; continue;
 
 // Algorithm 1:
 // Enter a digit into the solution by setting it as the value of cell and by
@@ -214,7 +229,8 @@ search:
 // For all cells check whether the cell has no candidates: back track.
 // Check all cells for a single candidate.
 //
-enter:
+    }
+    case Phase_Enter: {
 
     {
         // inlined flavor of enter_digit
@@ -276,7 +292,7 @@ enter:
                     }
                 }
                 e_digit=0;
-                goto back;
+                phase = Phase_Back; continue;
             }
             unsigned int mask = and_compress_masks<false>(a, grid_state->unlocked.u16[j>>4]);
             if ( mask ) {
@@ -298,7 +314,7 @@ enter:
                             solverData.printf("back track - cell %s is 0\n", cl2txt[80]);
                         }
                     }
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
             }
             if ( __popcnt16(candidates[80]) == 1) {
@@ -308,7 +324,7 @@ enter:
                 }
                 e_i = 80;
                 e_digit = candidates[80];
-                goto enter;
+                phase = Phase_Enter; continue;
             }
         }
         if ( dtct_m ) {
@@ -318,7 +334,7 @@ enter:
             if ( verbose == VDebug ) {
                 solverData.printf("naked  single      ");
             }
-            goto enter;
+            phase = Phase_Enter; continue;
         }
         e_digit = 0;
     }
@@ -442,7 +458,7 @@ enter:
                 solverData.printf("Solution: %.81s\nBack track to determine uniqueness\n", grid);
             }
             unique_check_mode = 1;
-            goto back;
+            phase = Phase_Back; continue;
         }
         // otherwise uniqueness checking is complete
         if ( status.unique == false ) {
@@ -451,7 +467,8 @@ enter:
         return status;
     }
 
-hidden_search:
+    } [[fallthrough]];
+    case Phase_HiddenSearch: {
     // reset solverData
     solverData.bivaluesValid = false;
     solverData.cbbvsValid = false;
@@ -634,7 +651,7 @@ hidden_search:
                         solverData.printf("back track - missing digit %d in column %d\n", __tzcnt_u16(digit)+1, idx);
                     }
                 }
-                goto back;
+                phase = Phase_Back; continue;
             }
 
             // breaking the column hidden singles out of the loop this way will win some performance
@@ -662,12 +679,12 @@ hidden_search:
                                 solverData.printf("back track - multiple hidden singles in col cell %s\n", cl2txt[e_i]);
                             }
                         }
-                        goto back;
+                        phase = Phase_Back; continue;
                     }
                     if ( verbose == VDebug ) {
                         solverData.printf("hidden single (col)");
                     }
-                    goto enter;
+                    phase = Phase_Enter; continue;
                 }
 
                 // leverage previously computed or'ed rows in head and tails.
@@ -778,7 +795,7 @@ hidden_search:
                                 solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, irow+((m & 0xffff)?1:0)); // XXX
                             }
                         }
-                        goto back;
+                        phase = Phase_Back; continue;
                     }
                 }
             }
@@ -799,7 +816,7 @@ hidden_search:
                         if ( verbose == VDebug ) {
                             solverData.printf("hidden single (row)");
                         }
-                        goto enter;
+                        phase = Phase_Enter; continue;
                     }
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                         if ( warnings != 0 ) {
@@ -809,7 +826,7 @@ hidden_search:
                         solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[e_i]);
                     }
                     e_digit = 0;
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
 #endif
             }
@@ -887,7 +904,7 @@ hidden_search:
                                 solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, 8);
                             }
                         }
-                        goto back;
+                        phase = Phase_Back; continue;
                     }
                 }
             }
@@ -908,7 +925,7 @@ hidden_search:
                         if ( verbose == VDebug ) {
                             solverData.printf("hidden single (row)");
                         }
-                        goto enter;
+                        phase = Phase_Enter; continue;
                     } else {
                         if ( verbose != VNone ) {
                             if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
@@ -920,7 +937,7 @@ hidden_search:
                             }
                         }
                         e_digit = 0;
-                        goto back;
+                        phase = Phase_Back; continue;
                     }
                 }
 #endif
@@ -962,14 +979,14 @@ hidden_search:
                             solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[celli]);
                         }
                     }
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
                 if ( verbose == VDebug ) {
                     solverData.printf("hidden single (row)");
                 }
                 e_i = celli;
                 e_digit = cand;
-                goto enter;
+                phase = Phase_Enter; continue;
             }
             mask &= ~(3<<(s_idx<<1));
         }
@@ -1352,7 +1369,7 @@ hidden_search:
         } // for type (cols,rows)
 
         if ( any_changes ) {
-            goto search;
+            phase = Phase_Search; continue;
         }
     }
 
@@ -1394,18 +1411,18 @@ hidden_search:
                             solverData.printf("checking a bi-value universal grave.\n");
                         }
                     }
-                    goto guess;
+                    phase = Phase_Guess; continue;
                 } else if ( grid_state->stackpointer ) {
                     if ( verbose == VDebug ) {
                         solverData.printf("back track - found a bi-value universal grave.\n");
                     }
-                    goto back;
+                    phase = Phase_Back; continue;
                 } else {   // busted.  This is not a valid puzzle under standard rules.
                     if ( verbose == VDebug ) {
                         solverData.printf("Found a bi-value universal grave. This means at least two solutions exist.\n");
                     }
                     status.unique = false;  // set to non-unique even under Regular rules
-                    goto guess;
+                    phase = Phase_Guess; continue;
                 }
             } else if ( sum2+1 == N ) {  // find the single cell with count > 2
                 bit128_t gt2 = { .u128 = ((bit128_t*)unlocked)->u128 & ~bivalues.u128 };
@@ -1447,14 +1464,14 @@ hidden_search:
                         if ( rules == Regular ) {
                             e_i = target;
                             e_digit = digit;
-                            goto enter;
+                            phase = Phase_Enter; continue;
                         } else {
                             if ( verbose == VDebug ) {
                                 solverData.printf("\n");
                             }
                             grid_state = grid_state->make_guess<verbose>(target, digit, counters, solverData.output);
                         }
-                        goto start;
+                        phase = Phase_Start; continue;
                     }
                 }
             }
@@ -1622,7 +1639,7 @@ hidden_search:
                     }
                 }
                 // no need to update grid_state
-                goto back;
+                phase = Phase_Back; continue;
             }
 #if 0
             c_intersect = _mm256_or_si256(c_intersect,
@@ -1749,7 +1766,7 @@ hidden_search:
                             if ( verbose != VNone ) {
                                 counters.naked_sets_found++;
                             }
-                            goto search;
+                            phase = Phase_Search; continue;
                         }
                     }
 //dump_board(candidates, "board");
@@ -1796,7 +1813,7 @@ hidden_search:
                         }
                     }
                     // no need to update grid_state
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
 //dbgprintf(1, "cnt1=%d, cnt2=%d, cnts=%x\n", cnt1, cnt2, cnts);
 //dbgprintf(1, "popcnt32(cnts & 0xff)+1=%d, _popcnt32(cnts >> 8)+1=%d\n", _popcnt32(cnts & 0xff)+1, _popcnt32(cnts >> 8)+1);
@@ -1887,7 +1904,7 @@ hidden_search:
                             if ( verbose != VNone ) {
                                 counters.naked_sets_found++;
                             }
-                            goto search;
+                            phase = Phase_Search; continue;
                         }
                     }
                 }
@@ -2023,7 +2040,7 @@ hidden_search:
                                 }
                             }
                             // no need to update grid_state
-                            goto back;
+                            phase = Phase_Back; continue;
                         } else if (s == cnt && cnt+2 <= ul) {
                             char ret[32];
                             int delta = ul-cnt;
@@ -2155,7 +2172,7 @@ hidden_search:
                                     }
                                 }
                                 // no need to update grid_state
-                                goto back;
+                                phase = Phase_Back; continue;
                             }
                         }
                         for ( int j=0; j<2; j++) {
@@ -2250,7 +2267,7 @@ hidden_search:
                 // If any cell's candidates got updated, go back and try all that other stuff again
                 if (found) {
                     grid_state->updated.u128 = to_visit_n.u128 | tv.u128 | to_visit_again.u128;
-                    goto search;
+                    phase = Phase_Search; continue;
                 }
             } else if ( cnt == 1 ) {
                 // this is not possible, but just to eliminate cnt == 1:
@@ -2262,7 +2279,7 @@ hidden_search:
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  (sets) ");
                 }
-                goto enter;
+                phase = Phase_Enter; continue;
             }
         } // while
       }
@@ -2425,7 +2442,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     if ( verbose == VDebug ) {
                         solverData.printf("back track - insufficient number of rows to form %s for digit %d based on row %d\n", fish_names[cnt-2], dgt+1, t);
                     }
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
 
                 bit128_t clean_bits {};
@@ -2689,12 +2706,12 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
-                        goto enter;
+                        phase = Phase_Enter; continue;
                     }
                     dosearch = true;
                 }
                 if ( dosearch ) {
-                    goto search;
+                    phase = Phase_Search; continue;
                 }
             } // if
             // scan for two bi-values forming a triple...
@@ -2779,7 +2796,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     if ( verbose == VDebug ) {
                         solverData.printf("back track - insufficient number of cols to form %s for digit %d based on row %d\n", fish_names[cnt-2], dgt+1, t);
                     }
-                    goto back;
+                    phase = Phase_Back; continue;
                 }
 
                 bit128_t clean_bits {};
@@ -2999,12 +3016,12 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
-                        goto enter;
+                        phase = Phase_Enter; continue;
                     }
                     dosearch = true;
                 }
                 if ( dosearch ) {
-                    goto search;
+                    phase = Phase_Search; continue;
                 }
             }
             // scan for two bi-values forming a triple...
@@ -3016,19 +3033,25 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     pos[i] = 8-tzcnt_and_mask(pair_locs);
                 }
                 unsigned short res = 0;
-                for ( unsigned int i=0; i<pair_cnt-1; i++) {
+                bool fish2_alt_found = false;
+                for ( unsigned int i=0; i<pair_cnt-1 && !fish2_alt_found; i++) {
                     for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
                         if ( ( __popcnt16(res = cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]])) == 3 ) {
                             alt_base_x = res;
-                            goto done2;
+                            fish2_alt_found = true;
+                            break;
                         }
                     }
                 }
+                if ( !fish2_alt_found ) {
+                    continue;
+                }
+            } else {
+                continue;
             }
-            continue;
-done2:
-            t = 7;  // one iteration with the made-up data
-            pair_locs = 0; // will skip this section next time...
+            // alternative pattern synthesised; replay this iteration with t pinned at 7.
+            t = 7;
+            pair_locs = 0;
         } // for t
     } // for dgt
     } // mode_fish
@@ -3452,7 +3475,7 @@ if ( mode_uqr )
                                     oldgs.candidates[celli]  &= ~newgs.candidates[celli];
                                     msg[1] = guess_message[1];
                                 }, solverData.counters, solverData.output);
-                                goto guess_made_with_incr;
+                                phase = Phase_GuessMadeWithIncr; continue;
                             }
                             // otherwise simply avoid the UQR:
                             candidates[celli] &= ~single;
@@ -3467,7 +3490,7 @@ if ( mode_uqr )
                                 if ( verbose == VDebug ) {
                                     solverData.printf("naked  single      ");
                                 }
-                                goto enter;
+                                phase = Phase_Enter; continue;
                             }
                             found_update = true;
                         }
@@ -3481,7 +3504,7 @@ if ( mode_uqr )
                                 format_candidate_set(ret, all_digits);
                                 solverData.printf("back track - found a completed unique rectangle %s at %s %s\n", ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
                             }
-                            goto back;
+                            phase = Phase_Back; continue;
                         } else {
                             // there's no point doing anything here... except:
                             if ( grid_state->stackpointer == 0 ) {
@@ -3583,7 +3606,7 @@ if ( mode_uqr )
                                         oldgs.candidates[corner4_index]  &= ~other_cands;
                                         msg[1] = guess_message[1];
                                     }, solverData.counters, solverData.output);
-                                    goto guess_made_with_incr;
+                                    phase = Phase_GuessMadeWithIncr; continue;
                                 }
                                 // simply avoid the UQR
                                 candidates[corner4_index] &= ~pair;
@@ -3601,7 +3624,7 @@ if ( mode_uqr )
                                     if ( verbose == VDebug ) {
                                         solverData.printf("naked  single      ");
                                     }
-                                    goto enter;
+                                    phase = Phase_Enter; continue;
                                 }
                                 found_update = true;
                             }
@@ -3690,7 +3713,7 @@ if ( mode_uqr )
                                                 if ( verbose == VDebug ) {
                                                     solverData.printf("back track - found an unavoidable unique rectangle %s at %s %s\n", ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx]);
                                                 }
-                                                goto back;
+                                                phase = Phase_Back; continue;
                                             } else {
                                                 // there's no point doing anything here...
                                                 // not even:
@@ -3747,7 +3770,7 @@ if ( mode_uqr )
                                                     oldgs.candidates[weak_corner_indx] = weak_corner_y;
                                                     msg[1] = guess_message[1];
                                                 }, solverData.counters, solverData.output);
-                                                goto guess_made_with_incr;
+                                                phase = Phase_GuessMadeWithIncr; continue;
                                             }
                                             // simply avoid the UQR
                                             candidates[weak_corner_indx] &= ~weak_corner_y;
@@ -3762,7 +3785,7 @@ if ( mode_uqr )
                                                 if ( verbose == VDebug ) {
                                                     solverData.printf("naked  single      ");
                                                 }
-                                                goto enter;
+                                                phase = Phase_Enter; continue;
                                             }
                                             found_update = true;
                                         }
@@ -3817,14 +3840,14 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            goto enter;
+                                            phase = Phase_Enter; continue;
                                         } else if ( (candidates[indx2upd[1]] & (candidates[indx2upd[1]] - 1)) == 0 ) {
                                             e_digit = candidates[indx2upd[1]];
                                             e_i = indx2upd[1];
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            goto enter;
+                                            phase = Phase_Enter; continue;
                                         }
                                     } else {
                                         if ( is_diag ) {
@@ -3852,7 +3875,7 @@ if ( mode_uqr )
                                                             oldgs.candidates[indx2upd[1]] &= ~other_cand;
                                                             msg[1] = guess_message[1];
                                                         }, solverData.counters, solverData.output);
-                                             goto guess_made_with_incr;
+                                             phase = Phase_GuessMadeWithIncr; continue;
                                         } else {
                                             if ( verbose == VDebug ) {
 
@@ -3877,7 +3900,7 @@ if ( mode_uqr )
                                                             oldgs.candidates[indx2upd[0]] = uqr_cand;
                                                             msg[1] = guess_message[1];
                                                         }, solverData.counters, solverData.output);
-                                             goto guess_made_with_incr;
+                                             phase = Phase_GuessMadeWithIncr; continue;
                                         }
                                     }
                                 }
@@ -4013,7 +4036,7 @@ if ( mode_uqr )
                                         solverData.printf("\n");
                                     }
                                     if ( got_single ) {
-                                        goto search;
+                                        phase = Phase_Search; continue;
                                     }
                                 }
                             } else {
@@ -4078,7 +4101,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            goto enter;
+                                            phase = Phase_Enter; continue;
                                         }
                                     } else {
                                         if ( verbose == VDebug ) {
@@ -4104,7 +4127,7 @@ if ( mode_uqr )
                                                     oldgs.candidates[indx] = uqr_alt_cand;
                                                     msg[1] = guess_message[1];
                                                 }, solverData.counters, solverData.output);
-                                        goto guess_made_with_incr;
+                                        phase = Phase_GuessMadeWithIncr; continue;
                                     }
                                 }
                             }
@@ -4125,22 +4148,26 @@ if ( mode_uqr )
         }
         if ( found_update ) {
             last_band_uqr = (band+1)%6;
-            goto search;
+            phase = Phase_Search; continue;
         };
     }
 }
 #endif
 
-guess:
+    } [[fallthrough]];
+    case Phase_Guess: {
     // Make a guess if all that didn't work
     grid_state = grid_state->make_guess<verbose>(&solverData);
     no_guess_incr = 0;
 #ifdef OPT_UQR
 // if the guess was made solely to allow for checking uniqueness, still count the solution
 // as direct solve
-guess_made_with_incr:
+    } [[fallthrough]];
+    case Phase_GuessMadeWithIncr: {
 #endif
     current_entered_count  = (grid_state->stackpointer<<8) | (81 - grid_state->unlocked.popcount());
-    goto start;
-
+    phase = Phase_Start; continue;
+    }  // end last case body
+    }  // end switch
+    __builtin_unreachable();
 }
