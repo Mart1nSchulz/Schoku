@@ -32,6 +32,9 @@ while IFS=$'\t' read -r dataset flags label; do
     [[ -z "${dataset:-}" ]] && continue
 
     in="$DATA/${dataset}.txt"
+    # Dataset may include a subdir component (e.g. `buckets/b01_singles`).
+    # Ensure the WORK and GOLDEN parents exist so the per-row paths resolve.
+    mkdir -p "$(dirname "$WORK/${dataset}_${label}.sols")"
     out="$WORK/${dataset}_${label}.sols"
     expect_file="$GOLDEN/${dataset}_${label}.sha256"
     expect=$(cat "$expect_file" 2>/dev/null || echo "MISSING")

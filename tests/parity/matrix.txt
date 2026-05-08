@@ -14,3 +14,18 @@ puzzles_invalid5	-x -t1 -rO	t1_rO
 puzzles_invalid5	-x -t8 -rO	t8_rO
 puzzles_big5000	-x -t8 -ms	t8_ms
 puzzles_big5000	-x -t8 -mn	t8_mn
+# AlphaEvolve mutation buckets: each row is a sub-corpus stratified by the
+# most-advanced technique its solution path requires (per sudoku_rs_core's
+# rater, max-tier rule). Goal: a mutation in one Schoku phase localises to
+# the bucket(s) that exercise it. -t1 is deterministic (no thread race).
+# Bucket policy + sources: see tests/bucketize.py and tests/build_buckets.sh.
+buckets/b01_singles	-x -t1	t1
+buckets/b02_locked	-x -t1	t1
+buckets/b03_pair	-x -t1	t1
+buckets/b04_triple_quad	-x -t1	t1
+buckets/b06_xwing	-x -t1	t1
+buckets/b07_swordfish	-x -t1	t1
+buckets/b08_jellyfish	-x -t1	t1
+buckets/b09_ur	-x -t1	t1
+buckets/b10_chains	-x -t1	t1
+buckets/b11_t4_hard	-x -t1	t1
