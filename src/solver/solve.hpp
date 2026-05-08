@@ -1416,52 +1416,49 @@ hidden_search:
                     target = 64;
                 }
                 target += __tzcnt_u64(m);
-            } else {
-                goto no_bug;
-            }
-            if ( __popcnt16(candidates[target]) == 3 ) {
-                unsigned char row = row_index[target];
-                unsigned short cand3 = candidates[target];
-                unsigned short digit = 0;
-                unsigned short mask = ((bit128_t*)unlocked)->get_indexbits(row*9,9);
-                __m256i maskv = expand_bitvector(mask);
-                __m256i c = _mm256_and_si256(_mm256_load_si256((__m256i*) &candidates[row*9]), maskv);
-                while (cand3) {
-                    unsigned short canddigit = __blsi_u32(cand3);
-                    // count cells with this candidate digit:
-                    __m256i tmp = _mm256_and_si256(_mm256_set1_epi16(canddigit), c);
-                    // as a boolean
-                    tmp = _mm256_cmpeq_epi16(tmp,_mm256_setzero_si256());
-                    // need three cell, doubled bits in mask:
-                    if ( _popcnt32(~_mm256_movemask_epi8(tmp)) == 3*2 ) {
-                        digit = canddigit;
-                        break;
-                    }
-                    cand3 &= ~canddigit;
-                }
-                if ( digit ) {
-                    if ( verbose != VNone ) {
-                        counters.bug_plus1_count++;
-                    }
-                    if ( verbose == VDebug ) {
-                        solverData.printf("bi-value universal grave + 1: pivot:");
-                    }
-                    if ( rules == Regular ) {
-                        e_i = target;
-                        e_digit = digit;
-                        goto enter;
-                    } else {
-                        if ( verbose == VDebug ) {
-                            solverData.printf("\n");
+
+                if ( __popcnt16(candidates[target]) == 3 ) {
+                    unsigned char row = row_index[target];
+                    unsigned short cand3 = candidates[target];
+                    unsigned short digit = 0;
+                    unsigned short mask = ((bit128_t*)unlocked)->get_indexbits(row*9,9);
+                    __m256i maskv = expand_bitvector(mask);
+                    __m256i c = _mm256_and_si256(_mm256_load_si256((__m256i*) &candidates[row*9]), maskv);
+                    while (cand3) {
+                        unsigned short canddigit = __blsi_u32(cand3);
+                        // count cells with this candidate digit:
+                        __m256i tmp = _mm256_and_si256(_mm256_set1_epi16(canddigit), c);
+                        // as a boolean
+                        tmp = _mm256_cmpeq_epi16(tmp,_mm256_setzero_si256());
+                        // need three cell, doubled bits in mask:
+                        if ( _popcnt32(~_mm256_movemask_epi8(tmp)) == 3*2 ) {
+                            digit = canddigit;
+                            break;
                         }
-                        grid_state = grid_state->make_guess<verbose>(target, digit, counters, solverData.output);
+                        cand3 &= ~canddigit;
                     }
-                    goto start;
+                    if ( digit ) {
+                        if ( verbose != VNone ) {
+                            counters.bug_plus1_count++;
+                        }
+                        if ( verbose == VDebug ) {
+                            solverData.printf("bi-value universal grave + 1: pivot:");
+                        }
+                        if ( rules == Regular ) {
+                            e_i = target;
+                            e_digit = digit;
+                            goto enter;
+                        } else {
+                            if ( verbose == VDebug ) {
+                                solverData.printf("\n");
+                            }
+                            grid_state = grid_state->make_guess<verbose>(target, digit, counters, solverData.output);
+                        }
+                        goto start;
+                    }
                 }
             }
         }
-        no_bug:
-        ;
     }
 
 #ifdef OPT_NEWSETS
