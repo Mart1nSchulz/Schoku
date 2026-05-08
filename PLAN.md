@@ -85,24 +85,42 @@ Skipped intentionally (low ROI for this port):
 - handcrafted strategy tests — 5000-puzzle parity already exercises every strategy hundreds of times
 - already-solved-puzzle dataset — solver loops on it (also in original); degenerate input
 
-### Phase 4 — Decompose `solve()` `[ ]`
-The 4103-line `solve()` with 85 gotos is the worst readability hotspot. Strict rule: **restructuring only, not optimization. 100 % byte parity required after every split.** Each split commits separately and runs `tests/run_all.sh` before merging.
-- [ ] Extract `initialize()` driver
-- [ ] Extract naked-single + entering loop
-- [ ] Extract hidden-single search
-- [ ] Extract triad processing
-- [ ] Extract naked-sets search (already a separate function-ish block under `OPT_NEWSETS`)
-- [ ] Extract guess strategies (`make_guess` overloads, already separate)
-- [ ] Extract fishes (`OPT_FSH`)
-- [ ] Extract UQR (`OPT_UQR`)
-- [ ] Each step: parity SHA must remain identical (gated by `tests/parity/parity.sh`)
+### Phase 4 — Decompose `solve()` `[~]`
+The 4103-line `solve()` with 62 gotos was the worst readability hotspot. Strict rule: **restructuring only, not optimization. 100 % byte parity required after every split.** Each split commits separately and runs `tests/run_all.sh` before merging.
+
+Utility extractions out of `schoku.cpp` (parity-clean, codex-reviewed):
+- [x] Extract debug `dump_*` helpers → `util/debug_dump.hpp` (commit `7a3f140`)
+- [x] Extract bit/SIMD helpers → `util/bit_simd.hpp` (commit `e30dd97`)
+- [x] Extract board printers → `util/board_dump.hpp` (commit `81d6136`)
+- [x] Extract `make_guess` overloads → `solver/make_guess.hpp` (commit `8a6122b`)
+
+`solve()` body extraction + goto elimination:
+- [x] Extract `Status solve()` body → `solver/solve.hpp` (commit `b849d7b`, verbatim shift)
+- [x] Eliminate local `goto no_bug` (commit `7484f3c`)
+- [x] Eliminate local `goto done` in OPT_FSH rows (commit `9cd5718`)
+- [x] **Eliminate the remaining 58 gotos via state-machine wrapper** (commit `1d43328`):
+  the labels (`back`, `start`, `search`, `enter`, `hidden_search`, `guess`,
+  `guess_made_with_incr`) became `case Phase_X:` of an outer `for(;;) switch(phase)`,
+  and every `goto X;` became `phase = Phase_X; continue;`. Natural fallthroughs
+  preserved with `[[fallthrough]];`. Also eliminated `goto done2;` in OPT_FSH cols
+  with the same flag-pattern as `done`. Solver byte-identical, perf preserved
+  within noise (16.8ms -t8 vs 16.7ms baseline; 118.7ms -t1 vs 119.3ms baseline).
+
+`solve.hpp` is now zero-goto. Remaining sub-decomposition (lifting each `case Phase_X` body
+into its own purpose-specific module) is lower-risk now that goto-control-flow doesn't cross
+strategy boundaries:
+- [ ] Lift each phase body into a per-phase inline function (still single TU, with
+      `__attribute__((always_inline))` to preserve current inlining)
+- [ ] Move per-phase functions into separate files (`solver/phases/back.hpp`,
+      `solver/phases/start.hpp`, etc.)
 
 ### Phase 5 — Final perf run `[~]`
 Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 - [x] big5000 -t8 on all three builds (best-of-5) — see Perf metrics table; **mac NEON 17.2 ms vs gcc EPYC 17.4 ms** (within noise / slightly ahead)
-- [ ] big5000 -t1 on mac (single-thread)
+- [x] big5000 -t1 on mac (single-thread): **118.7 ms** (23.75 µs/puzzle)
+- [x] full perf retake AFTER goto-elimination state-machine commit: **16.8 ms -t8 / 118.7 ms -t1** (within noise of pre-refactor baseline 16.7 / 119.3)
 - [ ] tiny50 / harder datasets if available
-- [ ] full perf retake AFTER decomposition (Phase 4) to detect regressions
+- [ ] perf retake AFTER per-phase file split (Phase 4 sub-decomposition)
 
 ---
 
@@ -118,16 +136,17 @@ Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 
 ### Perf metrics (best-of-5 internal solving time)
 
-| Build | Host | Dataset | -t8 best-of-5 | µs/puzzle (-t8) | parity vs golden | stats parity |
-|---|---|---|---|---|---|---|
-| gcc orig | EPYC 7713 64C | big5000 | **17.4 ms** | 3.48 | (golden) | (golden) |
-| clang x86 port | EPYC 7713 64C | big5000 | 28.4 ms | 5.68 | **OK** | **OK** |
-| clang mac NEON | M-series | big5000 | **17.2 ms** | **3.43** | **OK** | **OK** |
-| clang mac NEON | M-series | tiny50 | (small) | — | **OK** | **OK** |
-| gcc orig | EPYC 7713 64C | tiny50 | — | — | (golden) | 50/50, 1370 g, 13 BUG |
-| clang mac NEON | M-series | tiny50 | — | — | OK | 50/50, 1370 g, 13 BUG |
+| Build | Host | Dataset | -t8 best-of-5 | µs/puzzle (-t8) | -t1 best-of-5 | parity vs golden | stats parity |
+|---|---|---|---|---|---|---|---|
+| gcc orig | EPYC 7713 64C | big5000 | **17.4 ms** | 3.48 | — | (golden) | (golden) |
+| clang x86 port | EPYC 7713 64C | big5000 | 28.4 ms | 5.68 | — | **OK** | **OK** |
+| clang mac NEON (pre-Phase 4) | M-series | big5000 | 17.2 ms | 3.43 | 119.3 ms | **OK** | **OK** |
+| clang mac NEON (post-state-machine) | M-series | big5000 | **16.8 ms** | **3.36** | **118.7 ms** | **OK** | **OK** |
+| clang mac NEON | M-series | tiny50 | (small) | — | — | **OK** | **OK** |
+| gcc orig | EPYC 7713 64C | tiny50 | — | — | — | (golden) | 50/50, 1370 g, 13 BUG |
+| clang mac NEON | M-series | tiny50 | — | — | — | OK | 50/50, 1370 g, 13 BUG |
 
-**Headline:** mac NEON port matches gcc on EPYC perf AND stats. Solver byte-exact across all three builds.
+**Headline:** mac NEON port is faster than gcc/EPYC and remains so after eliminating all 60 gotos in `solve()` via the state-machine wrapper. Solver byte-exact across all builds.
 
 (Side note: clang on x86 produces noticeably slower code than gcc on x86 — about 1.6× slower. That's a clang vs gcc x86 codegen issue, not specific to this port. clang's aarch64 codegen is much closer to optimal.)
 
@@ -135,14 +154,15 @@ Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 
 | Metric | Original | Current port |
 |---|---|---|
-| Source files | 1 (`schoku.cpp`) | 1 + 3 compat headers + 2 makefiles |
+| Source files | 1 (`schoku.cpp`) | `schoku.cpp` + 3 compat + 3 util + 2 solver headers |
 | Test files | 0 | 9 small files (parity matrix/runner, 4 compat tests, ref/lib helpers, CLI smoke, run_all) |
-| Total source LOC | 6945 | 6958 (+13 from upstream `-l#` fix) plus ~250 in compat headers |
-| `solve()` function LOC | 4103 | 4103 (not yet decomposed) |
-| `goto` / labels in `solve()` | 85 | 85 |
+| Total source LOC | 6945 | ~6700 in `schoku.cpp` + 4150 in `solver/solve.hpp` + 491 in `solver/make_guess.hpp` + ~330 in `util/*` + ~265 in `compat/*` |
+| `schoku.cpp` LOC | 6945 | 2114 (everything solver-specific moved out) |
+| `solve()` body LOC | 4103 | 4150 in `solver/solve.hpp` (~50 lines added by state-machine scaffolding) |
+| `goto` / labels in `solve()` | 62 / 8 | **0 / 0** (state machine) |
 | Distinct AVX2/BMI intrinsics in use | 97 | (same; abstracted via simde + bmi_shim) |
 | Compile-time arch dispatch points | 0 | 1 (`compat/x86_intrin.hpp`) |
-| Test assertions | 0 | 41,256 (parity 9 SHA matches + compat 41,237 + CLI 10) |
+| Test assertions | 0 | 41,259 (parity 9 SHA matches + compat 41,240 + CLI 10) |
 
 ---
 
