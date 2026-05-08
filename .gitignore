@@ -16,3 +16,6 @@ src/puzzles_*.txt
 
 # Editor / tooling local state
 .claude/
+schoku-pre-sm
+src/schoku-pre-sm
+src/solutions.txt
