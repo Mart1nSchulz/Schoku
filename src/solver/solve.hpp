@@ -2700,25 +2700,30 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
             // scan for two bi-values forming a triple...
             // just take a single guess with this - it will also catch fin/sashimi
             unsigned int pair_cnt = __popcnt16(pair_locs);
+            bool fish_alt_found = false;
             if ( t == 8 && pair_cnt >= 3 ) {
                 unsigned char pos[9];
                 for ( int i=pair_cnt-1; pair_locs; i-- ) {
                     pos[i] = 8-tzcnt_and_mask(pair_locs);
                 }
                 unsigned short res = 0;
-                for ( unsigned int i=0; i<pair_cnt-1; i++) {
+                for ( unsigned int i=0; i<pair_cnt-1 && !fish_alt_found; i++) {
                     for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
                         if ( ( __popcnt16(res = cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]])) == 3 ) {
                             alt_base_x = res;
-                            goto done;
+                            fish_alt_found = true;
+                            break;
                         }
                     }
                 }
             }
-            continue;
-done:
-            t = 7;  // one iteration with the made-up data
-            pair_locs = 0; // will skip this section next time...
+            if ( !fish_alt_found ) {
+                continue;
+            }
+            // an alternative pattern was synthesised; replay this iteration
+            // with t pinned at 7 and pair_locs cleared so we don't loop here.
+            t = 7;
+            pair_locs = 0;
         } // for t
 
         // part 2: look for fishes at columns
