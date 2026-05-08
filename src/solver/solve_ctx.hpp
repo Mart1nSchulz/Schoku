@@ -88,4 +88,14 @@ struct SolveCtx {
 #ifdef OPT_UQR
     SolverPhase phase_guess_made_with_incr();
 #endif
+
+    // Sub-phase helpers called from phase_hidden_search() in sequence.
+    // Each returns Phase_HiddenSearch on natural completion (continue to
+    // the next helper) or any other SolverPhase to short-circuit back to
+    // the dispatcher (semantically equivalent to the pre-refactor `goto X`
+    // exits inside the original block). Bodies live in their own headers.
+    SolverPhase do_naked_sets_new();
+    SolverPhase do_naked_sets_main();
+    SolverPhase do_fishes();
+    SolverPhase do_unique_rectangles();
 };

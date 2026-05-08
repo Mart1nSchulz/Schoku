@@ -28,6 +28,13 @@
 #include "solver/phases/start.hpp"
 #include "solver/phases/search.hpp"
 #include "solver/phases/enter.hpp"
+// Sub-phase helpers must be included BEFORE hidden_search.hpp because
+// phase_hidden_search() body calls do_naked_sets_new() etc. and needs
+// their definitions visible for `__attribute__((always_inline))` inlining.
+#include "solver/phases/naked_sets_new.hpp"
+#include "solver/phases/naked_sets_main.hpp"
+#include "solver/phases/fishes.hpp"
+#include "solver/phases/unique_rectangles.hpp"
 #include "solver/phases/hidden_search.hpp"
 #include "solver/phases/guess.hpp"
 
