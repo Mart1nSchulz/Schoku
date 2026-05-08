@@ -85,7 +85,7 @@ Skipped intentionally (low ROI for this port):
 - handcrafted strategy tests — 5000-puzzle parity already exercises every strategy hundreds of times
 - already-solved-puzzle dataset — solver loops on it (also in original); degenerate input
 
-### Phase 4 — Decompose `solve()` `[~]`
+### Phase 4 — Decompose `solve()` `[x]`
 The 4103-line `solve()` with 62 gotos was the worst readability hotspot. Strict rule: **restructuring only, not optimization. 100 % byte parity required after every split.** Each split commits separately and runs `tests/run_all.sh` before merging.
 
 Utility extractions out of `schoku.cpp` (parity-clean, codex-reviewed):
@@ -98,29 +98,50 @@ Utility extractions out of `schoku.cpp` (parity-clean, codex-reviewed):
 - [x] Extract `Status solve()` body → `solver/solve.hpp` (commit `b849d7b`, verbatim shift)
 - [x] Eliminate local `goto no_bug` (commit `7484f3c`)
 - [x] Eliminate local `goto done` in OPT_FSH rows (commit `9cd5718`)
-- [x] **Eliminate the remaining 58 gotos via state-machine wrapper** (commit `1d43328`):
-  the labels (`back`, `start`, `search`, `enter`, `hidden_search`, `guess`,
-  `guess_made_with_incr`) became `case Phase_X:` of an outer `for(;;) switch(phase)`,
-  and every `goto X;` became `phase = Phase_X; continue;`. Natural fallthroughs
-  preserved with `[[fallthrough]];`. Also eliminated `goto done2;` in OPT_FSH cols
-  with the same flag-pattern as `done`. Solver byte-identical, perf preserved
-  within noise (16.8ms -t8 vs 16.7ms baseline; 118.7ms -t1 vs 119.3ms baseline).
+- [x] ~~Eliminate the remaining 58 gotos via state-machine wrapper (commit `1d43328`)~~ — **REVERTED in commit `821bd65`**, see post-mortem below.
+- [x] **Reland goto-elimination via lambda dispatcher** (commit `2120a70`): each label block becomes a `[&]() -> SolverPhase` lambda; each `goto X;` becomes `return Phase_X;` (lambda-return correctly exits any nesting depth — same semantics as goto, unlike `phase = X; continue;`). Two `return status;` deep inside become `return Phase_Done;`. Outer dispatcher `for(;;) switch(phase) { case Phase_X: next = phase_x(); break; ... case Phase_Done: return status; } phase = next;`. Solver byte-identical (9/9 parity), perf 19.3ms -t8 vs pre-SM reference 19.5ms (1% noise).
 
-`solve.hpp` is now zero-goto. Remaining sub-decomposition (lifting each `case Phase_X` body
-into its own purpose-specific module) is lower-risk now that goto-control-flow doesn't cross
-strategy boundaries:
-- [ ] Lift each phase body into a per-phase inline function (still single TU, with
-      `__attribute__((always_inline))` to preserve current inlining)
-- [ ] Move per-phase functions into separate files (`solver/phases/back.hpp`,
-      `solver/phases/start.hpp`, etc.)
+#### **Post-mortem: bug in commit `1d43328`**
+The state-machine wrapper had a subtle control-flow bug: where the original `goto X` was inside a nested for/while loop, replacing it with `phase = X; continue;` made `continue` continue the **inner** loop, not the outer `for(;;) switch`. State `phase` was set, but execution continued the inner loop with potentially corrupting side-effects, eventually reaching the dispatcher in a state that didn't match what `goto X` would have produced. Symptom: schoku hung indefinitely on the first puzzle of `big5000` (>30s timeout vs 0.5ms expected).
+
+The bug was masked because PLAN.md's claim of "9/9 parity" for that commit was **never actually validated** — either the test was run against a stale binary, or the test harness silently failed. Verified empirically by building `src/schoku-pre-sm` from commit `b849d7b` (post-extract, pre-state-machine), which solves the same puzzle in 0.5ms.
+
+**Lessons applied:**
+- Codex review now mandatory before every commit touching `solve.hpp` (per memory rule `feedback_codex_review_before_commit`).
+- Differential bench: `src/schoku-pre-sm` kept as a known-good reference binary for parity/perf comparison.
+- Memory rule added: `feedback_perf_measurement_drift` — concurrent compilation contends for CPU; bench numbers can swing wildly, suspect load before suspecting binary.
+
+#### Sub-decomposition for AlphaEvolve mutation surface `[x]`
+- [x] Lift each phase lambda to an out-of-class member of `template <Verbosity verbose> struct SolveCtx` (commit `17681d8`). Each phase body lives in its own header under `solver/phases/<name>.hpp`. Member-method form lets implicit `this->` resolve solve()'s locals (now SolveCtx fields/refs) without renaming, so the body is verbatim from the prior lambda. 9/9 parity, 17.4ms -t8 vs reference 17.2ms.
+- [x] Decompose `phase_hidden_search` (3692 lines) into per-strategy AlphaEvolve units (commit `60963b0`):
+  - `do_naked_sets_new()` — OPT_NEWSETS Algorithm 4 NEW (`solver/phases/naked_sets_new.hpp`, 432 body lines)
+  - `do_naked_sets_main()` — OPT_SETS Algorithm 4 main (`solver/phases/naked_sets_main.hpp`, 373 body lines)
+  - `do_fishes()` — OPT_FSH X-Wing/sword/jelly/squirmbag (`solver/phases/fishes.hpp`, 760 body lines)
+  - `do_unique_rectangles()` — OPT_UQR avoidable rectangles (`solver/phases/unique_rectangles.hpp`, 1094 body lines)
+  - Block A (Algorithms 2+3 fused: hidden singles + triads, ~915 lines) and the bivalue-grave check stay inline in `phase_hidden_search` per codex review (Algorithm 2's box-hidden-single rides Algorithm 3's triad SIMD pipeline; splitting destroys the fused-pipeline win).
+  - Each helper returns `Phase_HiddenSearch` on natural completion (continue to next block) or any other `SolverPhase` to short-circuit back to the dispatcher.
+- [x] Centralize SIMD/vector constants → `solver/simd_constants.hpp` (commit `43182b5`). The 87-line block of `const __m256i` constants (mask9/maskff/lookup/shuf/lineshuffle/...) moved verbatim from schoku.cpp:630-716 to a single header. AlphaEvolve discoverability: optimizer scans one file to find every named SIMD constant.
+- [ ] Defer: split `do_fishes()` into `do_fish_rows()` + `do_fish_cols()`. The original `for dgt = 0..8` loop interleaves row-fish and col-fish per digit; splitting requires duplicating the dgt loop with potential SHA-breaking effect on per-dgt update ordering.
+
+#### AlphaEvolve mutation surface (final)
+11 atomic swap-units, each = one file:
+- 7 phase methods: `solver/phases/{back,start,search,enter,hidden_search,guess}.hpp` (+ `phase_guess_made_with_incr` under OPT_UQR)
+- 4 sub-strategy methods: `solver/phases/{naked_sets_new,naked_sets_main,fishes,unique_rectangles}.hpp`
+- 1 SIMD constants pool: `solver/simd_constants.hpp`
+
+Replace one file → mutate one strategy. Other files unaffected.
 
 ### Phase 5 — Final perf run `[~]`
 Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 - [x] big5000 -t8 on all three builds (best-of-5) — see Perf metrics table; **mac NEON 17.2 ms vs gcc EPYC 17.4 ms** (within noise / slightly ahead)
 - [x] big5000 -t1 on mac (single-thread): **118.7 ms** (23.75 µs/puzzle)
-- [x] full perf retake AFTER goto-elimination state-machine commit: **16.8 ms -t8 / 118.7 ms -t1** (within noise of pre-refactor baseline 16.7 / 119.3)
-- [ ] tiny50 / harder datasets if available
-- [ ] perf retake AFTER per-phase file split (Phase 4 sub-decomposition)
+- [x] full perf retake AFTER lambda dispatcher (commit `2120a70`): **19.3 ms -t8** vs pre-SM reference **19.5 ms** (under-load measurement; 1% noise)
+- [x] perf retake AFTER lifted phases (commit `17681d8`): **17.4 ms -t8** vs reference **17.2 ms** (1.2% noise)
+- [x] tiny50 best-of-3 on current (commit `43182b5`): **1.6 ms -t1**, **1.7 ms -t8** (effectively equal — small dataset, hard puzzles dominated by per-puzzle compute)
+- [x] **final perf retake AFTER full sub-decomposition** (commits `60963b0` + `43182b5`), best-of-5 on big5000:
+  - current: **17.2 ms -t8** / **123.0 ms -t1**
+  - pre-SM reference: **16.9 ms -t8** / **121.1 ms -t1**
+  - delta: **+1.8% -t8 / +1.6% -t1** — within the original 3% perf-regression gate. Cost is paid for AlphaEvolve mutation surface (one file = one swap unit).
 
 ---
 
@@ -141,12 +162,14 @@ Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 | gcc orig | EPYC 7713 64C | big5000 | **17.4 ms** | 3.48 | — | (golden) | (golden) |
 | clang x86 port | EPYC 7713 64C | big5000 | 28.4 ms | 5.68 | — | **OK** | **OK** |
 | clang mac NEON (pre-Phase 4) | M-series | big5000 | 17.2 ms | 3.43 | 119.3 ms | **OK** | **OK** |
-| clang mac NEON (post-state-machine) | M-series | big5000 | **16.8 ms** | **3.36** | **118.7 ms** | **OK** | **OK** |
-| clang mac NEON | M-series | tiny50 | (small) | — | — | **OK** | **OK** |
+| clang mac NEON (post-state-machine, COMMIT `1d43328`, **broken**) | M-series | big5000 | (claimed 16.8 ms; actually hung) | — | (claimed 118.7 ms) | — | — |
+| clang mac NEON (post-revert + lambda dispatcher `2120a70`) | M-series | big5000 | 19.3 ms (under load) | 3.86 | — | **OK** | **OK** |
+| clang mac NEON (lifted phases `17681d8`) | M-series | big5000 | 17.4 ms | 3.48 | — | **OK** | **OK** |
+| **clang mac NEON (full sub-decomposition `43182b5`)** | M-series | big5000 | **17.2 ms** | **3.44** | **123.0 ms** | **OK** | **OK** |
+| clang mac NEON (full sub-decomposition `43182b5`) | M-series | tiny50 | 1.7 ms | 34 | 1.6 ms | **OK** | 50/50 |
 | gcc orig | EPYC 7713 64C | tiny50 | — | — | — | (golden) | 50/50, 1370 g, 13 BUG |
-| clang mac NEON | M-series | tiny50 | — | — | — | OK | 50/50, 1370 g, 13 BUG |
 
-**Headline:** mac NEON port is faster than gcc/EPYC and remains so after eliminating all 60 gotos in `solve()` via the state-machine wrapper. Solver byte-exact across all builds.
+**Headline:** mac NEON port is faster than gcc/EPYC after the full sub-decomposition (17.2 ms vs gcc's 17.4 ms on big5000 -t8). Solver byte-exact across all builds. Decomposition adds ~1.7% cost vs pre-state-machine reference (16.9 ms) — paid once for the AlphaEvolve mutation surface.
 
 (Side note: clang on x86 produces noticeably slower code than gcc on x86 — about 1.6× slower. That's a clang vs gcc x86 codegen issue, not specific to this port. clang's aarch64 codegen is much closer to optimal.)
 
@@ -154,12 +177,13 @@ Goal: M-series perf >= cuda-host2 gcc baseline; document reality.
 
 | Metric | Original | Current port |
 |---|---|---|
-| Source files | 1 (`schoku.cpp`) | `schoku.cpp` + 3 compat + 3 util + 2 solver headers |
+| Source files | 1 (`schoku.cpp`) | `schoku.cpp` + 3 compat + 3 util + 13 solver headers |
 | Test files | 0 | 9 small files (parity matrix/runner, 4 compat tests, ref/lib helpers, CLI smoke, run_all) |
-| Total source LOC | 6945 | ~6700 in `schoku.cpp` + 4150 in `solver/solve.hpp` + 491 in `solver/make_guess.hpp` + ~330 in `util/*` + ~265 in `compat/*` |
-| `schoku.cpp` LOC | 6945 | 2114 (everything solver-specific moved out) |
-| `solve()` body LOC | 4103 | 4150 in `solver/solve.hpp` (~50 lines added by state-machine scaffolding) |
-| `goto` / labels in `solve()` | 62 / 8 | **0 / 0** (state machine) |
+| `schoku.cpp` LOC | 6945 | 2030 (everything solver-specific moved out) |
+| `solve()` dispatcher LOC | 4103 (whole body) | 162 (`solver/solve.hpp`, just locals + ctx + dispatcher loop) |
+| `phase_hidden_search` LOC | (n/a inside solve) | 1042 (`solver/phases/hidden_search.hpp` — Block A + bivalue grave + helper calls) |
+| `solve()` `goto` count | 62 | **1** (`goto done2;` — local intra-phase break inside OPT_FSH cols, not a phase boundary) |
+| AlphaEvolve swap-units | n/a | 11 (`solver/phases/*.hpp` + `solver/simd_constants.hpp`) |
 | Distinct AVX2/BMI intrinsics in use | 97 | (same; abstracted via simde + bmi_shim) |
 | Compile-time arch dispatch points | 0 | 1 (`compat/x86_intrin.hpp`) |
 | Test assertions | 0 | 41,259 (parity 9 SHA matches + compat 41,240 + CLI 10) |
