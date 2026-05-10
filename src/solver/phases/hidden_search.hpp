@@ -891,6 +891,36 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                         solverData.printf("remove %-5s from %s triad at %s\n", ret, type == 0? "row":"col",
                                cl2txt[type==0?row_triad_canonical_map[ltidx]*3:col_canonical_triad_pos[ltidx]] );
                     }
+                    if ( trace::current ) {
+                        // Locked-candidates / Algorithm-3 part-3 triad
+                        // elimination. The deduction asserts the bitmask
+                        // `rm` cannot appear in any of the triad's three
+                        // cells; SIMD applied the mask to all three at
+                        // once, but per-cell actual removal depends on
+                        // pre-update candidates. Emit ONE group event
+                        // rather than three per-cell events (which would
+                        // each have to claim deduction-level `values`
+                        // even when the cell didn't have them).
+                        unsigned short rm = ((v16us)to_remove_v)[i_rel];
+                        unsigned char cells_buf[3];
+                        const char* reason;
+                        char u;
+                        if ( type == 0 ) {
+                            int first = row_triad_canonical_map[ltidx]*3;
+                            cells_buf[0] = (unsigned char)first;
+                            cells_buf[1] = (unsigned char)(first + 1);
+                            cells_buf[2] = (unsigned char)(first + 2);
+                            reason = "triad_row"; u = 'r';
+                        } else {
+                            int first = col_canonical_triad_pos[ltidx];
+                            cells_buf[0] = (unsigned char)first;
+                            cells_buf[1] = (unsigned char)(first + 9);
+                            cells_buf[2] = (unsigned char)(first + 18);
+                            reason = "triad_col"; u = 'c';
+                        }
+                        trace::eliminate_group(reason, u, cells_buf, 3, rm,
+                                               (int)grid_state->stackpointer);
+                    }
                 }
                 if ( type == 1 ) {
                     if ( rslvd_col_combo_tpos ) {

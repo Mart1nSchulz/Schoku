@@ -192,6 +192,91 @@ public:
         append_lit("}\n");
     }
 
+    // Phase 2: set detection (antecedent). `kind` is one of
+    // "naked_pair"/"naked_triple"/"naked_quad"/
+    // "hidden_pair"/"hidden_triple"/"hidden_quad".
+    // `unit` is 'r'/'c'/'b'. `set_cells` are the SET-member cell indices
+    // (0..80, row-major); `set_values` is the bitmask of locked digits.
+    void naked_set(const char* kind, char unit,
+                   const unsigned char* set_cells, int n_set,
+                   unsigned short set_values, int level) {
+        ensure(192 + n_set * 12);
+        append_lit("{\"event\":\"step\",\"type\":\"");
+        append_str(kind);
+        append_lit("\",\"unit\":\"");
+        char u[2] = {unit, 0}; append_str(u);
+        append_lit("\",\"cells\":[");
+        for (int k = 0; k < n_set; k++) {
+            if (k > 0) append_lit(",");
+            append_lit("[");
+            append_int(set_cells[k] / 9);
+            append_lit(",");
+            append_int(set_cells[k] % 9);
+            append_lit("]");
+        }
+        append_lit("],\"values\":");
+        append_value_set(set_values);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
+    // Phase 2: cell-level candidate removal (single-cell consequence).
+    // `reason` is the antecedent kind ("naked_set", etc.); `unit` is
+    // 'r'/'c'/'b' for the unit the antecedent was in; `values` MUST be
+    // the bits actually removed from THIS cell (caller responsibility:
+    // values = pre_candidates[cell] & deduction_mask, skip when zero).
+    void eliminate(const char* reason, char unit,
+                   int row, int col,
+                   unsigned short values, int level) {
+        ensure(176);
+        append_lit("{\"event\":\"step\",\"type\":\"eliminate\","
+                   "\"reason\":\"");
+        append_str(reason);
+        append_lit("\",\"unit\":\"");
+        char u[2] = {unit, 0}; append_str(u);
+        append_lit("\",\"cell\":[");
+        append_int(row);
+        append_lit(",");
+        append_int(col);
+        append_lit("],\"values\":");
+        append_value_set(values);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
+    // Phase 2: group-cell elimination event — used for triad reductions
+    // where a single deduction implies an elimination across multiple
+    // cells uniformly. `values` here is the DEDUCTION mask (what the
+    // deduction asserts cannot be in any of the listed cells); per-cell
+    // actual removal = pre_cell_candidates & values. The plural form
+    // (`cells` vs `cell`) discriminates from the single-cell event.
+    void eliminate_group(const char* reason, char unit,
+                         const unsigned char* cells, int n_cells,
+                         unsigned short values, int level) {
+        ensure(192 + n_cells * 12);
+        append_lit("{\"event\":\"step\",\"type\":\"eliminate\","
+                   "\"reason\":\"");
+        append_str(reason);
+        append_lit("\",\"unit\":\"");
+        char u[2] = {unit, 0}; append_str(u);
+        append_lit("\",\"cells\":[");
+        for (int k = 0; k < n_cells; k++) {
+            if (k > 0) append_lit(",");
+            append_lit("[");
+            append_int(cells[k] / 9);
+            append_lit(",");
+            append_int(cells[k] % 9);
+            append_lit("]");
+        }
+        append_lit("],\"values\":");
+        append_value_set(values);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
     void backtrack(int from_level, int to_level) {
         backtracks_++;
         ensure(96);
@@ -249,6 +334,22 @@ private:
         // Compile-time string literal length, minus the terminator.
         std::memcpy(buf_ + len_, s, N - 1);
         len_ += N - 1;
+    }
+
+    // Emit a value-set as a JSON array of 1..9 digits. `bits` is a
+    // candidate bitmask (bit k set => digit k+1 present).
+    inline void append_value_set(unsigned short bits) {
+        ensure(32);
+        append_lit("[");
+        bool first = true;
+        for (int d = 1; d <= 9; d++) {
+            if (bits & (1u << (d - 1))) {
+                if (!first) append_lit(",");
+                first = false;
+                buf_[len_++] = (char)('0' + d);
+            }
+        }
+        append_lit("]");
     }
 
     // Hand-rolled int formatter. snprintf is too slow on hot path —
@@ -312,6 +413,21 @@ inline void guess_triad(int row, int col, int value, char unit, int from_level) 
 }
 inline void backtrack(int from_level, int to_level) {
     current->backtrack(from_level, to_level);
+}
+inline void naked_set(const char* kind, char unit,
+                      const unsigned char* set_cells, int n_set,
+                      unsigned short set_values, int level) {
+    current->naked_set(kind, unit, set_cells, n_set, set_values, level);
+}
+inline void eliminate(const char* reason, char unit,
+                      int row, int col,
+                      unsigned short values, int level) {
+    current->eliminate(reason, unit, row, col, values, level);
+}
+inline void eliminate_group(const char* reason, char unit,
+                            const unsigned char* cells, int n_cells,
+                            unsigned short values, int level) {
+    current->eliminate_group(reason, unit, cells, n_cells, values, level);
 }
 inline void puzzle_start(const char* puzzle81, int puzzle_id) {
     current->puzzle_start(puzzle81, puzzle_id);

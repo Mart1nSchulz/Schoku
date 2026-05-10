@@ -69,13 +69,28 @@ if [[ -n "$unknown" ]]; then
     echo "FAIL: unknown event types: $unknown"
     exit 1
 fi
+# Phase 1+2 vocabulary: singles, guess, backtrack, eliminate, naked_*.
+# hidden_pair/triple/quad reserved for future when emitter splits them.
 unknown_types=$(jq -r 'select(.event=="step") | .type' "$trace" | sort -u | \
-    grep -vE '^(single|guess|backtrack)$' | head)
+    grep -vE '^(single|guess|backtrack|eliminate|naked_pair|naked_triple|naked_quad|hidden_pair|hidden_triple|hidden_quad)$' | head)
 if [[ -n "$unknown_types" ]]; then
     echo "FAIL: unknown step types: $unknown_types"
     exit 1
 fi
-echo "PASS vocabulary ($(jq -r 'select(.event=="step") | .type' "$trace" | sort -u | tr '\n' ',' | sed 's/,$//'))"
+# Phase 2: validate unit and reason vocabularies for eliminate / naked_*.
+unknown_units=$(jq -r 'select(.event=="step" and (.unit // null) != null) | .unit' "$trace" | sort -u | \
+    grep -vE '^(r|c|b)$' | head)
+if [[ -n "$unknown_units" ]]; then
+    echo "FAIL: unknown units in step events: $unknown_units"
+    exit 1
+fi
+unknown_reasons=$(jq -r 'select(.event=="step" and (.reason // null) != null) | .reason' "$trace" | sort -u | \
+    grep -vE '^(naked|hidden|deduced|cell|triad_(r|c)(ow|ol)|naked_set|hidden_set|triad_row|triad_col)$' | head)
+if [[ -n "$unknown_reasons" ]]; then
+    echo "FAIL: unknown reasons in step events: $unknown_reasons"
+    exit 1
+fi
+echo "PASS vocabulary (types=$(jq -r 'select(.event=="step") | .type' "$trace" | sort -u | tr '\n' ',' | sed 's/,$//'))"
 
 # 5. level continuity per puzzle: track current level via guess/backtrack
 # events. Each guess sets level = new_level; each backtrack sets level = to_level.

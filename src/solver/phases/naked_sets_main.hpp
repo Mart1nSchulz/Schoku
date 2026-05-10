@@ -215,6 +215,12 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                                     solverData.printf("%s %s (row): %-7s %s\n", complement?"hidden":"naked ", __popcnt16(complement)==2?"pair":"set ", ret, cl2txt[ri*9+k%9]);
                                 }
                             }
+                            // OPT_SETS path: trace wiring intentionally
+                            // deferred. Its `to_change` aggregates row+col
+                            // +box updates into one bit vector, so per-cell
+                            // eliminate events cannot honestly attribute
+                            // their `unit`. Phase 3+ should split the
+                            // elimination pass per-unit to wire this.
                         }
                     }
                 } // row
@@ -327,6 +333,8 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                                             complement |= candidates[k_i];
                                         }
                                 } // for
+                                // OPT_SETS path: trace wiring deferred —
+                                // see comment at the row-detection site.
                                 if ( verbose == VDebug ) {
                                     bool naked_anyway = !(complement & candidates[i]);
                                     char ret[32];
@@ -357,6 +365,9 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                         // if there are bits that need removing
                         if (candidates[j] & cdi) {
                             candidates[j] &= cdin;
+                            // OPT_SETS path: per-cell eliminate trace not
+                            // wired (cannot honestly attribute `unit` from
+                            // the merged to_change). Phase 3+ TODO.
                             to_visit_again.set_indexbit(j);
                             found = true;
                         }
@@ -386,7 +397,11 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  (sets) ");
                 }
-                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                // OPT_SETS path is not Phase-2 trace-wired (see comments
+                // at detection/eliminate sites), so a placement landing
+                // here has no antecedent event. Keep as ER_DeducedSingle
+                // until OPT_SETS wiring lands.
+                trace::next_entry_reason = trace::ER_DeducedSingle;
                 return Phase_Enter;
             }
         } // while
