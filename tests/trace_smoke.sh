@@ -30,7 +30,11 @@ n_in=$(wc -l < "$in" | tr -d ' ')
 
 trace="$WORK/trace.jsonl"
 sols="$WORK/sols.txt"
-"$BIN" --trace-out "$trace" -t1 "$in" "$sols" >/dev/null 2>&1
+# -mN activates the OPT_NEWSETS path so naked_pair/eliminate(naked_set)
+# events get exercised (default Schoku doesn't auto-enable mode flags).
+# -mF / -mU require OPT_FSH / OPT_UQR at compile time; they're a no-op
+# on the default Makefile build and harmless to pass.
+"$BIN" --trace-out "$trace" -mN -mF -mU -t1 "$in" "$sols" >/dev/null 2>&1
 [[ -s "$trace" ]] || { echo "FAIL: empty trace"; exit 1; }
 
 # 1. each line is parseable JSON
@@ -72,7 +76,7 @@ fi
 # Phase 1+2 vocabulary: singles, guess, backtrack, eliminate, naked_*.
 # hidden_pair/triple/quad reserved for future when emitter splits them.
 unknown_types=$(jq -r 'select(.event=="step") | .type' "$trace" | sort -u | \
-    grep -vE '^(single|guess|backtrack|eliminate|naked_pair|naked_triple|naked_quad|hidden_pair|hidden_triple|hidden_quad)$' | head)
+    grep -vE '^(single|guess|backtrack|eliminate|naked_pair|naked_triple|naked_quad|hidden_pair|hidden_triple|hidden_quad|fish)$' | head)
 if [[ -n "$unknown_types" ]]; then
     echo "FAIL: unknown step types: $unknown_types"
     exit 1
@@ -85,7 +89,7 @@ if [[ -n "$unknown_units" ]]; then
     exit 1
 fi
 unknown_reasons=$(jq -r 'select(.event=="step" and (.reason // null) != null) | .reason' "$trace" | sort -u | \
-    grep -vE '^(naked|hidden|deduced|cell|triad_(r|c)(ow|ol)|naked_set|hidden_set|triad_row|triad_col)$' | head)
+    grep -vE '^(naked|hidden|deduced|cell|triad_(r|c)(ow|ol)|naked_set|hidden_set|triad_row|triad_col|fish)$' | head)
 if [[ -n "$unknown_reasons" ]]; then
     echo "FAIL: unknown reasons in step events: $unknown_reasons"
     exit 1

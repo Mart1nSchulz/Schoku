@@ -277,6 +277,34 @@ public:
         append_lit("}\n");
     }
 
+    // Phase 3: fish antecedent (X-Wing K=2, Swordfish K=3, Jellyfish K=4).
+    // `base_kind` is 'r' (rows-as-base, cols-as-cover) or 'c' (cols-as-base,
+    // rows-as-cover). `base_mask` / `cover_mask` are 9-bit bitmasks of
+    // unit indices (0..8) where bit k = unit k participates. `digit` is
+    // 1..9. Consequences follow as per-cell `eliminate` events with
+    // reason:"fish".
+    void fish(int size, int digit,
+              char base_kind,
+              unsigned short base_mask,
+              unsigned short cover_mask,
+              int level) {
+        ensure(192);
+        append_lit("{\"event\":\"step\",\"type\":\"fish\","
+                   "\"size\":");
+        append_int(size);
+        append_lit(",\"digit\":");
+        append_int(digit);
+        append_lit(",\"base\":\"");
+        char b[2] = {base_kind, 0}; append_str(b);
+        append_lit("\",\"base_units\":");
+        append_unit_set(base_mask);
+        append_lit(",\"cover_units\":");
+        append_unit_set(cover_mask);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
     void backtrack(int from_level, int to_level) {
         backtracks_++;
         ensure(96);
@@ -347,6 +375,22 @@ private:
                 if (!first) append_lit(",");
                 first = false;
                 buf_[len_++] = (char)('0' + d);
+            }
+        }
+        append_lit("]");
+    }
+
+    // Emit a unit-set as a JSON array of 0-based unit indices (0..8).
+    // Used for fish base_units / cover_units.
+    inline void append_unit_set(unsigned short bits) {
+        ensure(32);
+        append_lit("[");
+        bool first = true;
+        for (int u = 0; u < 9; u++) {
+            if (bits & (1u << u)) {
+                if (!first) append_lit(",");
+                first = false;
+                buf_[len_++] = (char)('0' + u);
             }
         }
         append_lit("]");
@@ -428,6 +472,11 @@ inline void eliminate_group(const char* reason, char unit,
                             const unsigned char* cells, int n_cells,
                             unsigned short values, int level) {
     current->eliminate_group(reason, unit, cells, n_cells, values, level);
+}
+inline void fish(int size, int digit, char base_kind,
+                 unsigned short base_mask, unsigned short cover_mask,
+                 int level) {
+    current->fish(size, digit, base_kind, base_mask, cover_mask, level);
 }
 inline void puzzle_start(const char* puzzle81, int puzzle_id) {
     current->puzzle_start(puzzle81, puzzle_id);

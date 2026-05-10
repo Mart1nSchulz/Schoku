@@ -114,7 +114,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_fishes()
 
         // load cbbv_v
         __m128i off0 = uncompress(cbbv_digit.m128);
-        cbbv_v.m256 = _mm256_insert_epi16(_mm256_and_si256(mask1ff,_mm256_castsi128_si256(off0)), *(__int16*)&cbbv_digit.u8[9], 8);
+        cbbv_v.m256 = _mm256_insert_epi16(_mm256_and_si256(mask1ff,_mm256_castsi128_si256(off0)), *(int16_t*)&cbbv_digit.u8[9], 8);
         unsigned long long hi = cbbv_digit.u64[1];
 #if 0
         unsigned long long lo = cbbv_digit.u64[0];
@@ -179,6 +179,11 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                 bit128_t clean_bits {};
                 unsigned char fincells[2] = {0xff, 0xff};
                 bool dosearch = false;
+                // Unit label for the common eliminate loop. Default is the
+                // row-scan's Case-2 orientation ('r'). The plain emit block
+                // overrides to match its antecedent's `base`. Case-1 has
+                // its own local loop so its label isn't read here.
+                char trace_elim_unit = 'r';
 
                 // if there are exactly N rows with exclusively some of the pattern of digits, then
                 // it is a row fish pattern.
@@ -204,6 +209,22 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 show_fish(cbbv_v, base_x, nsubs == cnt ? subs_prp_x:hassubs_prp_x, hassubs_prp_x, clean_bits, dgt_bits, solverData, "row fish");
                             }
                             solverData.printf("%s (%s) digit %d at cells %s - %s\nRemove %d at ", fish_names[cnt-2], nsubs==cnt?"rows":"cols", dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
+                        }
+                        if ( trace::current ) {
+                            // Plain fish antecedent. The (nsubs == cnt)
+                            // branch is the canonical row-fish: cnt rows
+                            // (subs_prp_x) form the base, cnt cols (base_x)
+                            // form the cover. The dual branch (hassubs ==
+                            // cnt) is detected via the same scan but is
+                            // structurally a col-fish: base cols (base_x),
+                            // cover rows (hassubs_prp_x).
+                            char base_kind = (nsubs == cnt) ? 'r' : 'c';
+                            unsigned short base_mask = (nsubs == cnt) ? subs_prp_x : (unsigned short)base_x;
+                            unsigned short cover_mask = (nsubs == cnt) ? (unsigned short)base_x : (unsigned short)hassubs_prp_x;
+                            trace::fish((int)cnt, (int)(dgt+1), base_kind,
+                                        base_mask, cover_mask,
+                                        (int)grid_state->stackpointer);
+                            trace_elim_unit = base_kind;
                         }
                         dosearch = true;
                     }
@@ -327,12 +348,26 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                             }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
                             unsigned short dgt_mask_bit = 1<<dgt;
+                            // Sashimi/finned Case-1 has its own local
+                            // removal loop. Mirror trace::eliminate
+                            // emission so finned consequences aren't
+                            // dropped from the JSONL. (Antecedent for
+                            // finned is Phase 3.1; events here are orphans
+                            // for now — consequence-only.)
+                            bool tracing = (trace::current != nullptr);
+                            char u = 'r';   // finned row-fish (Case-1, row scan)
+                            int level = tracing ? (int)grid_state->stackpointer : 0;
                             while (clean_bits) {
                                 unsigned char cl = tzcnt_and_mask(clean_bits);
                                 if ( candidates[cl] & dgt_mask_bit ) {
                                     candidates[cl] &= ~dgt_mask_bit;
                                     if ( verbose == VDebug ) {
                                         solverData.printf("%s ", cl2txt[cl]);
+                                    }
+                                    if ( tracing ) {
+                                        trace::eliminate("fish", u,
+                                                         cl/9, cl%9, dgt_mask_bit,
+                                                         level);
                                     }
                                 }
                             }
@@ -420,12 +455,23 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         e_i = fincells[0];
                     }
                     unsigned short dgt_mask_bit = 1<<dgt;
+                    // Consequence unit matches the FISH orientation, set
+                    // by the plain antecedent emit just above (overrides
+                    // the row-scan default 'r' used for Case-2 orphans).
+                    bool tracing = (trace::current != nullptr);
+                    char u = trace_elim_unit;
+                    int level = tracing ? (int)grid_state->stackpointer : 0;
                     while (clean_bits) {
                         unsigned char cl = tzcnt_and_mask(clean_bits);
                         if ( candidates[cl] & dgt_mask_bit ) {
                             candidates[cl] &= ~dgt_mask_bit;
                             if ( verbose == VDebug ) {
                                 solverData.printf("%s ", cl2txt[cl]);
+                            }
+                            if ( tracing ) {
+                                trace::eliminate("fish", u,
+                                                 cl/9, cl%9, dgt_mask_bit,
+                                                 level);
                             }
                         }
                     }
@@ -437,7 +483,10 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
-                        trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                        // Sashimi-driven placement. Antecedent is the
+                        // sashimi pattern (Phase 3.1) — until then this
+                        // remains a deduced-single placeholder.
+                        trace::next_entry_reason = trace::ER_DeducedSingle;
                         return Phase_Enter;
                     }
                     dosearch = true;
@@ -535,6 +584,10 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                 bit128_t tmp {};
                 unsigned char fincells[2] = {0xff, 0xff};
                 bool dosearch = false;
+                // Unit label for the common eliminate loop. Col-scan
+                // default is 'c' (Case-2 orphan finned col-fish); the
+                // plain emit block overrides to match its antecedent.
+                char trace_elim_unit = 'c';
 
                 // if there are exactly N cols with exclusively some of the pattern of digits, then
                 // it is a col fish pattern.
@@ -565,6 +618,19 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                             unsigned char celli = __tzcnt_u16(subs_prp_x) + __tzcnt_u16(base_x)*9;
                             unsigned char celli2 = (15-__lzcnt16(subs_prp_x)) + (15-__lzcnt16(base_x))*9;
                             solverData.printf("%s (%s) digit %d cells %s - %s\nRemove %d at ", fish_names[cnt-2], nsubs == cnt? "cols":"rows", dgt+1, cl2txt[celli], cl2txt[celli2], dgt+1);
+                        }
+                        if ( trace::current ) {
+                            // Mirror of the row-scan path, transposed view:
+                            // (nsubs == cnt) => canonical col-fish (base
+                            // cols, cover rows); (hassubs == cnt) dual is
+                            // a row-fish detected via col scan.
+                            char base_kind = (nsubs == cnt) ? 'c' : 'r';
+                            unsigned short base_mask = (nsubs == cnt) ? (unsigned short)subs_prp_x : (unsigned short)base_x;
+                            unsigned short cover_mask = (nsubs == cnt) ? (unsigned short)base_x : (unsigned short)hassubs_prp_x;
+                            trace::fish((int)cnt, (int)(dgt+1), base_kind,
+                                        base_mask, cover_mask,
+                                        (int)grid_state->stackpointer);
+                            trace_elim_unit = base_kind;
                         }
                         dosearch = true;
                     }
@@ -637,12 +703,26 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                             }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
                             unsigned short dgt_mask_bit = 1<<dgt;
+                            // Sashimi/finned Case-1 has its own local
+                            // removal loop. Mirror trace::eliminate
+                            // emission so finned consequences aren't
+                            // dropped from the JSONL. (Antecedent for
+                            // finned is Phase 3.1; events here are orphans
+                            // for now — consequence-only.)
+                            bool tracing = (trace::current != nullptr);
+                            char u = 'c';   // finned col-fish (Case-1, col scan)
+                            int level = tracing ? (int)grid_state->stackpointer : 0;
                             while (clean_bits) {
                                 unsigned char cl = tzcnt_and_mask(clean_bits);
                                 if ( candidates[cl] & dgt_mask_bit ) {
                                     candidates[cl] &= ~dgt_mask_bit;
                                     if ( verbose == VDebug ) {
                                         solverData.printf("%s ", cl2txt[cl]);
+                                    }
+                                    if ( tracing ) {
+                                        trace::eliminate("fish", u,
+                                                         cl/9, cl%9, dgt_mask_bit,
+                                                         level);
                                     }
                                 }
                             }
@@ -731,12 +811,23 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         e_i = fincells[0];
                     }
                     unsigned short dgt_mask_bit = 1<<dgt;
+                    // Mirror of row-scan. Plain emit block sets
+                    // trace_elim_unit to its antecedent's base; Case-2
+                    // orphans use the default 'c' (col-scan).
+                    bool tracing = (trace::current != nullptr);
+                    char u = trace_elim_unit;
+                    int level = tracing ? (int)grid_state->stackpointer : 0;
                     while (clean_bits) {
                         unsigned char cl = tzcnt_and_mask(clean_bits);
                         if ( candidates[cl] & dgt_mask_bit) {
                             candidates[cl] &= ~dgt_mask_bit;
                             if ( verbose == VDebug ) {
                                 solverData.printf("%s ", cl2txt[cl]);
+                            }
+                            if ( tracing ) {
+                                trace::eliminate("fish", u,
+                                                 cl/9, cl%9, dgt_mask_bit,
+                                                 level);
                             }
                         }
                     }
@@ -748,7 +839,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
-                        trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                        // Sashimi-driven placement — Phase 3.1.
+                        trace::next_entry_reason = trace::ER_DeducedSingle;
                         return Phase_Enter;
                     }
                     dosearch = true;
