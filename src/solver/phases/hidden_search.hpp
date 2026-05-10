@@ -1039,10 +1039,24 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                         if ( rules == Regular ) {
                             e_i = target;
                             e_digit = digit;
-                            // BUG+1 deduction. Phase 1 emits this as a
-                            // deduced single — a "type":"bug" event lives in
-                            // Phase 4 alongside the rest of the BUG path.
-                            trace::next_entry_reason = trace::ER_DeducedSingle;
+                            // Phase 4: BUG+1 antecedent + eliminate the two
+                            // losing candidates from the pivot cell, then
+                            // mark the placement as a naked single (after
+                            // eliminate, the pivot has 1 candidate left).
+                            if ( trace::current ) {
+                                unsigned short pre_t = candidates[target];
+                                unsigned short losers = (unsigned short)(pre_t & ~digit);
+                                trace::bug((int)(target/9), (int)(target%9),
+                                           (int)(_tzcnt_u32(digit)+1),
+                                           pre_t, (int)grid_state->stackpointer);
+                                if ( losers ) {
+                                    trace::eliminate("bug", 0,
+                                                     (int)(target/9), (int)(target%9),
+                                                     losers,
+                                                     (int)grid_state->stackpointer);
+                                }
+                            }
+                            trace::next_entry_reason = trace::ER_NakedSingle;
                             return Phase_Enter;
                         } else {
                             if ( verbose == VDebug ) {

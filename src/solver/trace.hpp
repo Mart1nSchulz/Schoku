@@ -223,9 +223,11 @@ public:
 
     // Phase 2: cell-level candidate removal (single-cell consequence).
     // `reason` is the antecedent kind ("naked_set", etc.); `unit` is
-    // 'r'/'c'/'b' for the unit the antecedent was in; `values` MUST be
-    // the bits actually removed from THIS cell (caller responsibility:
-    // values = pre_candidates[cell] & deduction_mask, skip when zero).
+    // 'r'/'c'/'b' for the unit the antecedent was in (use 0 to omit the
+    // field when the antecedent is not unit-bound — e.g. UR, BUG); `values`
+    // MUST be the bits actually removed from THIS cell (caller
+    // responsibility: values = pre_candidates[cell] & deduction_mask, skip
+    // when zero).
     void eliminate(const char* reason, char unit,
                    int row, int col,
                    unsigned short values, int level) {
@@ -233,8 +235,10 @@ public:
         append_lit("{\"event\":\"step\",\"type\":\"eliminate\","
                    "\"reason\":\"");
         append_str(reason);
-        append_lit("\",\"unit\":\"");
-        char u[2] = {unit, 0}; append_str(u);
+        if (unit != 0) {
+            append_lit("\",\"unit\":\"");
+            char u[2] = {unit, 0}; append_str(u);
+        }
         append_lit("\",\"cell\":[");
         append_int(row);
         append_lit(",");
@@ -259,8 +263,10 @@ public:
         append_lit("{\"event\":\"step\",\"type\":\"eliminate\","
                    "\"reason\":\"");
         append_str(reason);
-        append_lit("\",\"unit\":\"");
-        char u[2] = {unit, 0}; append_str(u);
+        if (unit != 0) {
+            append_lit("\",\"unit\":\"");
+            char u[2] = {unit, 0}; append_str(u);
+        }
         append_lit("\",\"cells\":[");
         for (int k = 0; k < n_cells; k++) {
             if (k > 0) append_lit(",");
@@ -300,6 +306,60 @@ public:
         append_unit_set(base_mask);
         append_lit(",\"cover_units\":");
         append_unit_set(cover_mask);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
+    // Phase 4: unique-rectangle antecedent. `subtype` is a short label
+    // identifying the UR pattern variant ("3s", "3p", "1p", "2pi", "2pd",
+    // "2pl", "2pbld"). `corners` are the four UR cell indices (0..80,
+    // row-major, clockwise from start cell). `digits` is the bitmask of
+    // the UR pair (two bits set; for "3s" it's the two repeated singles
+    // forming the conceptual pair). Consequences follow as per-cell
+    // `eliminate` events with reason:"ur" (unit field omitted — UR is not
+    // unit-bound).
+    void ur(const char* subtype,
+            const unsigned char* corners,
+            unsigned short digits, int level) {
+        ensure(224);
+        append_lit("{\"event\":\"step\",\"type\":\"ur\","
+                   "\"subtype\":\"");
+        append_str(subtype);
+        append_lit("\",\"cells\":[");
+        for (int k = 0; k < 4; k++) {
+            if (k > 0) append_lit(",");
+            append_lit("[");
+            append_int(corners[k] / 9);
+            append_lit(",");
+            append_int(corners[k] % 9);
+            append_lit("]");
+        }
+        append_lit("],\"digits\":");
+        append_value_set(digits);
+        append_lit(",\"level\":");
+        append_int(level);
+        append_lit("}\n");
+    }
+
+    // Phase 4: BUG+1 antecedent. The pivot cell currently has three
+    // candidates `cands3`; the BUG+1 deduction asserts the cell's value
+    // must be `value` (the candidate that appears 3 times in some unit
+    // intersecting the cell). A consequence `eliminate(reason="bug",
+    // values=cands3&~value)` removes the other two candidates, leaving a
+    // naked single for the placement.
+    void bug(int row, int col, int value,
+             unsigned short cands3, int level) {
+        ensure(160);
+        append_lit("{\"event\":\"step\",\"type\":\"bug\","
+                   "\"cell\":[");
+        append_int(row);
+        append_lit(",");
+        append_int(col);
+        append_lit("],\"value\":");
+        append_int(value);
+        append_lit(",\"candidates\":");
+        append_value_set(cands3);
         append_lit(",\"level\":");
         append_int(level);
         append_lit("}\n");
@@ -477,6 +537,14 @@ inline void fish(int size, int digit, char base_kind,
                  unsigned short base_mask, unsigned short cover_mask,
                  int level) {
     current->fish(size, digit, base_kind, base_mask, cover_mask, level);
+}
+inline void ur(const char* subtype, const unsigned char* corners,
+               unsigned short digits, int level) {
+    current->ur(subtype, corners, digits, level);
+}
+inline void bug(int row, int col, int value,
+                unsigned short cands3, int level) {
+    current->bug(row, col, value, cands3, level);
 }
 inline void puzzle_start(const char* puzzle81, int puzzle_id) {
     current->puzzle_start(puzzle81, puzzle_id);

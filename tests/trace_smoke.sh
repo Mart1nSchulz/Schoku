@@ -76,7 +76,7 @@ fi
 # Phase 1+2 vocabulary: singles, guess, backtrack, eliminate, naked_*.
 # hidden_pair/triple/quad reserved for future when emitter splits them.
 unknown_types=$(jq -r 'select(.event=="step") | .type' "$trace" | sort -u | \
-    grep -vE '^(single|guess|backtrack|eliminate|naked_pair|naked_triple|naked_quad|hidden_pair|hidden_triple|hidden_quad|fish)$' | head)
+    grep -vE '^(single|guess|backtrack|eliminate|naked_pair|naked_triple|naked_quad|hidden_pair|hidden_triple|hidden_quad|fish|ur|bug)$' | head)
 if [[ -n "$unknown_types" ]]; then
     echo "FAIL: unknown step types: $unknown_types"
     exit 1
@@ -89,7 +89,7 @@ if [[ -n "$unknown_units" ]]; then
     exit 1
 fi
 unknown_reasons=$(jq -r 'select(.event=="step" and (.reason // null) != null) | .reason' "$trace" | sort -u | \
-    grep -vE '^(naked|hidden|deduced|cell|triad_(r|c)(ow|ol)|naked_set|hidden_set|triad_row|triad_col|fish)$' | head)
+    grep -vE '^(naked|hidden|deduced|cell|triad_(r|c)(ow|ol)|naked_set|hidden_set|triad_row|triad_col|fish|ur|bug)$' | head)
 if [[ -n "$unknown_reasons" ]]; then
     echo "FAIL: unknown reasons in step events: $unknown_reasons"
     exit 1

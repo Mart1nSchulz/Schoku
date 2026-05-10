@@ -443,7 +443,19 @@ if ( mode_uqr )
                                 return Phase_GuessMadeWithIncr;
                             }
                             // otherwise simply avoid the UQR:
+                            unsigned short ur_removed = candidates[celli] & single;
                             candidates[celli] &= ~single;
+                            if ( trace::current && ur_removed ) {
+                                unsigned char ur_cells[4] = {
+                                    uqr_corners[0].indx, uqr_corners[1].indx,
+                                    uqr_corners[2].indx, uqr_corners[3].indx };
+                                trace::ur("3s", ur_cells, uqr_singles,
+                                          (int)grid_state->stackpointer);
+                                trace::eliminate("ur", 0,
+                                                 celli/9, celli%9,
+                                                 ur_removed,
+                                                 (int)grid_state->stackpointer);
+                            }
                             if ( verbose == VDebug ) {
                                 solverData.printf("avoiding unique rectangle: %s %s - %s\n3 singles pattern: remove candidate %d from cell %s\n",
                                     ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
@@ -455,7 +467,7 @@ if ( mode_uqr )
                                 if ( verbose == VDebug ) {
                                     solverData.printf("naked  single      ");
                                 }
-                                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                trace::next_entry_reason = trace::ER_NakedSingle;
                                 return Phase_Enter;
                             }
                             found_update = true;
@@ -575,7 +587,19 @@ if ( mode_uqr )
                                     return Phase_GuessMadeWithIncr;
                                 }
                                 // simply avoid the UQR
+                                unsigned short ur_removed = candidates[corner4_index] & pair;
                                 candidates[corner4_index] &= ~pair;
+                                if ( trace::current && ur_removed ) {
+                                    unsigned char ur_cells[4] = {
+                                        uqr_corners[0].indx, uqr_corners[1].indx,
+                                        uqr_corners[2].indx, uqr_corners[3].indx };
+                                    trace::ur("3p", ur_cells, pair,
+                                              (int)grid_state->stackpointer);
+                                    trace::eliminate("ur", 0,
+                                                     corner4_index/9, corner4_index%9,
+                                                     ur_removed,
+                                                     (int)grid_state->stackpointer);
+                                }
                                 if ( verbose == VDebug ) {
                                     char ret[32];
                                     format_candidate_set(ret, pair);
@@ -590,7 +614,7 @@ if ( mode_uqr )
                                     if ( verbose == VDebug ) {
                                         solverData.printf("naked  single      ");
                                     }
-                                    trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                    trace::next_entry_reason = trace::ER_NakedSingle;
                                     return Phase_Enter;
                                 }
                                 found_update = true;
@@ -740,7 +764,19 @@ if ( mode_uqr )
                                                 return Phase_GuessMadeWithIncr;
                                             }
                                             // simply avoid the UQR
+                                            unsigned short ur_removed = candidates[weak_corner_indx] & weak_corner_y;
                                             candidates[weak_corner_indx] &= ~weak_corner_y;
+                                            if ( trace::current && ur_removed ) {
+                                                unsigned char ur_cells[4] = {
+                                                    uqr_corners[0].indx, uqr_corners[1].indx,
+                                                    uqr_corners[2].indx, uqr_corners[3].indx };
+                                                trace::ur("2pi", ur_cells, uqr_pairs[pi].digits,
+                                                          (int)grid_state->stackpointer);
+                                                trace::eliminate("ur", 0,
+                                                                 weak_corner_indx/9, weak_corner_indx%9,
+                                                                 ur_removed,
+                                                                 (int)grid_state->stackpointer);
+                                            }
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d at %s\n",
                                                        ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
@@ -752,7 +788,7 @@ if ( mode_uqr )
                                                 if ( verbose == VDebug ) {
                                                     solverData.printf("naked  single      ");
                                                 }
-                                                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                                trace::next_entry_reason = trace::ER_NakedSingle;
                                                 return Phase_Enter;
                                             }
                                             found_update = true;
@@ -794,8 +830,30 @@ if ( mode_uqr )
                                         counters.unique_rectangles_avoided++;
                                     }
                                     if ( rules == Regular ) {
+                                        unsigned short ur_removed0 = candidates[indx2upd[0]] & uqr_cand;
+                                        unsigned short ur_removed1 = candidates[indx2upd[1]] & uqr_cand;
                                         candidates[indx2upd[0]] &= ~uqr_cand;
                                         candidates[indx2upd[1]] &= ~uqr_cand;
+                                        if ( trace::current && (ur_removed0 | ur_removed1) ) {
+                                            unsigned char ur_cells[4] = {
+                                                uqr_corners[0].indx, uqr_corners[1].indx,
+                                                uqr_corners[2].indx, uqr_corners[3].indx };
+                                            trace::ur(is_diag ? "2pd" : "2pl",
+                                                      ur_cells, uqr_pairs[pi].digits,
+                                                      (int)grid_state->stackpointer);
+                                            if ( ur_removed0 ) {
+                                                trace::eliminate("ur", 0,
+                                                                 indx2upd[0]/9, indx2upd[0]%9,
+                                                                 ur_removed0,
+                                                                 (int)grid_state->stackpointer);
+                                            }
+                                            if ( ur_removed1 ) {
+                                                trace::eliminate("ur", 0,
+                                                                 indx2upd[1]/9, indx2upd[1]%9,
+                                                                 ur_removed1,
+                                                                 (int)grid_state->stackpointer);
+                                            }
+                                        }
                                         if ( verbose == VDebug ) {
                                             solverData.printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d from cells %s %s\n",
                                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
@@ -808,7 +866,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                            trace::next_entry_reason = trace::ER_NakedSingle;
                                             return Phase_Enter;
                                         } else if ( (candidates[indx2upd[1]] & (candidates[indx2upd[1]] - 1)) == 0 ) {
                                             e_digit = candidates[indx2upd[1]];
@@ -816,7 +874,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                            trace::next_entry_reason = trace::ER_NakedSingle;
                                             return Phase_Enter;
                                         }
                                     } else {
@@ -953,7 +1011,7 @@ if ( mode_uqr )
                                     }
                                 }
 
-                                cand_removal_indx.u128 &= ~corner_bits;
+                                cand_removal_indx.u128 &= ~corner_bits.u128;
 
                                 // double check to avoid multiple hits
                                 if ( check_set ) {
@@ -976,6 +1034,12 @@ if ( mode_uqr )
                                         counters.unique_rectangles_avoided++;
                                     }
                                     found_update = true;
+                                    // Phase 4: emit `ur` antecedent only if at least one
+                                    // cell actually loses a candidate (the loop below
+                                    // could be a no-op if every visible cell already
+                                    // lacks non_uqr_cands; suppress the antecedent then
+                                    // to avoid an antecedent with zero consequences).
+                                    bool ur_emitted = false;
                                     if ( verbose == VDebug ) {
                                         char ret[32];
                                         char ret2[32];
@@ -989,13 +1053,28 @@ if ( mode_uqr )
                                     const char *cma = "";
                                     while ( cand_removal_indx ) {
                                         unsigned char j = tzcnt_and_mask(cand_removal_indx);
-                                        unsigned short cj = candidates[j] & ~non_uqr_cands;
+                                        unsigned short pre_j = candidates[j];
+                                        unsigned short cj = pre_j & ~non_uqr_cands;
                                         if ( cj ) {
                                             candidates[j] = cj;
                                             if ( (cj & (cj-1)) == 0 ) {
                                                 got_single = true;
                                             }
                                             grid_state->updated.set_indexbit(j);
+                                            if ( trace::current ) {
+                                                if ( !ur_emitted ) {
+                                                    unsigned char ur_cells[4] = {
+                                                        uqr_corners[0].indx, uqr_corners[1].indx,
+                                                        uqr_corners[2].indx, uqr_corners[3].indx };
+                                                    trace::ur("2pbld", ur_cells, uqr_pairs[pi].digits,
+                                                              (int)grid_state->stackpointer);
+                                                    ur_emitted = true;
+                                                }
+                                                trace::eliminate("ur", 0,
+                                                                 j/9, j%9,
+                                                                 (unsigned short)(pre_j & non_uqr_cands),
+                                                                 (int)grid_state->stackpointer);
+                                            }
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("%s%s", cma, cl2txt[j]);
                                                 cma = ",";
@@ -1056,7 +1135,19 @@ if ( mode_uqr )
                                     // provide 'resolution' in form of a guess
                                     if ( rules == Regular ) {
                                         // simply avoid the UQR
+                                        unsigned short ur_removed = candidates[indx] & uqr_alt_cand;
                                         candidates[indx] &= ~uqr_alt_cand;
+                                        if ( trace::current && ur_removed ) {
+                                            unsigned char ur_cells[4] = {
+                                                uqr_corners[0].indx, uqr_corners[1].indx,
+                                                uqr_corners[2].indx, uqr_corners[3].indx };
+                                            trace::ur("1p", ur_cells, uqr_pairs[pi].digits,
+                                                      (int)grid_state->stackpointer);
+                                            trace::eliminate("ur", 0,
+                                                             indx/9, indx%9,
+                                                             ur_removed,
+                                                             (int)grid_state->stackpointer);
+                                        }
                                         if ( verbose == VDebug ) {
                                             char ret[32];
                                             format_candidate_set(ret, uqr_pairs[pi].digits);
@@ -1071,7 +1162,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
-                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
+                                            trace::next_entry_reason = trace::ER_NakedSingle;
                                             return Phase_Enter;
                                         }
                                     } else {
