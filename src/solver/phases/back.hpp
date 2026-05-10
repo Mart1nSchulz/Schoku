@@ -57,6 +57,10 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_back(
     if ( verbose == VDebug ) {
         solverData.printf("back track to level >%d<\n", grid_state->stackpointer-1);
     }
+    if ( trace::current ) {
+        int from = grid_state->stackpointer;
+        trace::backtrack(from, from - 1);
+    }
     if ( verbose != VNone && reportstats ) {
         counters.trackbacks++;
     }

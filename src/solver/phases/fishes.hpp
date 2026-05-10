@@ -437,6 +437,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
+                        trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                         return Phase_Enter;
                     }
                     dosearch = true;
@@ -747,6 +748,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                         }
                     }
                     if ( e_digit ) {
+                        trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                         return Phase_Enter;
                     }
                     dosearch = true;

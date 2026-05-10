@@ -386,6 +386,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  (sets) ");
                 }
+                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                 return Phase_Enter;
             }
         } // while

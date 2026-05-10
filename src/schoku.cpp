@@ -769,6 +769,11 @@ int numthreads      = 0; // if not 0, number of threads
 int warnings        = 0; // display warnings
 int report_guess_puzzles = 0; // display puzzles that did use guessing
 
+// JSONL trace output (Phase 1: singles + guess + backtrack + puzzle boundaries)
+// Set via --trace-out FILE. "-" means stdout. nullptr = trace disabled.
+const char *trace_out_path = nullptr;
+FILE * trace_out_fp = nullptr;
+
 int guess_score_threshold      = 3; // could be tuned dynamically to 2 for guess-intensive test sets
 
 // puzzle rules
@@ -1484,6 +1489,19 @@ inline GridState* make_guess(unsigned char guess_index, unsigned short digit, Co
 
 };
 
+#include "solver/trace.hpp"
+
+// Thread-local trace emitter pointer. Defined here (translation-unit scope)
+// rather than in the header so the .hpp stays header-only-clean. Each OpenMP
+// worker initialises this to its own Emitter when trace_out_fp is non-null,
+// and back to nullptr otherwise. The if (Schoku::trace::current) guard at every
+// emission site folds to a single TLS load + predicted-cold branch when
+// tracing is disabled.
+namespace trace {
+    thread_local Emitter* current = nullptr;
+    thread_local uint8_t next_entry_reason = ER_None;
+}
+
 #include "solver/make_guess.hpp"
 
 template<Kind kind>
@@ -1599,6 +1617,36 @@ using namespace Schoku;
             argv++; argc--;
             break;
         }
+        // Long options. A bare "--" terminates option parsing (POSIX
+        // convention), so positional args beginning with "-" remain
+        // reachable. --trace-out FILE | --trace-out=FILE: FILE = "-"
+        // means stdout. The file is opened in append mode so a single
+        // multi-thread Schoku run can extend an existing trace; cross-
+        // process appends to the same file are NOT guaranteed atomic at
+        // line granularity (libc FILE locking is per-FILE-object).
+        if (argv[0][1] == '-') {
+            if (argv[0][2] == 0) {     // bare "--"
+                argv++; argc--;
+                break;
+            }
+            if (strcmp(argv[0], "--trace-out") == 0) {
+                if (argc < 2) {
+                    fprintf(stderr, "--trace-out requires a path argument\n");
+                    exit(1);
+                }
+                trace_out_path = argv[1];
+                argc -= 2; argv += 2;
+                continue;
+            }
+            if (strncmp(argv[0], "--trace-out=", 12) == 0) {
+                trace_out_path = argv[0] + 12;
+                argc--; argv++;
+                continue;
+            }
+            fprintf(stderr, "invalid long option: %s\n", argv[0]);
+            argc--; argv++;
+            continue;
+        }
         switch(argv[0][1]) {
         case 'c':
              thorough_check=1;
@@ -1709,6 +1757,34 @@ using namespace Schoku;
             printf("uqr checking mode ( -mU ) disabled when not under default Regular rules\n");
         }
         mode_uqr = false;
+    }
+
+    // Open the JSONL trace sink up-front. "-" means stdout; any other path
+    // is opened for append. Atomicity guarantee: a per-puzzle fwrite() is
+    // line-coherent across THREADS sharing one FILE object (libc internal
+    // FILE locking), NOT across processes appending to the same path —
+    // those can still interleave at sub-fwrite granularity.
+    if ( trace_out_path != nullptr ) {
+        if ( strcmp(trace_out_path, "-") == 0 ) {
+            // Sending trace JSONL to stdout collides with Schoku's stats
+            // / timing / debug summary output which also targets stdout.
+            // Refuse the combination rather than silently corrupting the
+            // JSONL stream for the consumer.
+            if ( reportstats || reporttimings || debug ) {
+                fprintf(stderr, "--trace-out=- (stdout) is incompatible with "
+                                "-x / -y / -d; redirect trace to a file or "
+                                "drop the stats/debug flag.\n");
+                exit(1);
+            }
+            trace_out_fp = stdout;
+        } else {
+            trace_out_fp = fopen(trace_out_path, "ab");
+            if ( trace_out_fp == nullptr ) {
+                fprintf(stderr, "Failed to open --trace-out=%s: %s\n",
+                        trace_out_path, strerror(errno));
+                exit(1);
+            }
+        }
     }
 
     assert((sizeof(GridState) & 0x3f) == 0);
@@ -1842,15 +1918,36 @@ using namespace Schoku;
 
         signed char *grid = &output[82];
 
+        // Single-puzzle path: instantiate one Emitter on the stack so the
+        // trace-disabled cost is exactly the if (trace_out_fp) test below.
+        Schoku::trace::Emitter* trace_em = nullptr;
+        long long g0 = 0, t0 = 0;
+        if ( trace_out_fp ) {
+            trace_em = new Schoku::trace::Emitter(trace_out_fp, 0);
+            Schoku::trace::current = trace_em;
+            g0 = global_counters.guesses;
+            t0 = global_counters.trackbacks;
+            trace_em->puzzle_start((const char*)&string_pre[i], (int)line_to_solve);
+        }
+
+        Status s;
         if ( debug != 0) {
             stack[0].initialize<VDebug>(output, global_counters);
-            solve<VDebug>(grid, stack, line_to_solve, global_counters);
+            s = solve<VDebug>(grid, stack, line_to_solve, global_counters);
         } else if ( reportstats !=0) {
             stack[0].initialize<VStats>(output, global_counters);
-            solve<VStats>(grid, stack, line_to_solve, global_counters);
+            s = solve<VStats>(grid, stack, line_to_solve, global_counters);
         } else {
             stack[0].initialize<VNone>(output, global_counters);
-            solve<VNone>(grid, stack, line_to_solve, global_counters);
+            s = solve<VNone>(grid, stack, line_to_solve, global_counters);
+        }
+
+        if ( trace_em ) {
+            trace_em->puzzle_end(s.solved, s.solved ? (const char*)grid : nullptr,
+                                 global_counters.guesses - g0,
+                                 global_counters.trackbacks - t0);
+            Schoku::trace::current = nullptr;
+            delete trace_em;
         }
     } else {
         seqBuf.setLast((imax-1)/(120*82));
@@ -1869,7 +1966,7 @@ using namespace Schoku;
 #pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in) \
     initializer(omp_priv = Counters())
 
-#pragma omp parallel reduction(counters_reduction:global_counters) firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads)
+#pragma omp parallel reduction(counters_reduction:global_counters) firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads, trace_out_fp)
         {
             if ( numthreads == 0 ) {
                 numthreads = omp_get_num_threads();
@@ -1884,6 +1981,15 @@ using namespace Schoku;
             if ( debug && (numthreads > 1) ) {
                 memstream->startBuffer();
             }
+
+            // Per-thread trace emitter: one buffer per worker, shared FILE
+            // sink, flush at every puzzle_end. nullptr (default) when
+            // tracing disabled — branch-predictably skipped at every site.
+            Schoku::trace::Emitter* trace_em = nullptr;
+            if ( trace_out_fp ) {
+                trace_em = new Schoku::trace::Emitter(trace_out_fp, omp_get_thread_num());
+                Schoku::trace::current = trace_em;
+            }
 #pragma omp for schedule(monotonic:dynamic,120)
             for (size_t i = 0; i < imax; i+=82) {
                 // copy unsolved grid
@@ -1892,16 +1998,35 @@ using namespace Schoku;
                 // add comma and newline in right place
                 output[i*2 + 81] = ',';
                 output[i*2 + 163] = 10;
-                // solve the grid in place
+
+                // Per-puzzle trace wrapper. The OMP reduction gives every
+                // thread a private cumulative `global_counters`; per-puzzle
+                // delta = (after - before) snapshot.
+                long long g0 = 0, t0 = 0;
+                if ( trace_em ) {
+                    g0 = global_counters.guesses;
+                    t0 = global_counters.trackbacks;
+                    trace_em->puzzle_start((const char*)&string_pre[i],
+                                           (int)(i/82 + 1));
+                }
+
+                Status s;
                 if ( debug != 0) {
                     stack[0].initialize<VDebug>(&output[i*2], global_counters);
-                    solve<VDebug>(grid, stack, i/82+1, global_counters, memstream->outf);
+                    s = solve<VDebug>(grid, stack, i/82+1, global_counters, memstream->outf);
                 } else if ( reportstats !=0) {
                     stack[0].initialize<VStats>(&output[i*2], global_counters);
-                    solve<VStats>(grid, stack, i/82+1, global_counters, memstream->outf);
+                    s = solve<VStats>(grid, stack, i/82+1, global_counters, memstream->outf);
                 } else {
                     stack[0].initialize<VNone>(&output[i*2], global_counters);
-                    solve<VNone>(grid, stack, i/82+1, global_counters, memstream->outf);
+                    s = solve<VNone>(grid, stack, i/82+1, global_counters, memstream->outf);
+                }
+
+                if ( trace_em ) {
+                    trace_em->puzzle_end(s.solved,
+                                         s.solved ? (const char*)grid : nullptr,
+                                         global_counters.guesses - g0,
+                                         global_counters.trackbacks - t0);
                 }
                 // strictly align this with the chunk size of 120
                 if ( debug && (numthreads > 1) && ((i/82)%120 == 119 || (i==imax-82) )) {
@@ -1917,6 +2042,12 @@ using namespace Schoku;
                     }
                 }
             } // omp for
+
+            if ( trace_em ) {
+                Schoku::trace::current = nullptr;
+                delete trace_em;
+                trace_em = nullptr;
+            }
 
             if ( debug && (numthreads > 1) ) {
                 if ( omp_get_thread_num() == 0 ) {   // one thread to manage
@@ -2022,6 +2153,11 @@ using namespace Schoku;
     }
     if ( rules == Regular && (reportstats || warnings) && ( global_counters.unsolved_count || global_counters.non_unique_count || global_counters.not_verified_count) ) {
         printf("\n\tIf a puzzle may have multiple solutions use either\n\t -ro (find one solution) or -rm (check for multiple solutions)!\n");
+    }
+
+    if ( trace_out_fp != nullptr && trace_out_fp != stdout ) {
+        fclose(trace_out_fp);
+        trace_out_fp = nullptr;
     }
 
     return 0;

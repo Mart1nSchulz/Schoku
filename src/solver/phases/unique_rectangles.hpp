@@ -455,6 +455,7 @@ if ( mode_uqr )
                                 if ( verbose == VDebug ) {
                                     solverData.printf("naked  single      ");
                                 }
+                                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                 return Phase_Enter;
                             }
                             found_update = true;
@@ -589,6 +590,7 @@ if ( mode_uqr )
                                     if ( verbose == VDebug ) {
                                         solverData.printf("naked  single      ");
                                     }
+                                    trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                     return Phase_Enter;
                                 }
                                 found_update = true;
@@ -750,6 +752,7 @@ if ( mode_uqr )
                                                 if ( verbose == VDebug ) {
                                                     solverData.printf("naked  single      ");
                                                 }
+                                                trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                                 return Phase_Enter;
                                             }
                                             found_update = true;
@@ -805,6 +808,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
+                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                             return Phase_Enter;
                                         } else if ( (candidates[indx2upd[1]] & (candidates[indx2upd[1]] - 1)) == 0 ) {
                                             e_digit = candidates[indx2upd[1]];
@@ -812,6 +816,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
+                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                             return Phase_Enter;
                                         }
                                     } else {
@@ -1066,6 +1071,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("naked  single      ");
                                             }
+                                            trace::next_entry_reason = trace::ER_DeducedSingle;  // Phase 2: refine to fish/set/ur reason
                                             return Phase_Enter;
                                         }
                                     } else {

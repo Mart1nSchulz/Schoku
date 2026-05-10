@@ -181,6 +181,12 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
         solverData->printf("guess remove {%d} from %s triad at %s\n",
                1+_tzcnt_u32(select_cand), type==0?"row":"col", cl2txt[off]);
     }
+    if ( trace::current ) {
+        trace::guess_triad(off / 9, off % 9,
+                           _tzcnt_u32(select_cand) + 1,
+                           type == 0 ? 'r' : 'c',
+                           (int)stackpointer);
+    }
     if ( verbose != VNone ) {
         char gridout[82];
         if ( debug > 1 ) {
@@ -473,6 +479,11 @@ inline GridState* GridState::make_guess(unsigned char guess_index, unsigned shor
     // Update candidates
     if ( verbose == VDebug ) {
         fprintf(output, "guess at level >%d< - new level >%d<\nguess", stackpointer, new_grid_state->stackpointer);
+    }
+    if ( trace::current ) {
+        trace::guess(guess_index / 9, guess_index % 9,
+                     _tzcnt_u32(digit) + 1,
+                     (int)stackpointer);
     }
 
     new_grid_state->enter_digit<verbose>( digit, guess_index, output);

@@ -21,6 +21,46 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_enter
         if ( verbose == VDebug ) {
             solverData.printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
         }
+        // JSON trace: emit the placement event with the reason marker set
+        // by the upstream phase. ER_None is a defensive fallback (we get
+        // here only via Phase_Enter, which is always preceded by a reason
+        // store — but cold paths might land here e.g. during unique-check
+        // mode without a marker, so we don't assert).
+        if ( trace::current ) {
+            int row = e_i / 9;
+            int col = e_i % 9;
+            int value = _tzcnt_u32(e_digit) + 1;
+            int level = grid_state->stackpointer;
+            switch (trace::next_entry_reason) {
+            case trace::ER_NakedSingle:
+                trace::naked_single(row, col, value, level);
+                break;
+            case trace::ER_HiddenSingleRow:
+                trace::hidden_single(row, col, value, 'r', level);
+                break;
+            case trace::ER_HiddenSingleCol:
+                trace::hidden_single(row, col, value, 'c', level);
+                break;
+            case trace::ER_HiddenSingleBox:
+                trace::hidden_single(row, col, value, 'b', level);
+                break;
+            case trace::ER_DeducedSingle:
+                trace::deduced_single(row, col, value, level);
+                break;
+            case trace::ER_Guess:
+                // Guess event itself is emitted by make_guess() before this
+                // entry runs; entering the guessed digit here is the
+                // mechanical placement, not a separate step.
+                break;
+            default:
+                // ER_None or unknown — emit as deduced rather than naked so
+                // a stale TLS from a hypothetical future refactor doesn't
+                // poison the training signal as a "real" naked single.
+                trace::deduced_single(row, col, value, level);
+                break;
+            }
+            trace::next_entry_reason = trace::ER_None;
+        }
 #ifndef NDEBUG
         if ( __popcnt16(e_digit) != 1 ) {
             if ( warnings != 0 ) {
@@ -103,6 +143,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_enter
                 }
                 e_i = 80;
                 e_digit = candidates[80];
+                trace::next_entry_reason = trace::ER_NakedSingle;
                 return Phase_Enter;
             }
         }
@@ -113,6 +154,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_enter
             if ( verbose == VDebug ) {
                 solverData.printf("naked  single      ");
             }
+            trace::next_entry_reason = trace::ER_NakedSingle;
             return Phase_Enter;
         }
         e_digit = 0;

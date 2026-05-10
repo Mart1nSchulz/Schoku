@@ -46,6 +46,9 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_searc
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  single      ");
                 }
+                // Mark trace context so phase_enter can label this event.
+                // The store is a single TLS write; cheap when trace disabled.
+                trace::next_entry_reason = trace::ER_NakedSingle;
                 return Phase_Enter;
             }
         }

@@ -225,6 +225,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                     if ( verbose == VDebug ) {
                         solverData.printf("hidden single (col)");
                     }
+                    trace::next_entry_reason = trace::ER_HiddenSingleCol;
                     return Phase_Enter;
                 }
 
@@ -357,6 +358,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                         if ( verbose == VDebug ) {
                             solverData.printf("hidden single (row)");
                         }
+                        trace::next_entry_reason = trace::ER_HiddenSingleRow;
                         return Phase_Enter;
                     }
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
@@ -466,6 +468,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                         if ( verbose == VDebug ) {
                             solverData.printf("hidden single (row)");
                         }
+                        trace::next_entry_reason = trace::ER_HiddenSingleRow;
                         return Phase_Enter;
                     } else {
                         if ( verbose != VNone ) {
@@ -527,6 +530,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                 }
                 e_i = celli;
                 e_digit = cand;
+                trace::next_entry_reason = trace::ER_HiddenSingleRow;
                 return Phase_Enter;
             }
             mask &= ~(3<<(s_idx<<1));
@@ -1005,6 +1009,10 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::phase_hidde
                         if ( rules == Regular ) {
                             e_i = target;
                             e_digit = digit;
+                            // BUG+1 deduction. Phase 1 emits this as a
+                            // deduced single — a "type":"bug" event lives in
+                            // Phase 4 alongside the rest of the BUG path.
+                            trace::next_entry_reason = trace::ER_DeducedSingle;
                             return Phase_Enter;
                         } else {
                             if ( verbose == VDebug ) {
