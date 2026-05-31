@@ -699,6 +699,11 @@ Counters global_counters;
     typedef union {
         __m256i m256;
         v16us v16;
+        // Plain-array alias of the same storage. clang (unlike gcc) forbids
+        // taking the address of a vector element (&v16[i]); writes that need
+        // an element pointer go through u16 instead. Same bytes, so reads via
+        // m256/v16 see them — consistent with the union punning used elsewhere.
+        unsigned short u16[16];
     } cbbv_t;
 #endif
 
@@ -1523,6 +1528,25 @@ inline unsigned char *SolverData::getSectionSetUnlocked(GridState &gs) {
 
 #include "solver/solve.hpp"
 
+// Unified verbosity dispatch shared by the single-puzzle and OMP-parallel
+// solve call sites. Reads the file-scope globals `debug`/`reportstats`
+// exactly as the original inline blocks did (read-only inside the OMP
+// region). Kept `inline` so codegen matches the prior hand-inlined branches.
+// Selects the solve<> instantiation by verbosity: debug, then reportstats, otherwise none.
+static inline Status dispatch_solve(signed char *init_out, signed char *grid, int line,
+                                    GridState *stack, Counters &counters, FILE *out) {
+    if ( debug != 0 ) {
+        stack[0].initialize<VDebug>(init_out, counters);
+        return solve<VDebug>(grid, stack, line, counters, out);
+    } else if ( reportstats != 0 ) {
+        stack[0].initialize<VStats>(init_out, counters);
+        return solve<VStats>(grid, stack, line, counters, out);
+    } else {
+        stack[0].initialize<VNone>(init_out, counters);
+        return solve<VNone>(grid, stack, line, counters, out);
+    }
+}
+
 } // namespace Schoku
 
 #ifndef LIB_ONLY
@@ -1565,199 +1589,29 @@ Command line options:
 )");
 }
 
+// CLI / environment parsing and stats/timing reporting are extracted into
+// small purpose-specific fragments. They are included here, in the global
+// namespace AFTER print_help() (cli.hpp calls it) and BEFORE main() (which
+// calls both). Each pulls Schoku's globals in with `using namespace
+// Schoku;` rather than reopening the namespace.
+#include "cli.hpp"
+#include "report.hpp"
+
 int main(int argc, const char *argv[]) {
 using namespace Schoku;
 
     int line_to_solve = 0;
 
-    // the debug dbgprintf and dbgprintfilter are not used in checked-in code
-    // they are initialized here at no cost just in case...
-    const char *schoku_dbg_filter = getenv("SCHOKU_DBG_FILTER");
-    if ( schoku_dbg_filter ) {
-       unsigned off = 0;
-       while ( schoku_dbg_filter[off] == '0' ) {
-           off++;
-       }
-       if ( schoku_dbg_filter[off] == 'x' ) {
-            sscanf(&schoku_dbg_filter[off+1], "%x", &dbgprintfilter);
-       } else {
-            sscanf(&schoku_dbg_filter[off], "%d", &dbgprintfilter);
-       }
-    }
-    const char *schoku_report_guess = getenv("SCHOKU_GUESS_REPORT");
-    if ( schoku_report_guess ) {
-       if ( schoku_report_guess[0] == '1' ) {
-            report_guess_puzzles = 1;
-       }
-    }
-
-    if ( argc > 0 ) {
-        argc--;
-        argv++;
-    }
-
-    // Buffer holds the reflected command line for "-x" stats output (may
-    // be silently truncated for very long argv; truncation is harmless to
-    // solver behavior). Original was [80] which overflows on realistic
-    // absolute paths and triggers SIGABRT under fortified libcs (Apple
-    // clang/macOS). Sized to accommodate typical CLI plus two long file
-    // paths; snprintf bounds the writes regardless of argv length.
+    // Buffer holds the reflected command line for "-x" stats output (see
+    // parse_args for the truncation/sizing rationale).
     char opts[1024] = { 0 };
-    size_t used = 0;
-    for (int i = 0; i < argc; i++) {
-        if (used >= sizeof(opts) - 1) break;
-        int n = snprintf(opts + used, sizeof(opts) - used, "%s ", argv[i]);
-        if (n < 0) break;
-        used += (size_t)n;
-        if (used >= sizeof(opts) - 1) { opts[sizeof(opts) - 1] = 0; break; }
-    }
 
-    while ( argc && argv[0][0] == '-' ) {
-        if (argv[0][1] == 0) {
-            argv++; argc--;
-            break;
-        }
-        // Long options. A bare "--" terminates option parsing (POSIX
-        // convention), so positional args beginning with "-" remain
-        // reachable. --trace-out FILE | --trace-out=FILE: FILE = "-"
-        // means stdout. The file is opened in append mode so a single
-        // multi-thread Schoku run can extend an existing trace; cross-
-        // process appends to the same file are NOT guaranteed atomic at
-        // line granularity (libc FILE locking is per-FILE-object).
-        if (argv[0][1] == '-') {
-            if (argv[0][2] == 0) {     // bare "--"
-                argv++; argc--;
-                break;
-            }
-            if (strcmp(argv[0], "--trace-out") == 0) {
-                if (argc < 2) {
-                    fprintf(stderr, "--trace-out requires a path argument\n");
-                    exit(1);
-                }
-                trace_out_path = argv[1];
-                argc -= 2; argv += 2;
-                continue;
-            }
-            if (strncmp(argv[0], "--trace-out=", 12) == 0) {
-                trace_out_path = argv[0] + 12;
-                argc--; argv++;
-                continue;
-            }
-            fprintf(stderr, "invalid long option: %s\n", argv[0]);
-            argc--; argv++;
-            continue;
-        }
-        switch(argv[0][1]) {
-        case 'c':
-             thorough_check=1;
-             break;
-        case 'd':
-             debug=1;
-             if ( argv[0][2] && isdigit(argv[0][2]) ) {
-                 sscanf(&argv[0][2], "%d", &debug);
-             }
-             break;
-        case 'h':
-             print_help();
-             exit(0);
-             break;
-        case 'l':    // line of puzzle to solve
-             sscanf(argv[0]+2, "%d", &line_to_solve);
-             break;
-        case 'm':
-             for ( unsigned char p=2; argv[0][p] && p<6; p++) {
-                 switch (toupper(argv[0][p])) {
-#ifdef OPT_NEWSETS
-                case 'N':        // see OPT_NEWSETS
-                    mode_newsets = true;
-                    break;
-#endif
-#ifdef OPT_SETS
-                case 'S':        // see OPT_SETS
-                    mode_sets = true;
-                    break;
-#endif
-#ifdef OPT_UQR
-                case 'U':        // see OPT_UQR
-                    mode_uqr = true;
-                    break;
-#endif
-#ifdef OPT_FSH
-                case 'F':        // see OPT_FSH
-                    mode_fish = true;
-                    break;
-#endif
-                default:
-                    printf("invalid mode %c\n", argv[0][p]);
-                }
-            }
-            break;
-        case 'r':    // rules
-            if ( argv[0][2] ) {
-                switch (toupper(argv[0][2])) {
-                case 'R':        // defaul rules (fastest):
-                                 // assume regular puzzle with a unique solution
-                                 // not suitable for puzzles with multiple solutions
-                    rules = Regular;
-                    break;
-                case 'O':        // find one solution without making assumptions
-                    rules = FindOne;
-                    break;
-                case 'M':        // check for multiple solutions
-                    rules = Multiple;
-                    break;
-                default:
-                    printf("invalid puzzle rules option %c\n", argv[0][2]);
-                    break;
-                }
-            }
-            break;
-        case 't':    // set number of threads
-             if ( argv[0][2] && isdigit(argv[0][2]) ) {
-                 sscanf(&argv[0][2], "%d", &numthreads);
-                 if ( numthreads != 0 ) {
-                     omp_set_num_threads(numthreads);
-                 }
-             }
-             break;
-        case 'v':    // verify
-             verify=1;
-             break;
-        case 'w':    // display warnings
-             warnings = 1;
-             break;
-        case 'x':    // stats output
-             reportstats=1;
-             break;
-        case 'y':    // timing stats only
-             reporttimings=1;
-             break;
-        case '#':    // row/col numbering base
-             if ( argv[0][2] && isdigit(argv[0][2]) ) {
-                 int displaybase = 0;
-                 sscanf(&argv[0][2], "%d", &displaybase);
-                 if ( displaybase == 1 ) {
-                     for ( int i=0; i<81; i++ ) {
-                        cl2txt[i][1]++;
-                        cl2txt[i][3]++;
-                     }
-                 }
-             }
-             break;
-        default:
-             printf("invalid option: %s\n", argv[0]);
-             break;
-        }
-        argc--, argv++;
-    }
-    // suppress uqr mode if unique checking is requested,
-    // avoiding severe complications in the code.
-    if ( rules != Regular ) {
-        if ( mode_uqr && warnings != 0 ) {
-            printf("uqr checking mode ( -mU ) disabled when not under default Regular rules\n");
-        }
-        mode_uqr = false;
-    }
+    // Parse environment + command-line options. parse_args advances
+    // argv/argc past the consumed options, so on return argv[0]/argv[1]
+    // are the remaining positional (input/output) file tokens; the
+    // "puzzles.txt"/"solutions.txt" defaults are applied below exactly as
+    // before via the `argc>0?argv[0]:...` lines.
+    parse_args(argc, argv, line_to_solve, opts, sizeof(opts));
 
     // Open the JSONL trace sink up-front. "-" means stdout; any other path
     // is opened for append. Atomicity guarantee: a per-puzzle fwrite() is
@@ -1860,9 +1714,8 @@ using namespace Schoku;
         line_to_solve = 0;
     }
     size_t outnpuzzles = line_to_solve ? 1 : npuzzles;
-    // Single source of truth for the output mapping size — used by
-    // ftruncate, mmap, and munmap below. Splitting these used to allow
-    // a npuzzles/outnpuzzles mismatch under -l# (see git log for fix).
+    // Single source of truth for the output mapping size, shared by
+    // ftruncate, mmap, and munmap below so they stay consistent under -l#.
     const size_t output_bytes = outnpuzzles * 164;
 
 	if ( (fsize -pre -post + 1) % 82 ) {
@@ -1931,16 +1784,7 @@ using namespace Schoku;
         }
 
         Status s;
-        if ( debug != 0) {
-            stack[0].initialize<VDebug>(output, global_counters);
-            s = solve<VDebug>(grid, stack, line_to_solve, global_counters);
-        } else if ( reportstats !=0) {
-            stack[0].initialize<VStats>(output, global_counters);
-            s = solve<VStats>(grid, stack, line_to_solve, global_counters);
-        } else {
-            stack[0].initialize<VNone>(output, global_counters);
-            s = solve<VNone>(grid, stack, line_to_solve, global_counters);
-        }
+        s = dispatch_solve(output, grid, line_to_solve, stack, global_counters, stdout);
 
         if ( trace_em ) {
             trace_em->puzzle_end(s.solved, s.solved ? (const char*)grid : nullptr,
@@ -2011,16 +1855,7 @@ using namespace Schoku;
                 }
 
                 Status s;
-                if ( debug != 0) {
-                    stack[0].initialize<VDebug>(&output[i*2], global_counters);
-                    s = solve<VDebug>(grid, stack, i/82+1, global_counters, memstream->outf);
-                } else if ( reportstats !=0) {
-                    stack[0].initialize<VStats>(&output[i*2], global_counters);
-                    s = solve<VStats>(grid, stack, i/82+1, global_counters, memstream->outf);
-                } else {
-                    stack[0].initialize<VNone>(&output[i*2], global_counters);
-                    s = solve<VNone>(grid, stack, i/82+1, global_counters, memstream->outf);
-                }
+                s = dispatch_solve(&output[i*2], grid, (int)(i/82+1), stack, global_counters, memstream->outf);
 
                 if ( trace_em ) {
                     trace_em->puzzle_end(s.solved,
@@ -2080,80 +1915,11 @@ using namespace Schoku;
 		}
 	}
 
-    if ( reportstats) {
-        long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        printf("schoku version: %s\ncommand options: %s\ncompile options: %s\n", version_string, opts, compilation_options);
-        printf("%10ld  %6.1f/puzzle  puzzles entered and presets\n", npuzzles, (double)global_counters.preset_count/outnpuzzles);
-        printf("%10ld  %.0lf/s  puzzles solved\n", global_counters.solved_count, (double)global_counters.solved_count/((double)duration/1000000000LL));
-        if ( duration/outnpuzzles > 1000 ) {
-            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/(double)1000000, (double)duration/(outnpuzzles*1000LL));
-        } else {
-            printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/outnpuzzles));
-        }
-        if ( global_counters.unsolved_count && rules != Regular) {
-            printf("%10ld  puzzles had no solution\n", global_counters.unsolved_count);
-        }
-        if ( rules == Multiple ) {
-            printf("%10ld  puzzles had multiple solutions\n", global_counters.non_unique_count);
-        }
-        if ( verify ) {
-            printf("%10ld  puzzle solutions were verified\n", global_counters.verified_count);
-        }
-        printf( "%10ld  %6.2f%%  puzzles solved without guessing\n", global_counters.no_guess_cnt, (double)global_counters.no_guess_cnt/global_counters.solved_count*100);
-        printf( "%10ld  %6.2f/puzzle  guesses\n", global_counters.guesses, (double)global_counters.guesses/(double)global_counters.solved_count);
-        printf( "%10ld  %6.2f/puzzle  back tracks\n", global_counters.trackbacks, (double)global_counters.trackbacks/global_counters.solved_count);
-        printf("%10lld  %6.2f/puzzle  digits entered and retracted\n", global_counters.digits_entered_and_retracted, (double)global_counters.digits_entered_and_retracted/global_counters.solved_count);
-        printf("%10lld  %6.2f/puzzle  'rounds'\n", global_counters.past_naked_count, (double)global_counters.past_naked_count/global_counters.solved_count);
-        printf("%10lld  %6.2f/puzzle  triads resolved\n", global_counters.triads_resolved, (double)global_counters.triads_resolved/global_counters.solved_count);
-        printf("%10lld  %6.2f/puzzle  triad updates\n", global_counters.triad_updates, (double)global_counters.triad_updates/global_counters.solved_count);
-#if defined(OPT_SETS) || defined(OPT_NEWSETS)
-        if ( mode_sets || mode_newsets ) {
-            printf("%10lld  %6.2f/puzzle  naked sets found\n", global_counters.naked_sets_found, (double)global_counters.naked_sets_found/global_counters.solved_count);
-            printf("%10lld  %6.2f/puzzle  naked sets searched\n", global_counters.naked_sets_searched, (double)global_counters.naked_sets_searched/global_counters.solved_count);
-        }
-#endif
-#ifdef OPT_FSH
-        if ( mode_fish ) {
-            printf("%10lld  %6.2f/puzzle  fishes updated\n", global_counters.fishes_updated, (double)global_counters.fishes_updated/global_counters.solved_count);
-            printf("%10lld  %6.2f/puzzle  fishes detected\n", global_counters.fishes_detected, (double)global_counters.fishes_detected/global_counters.solved_count);
-         }
-#endif
-#ifdef OPT_UQR
-        if ( mode_uqr ) {
-            printf("%10lld  %6.2f/puzzle  unique rectangles avoided\n", global_counters.unique_rectangles_avoided, (double)global_counters.unique_rectangles_avoided/global_counters.solved_count);
-            printf("%10lld  %6.2f/puzzle  unique rectangles checked\n", global_counters.unique_rectangles_checked, (double)global_counters.unique_rectangles_checked/global_counters.solved_count);
-        }
-#endif
-        if ( global_counters.bug_plus1_count ) {
-            printf("%10ld  bi-value universal graves avoided (BUG+1)\n", global_counters.bug_plus1_count);
-        }
-        if ( global_counters.bug_count ) {
-            printf("%10ld  bi-value universal graves detected\n", global_counters.bug_count);
-        }
-        if ( global_counters.no_bivals_count ) {
-            printf("%10ld  board states without bivalues\n", global_counters.no_bivals_count);
-        }
-    } else if ( reporttimings ) {
-        long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
-        if ( duration/npuzzles > 1000 ) {
-            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(npuzzles*1000LL));
-        } else {
-            printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/npuzzles));
-        }
-    }
-
-    if ( !reportstats && rules == Multiple && global_counters.non_unique_count) {
-        printf("%10ld  puzzles had more than one solution\n", global_counters.non_unique_count);
-    }
-    if ( verify && global_counters.not_verified_count) {
-        printf("%10ld  puzzle solutions verified as not correct\n", global_counters.not_verified_count);
-    }
-    if ( !reportstats && global_counters.unsolved_count) {
-        printf("%10ld puzzles had no solution\n", global_counters.unsolved_count);
-    }
-    if ( rules == Regular && (reportstats || warnings) && ( global_counters.unsolved_count || global_counters.non_unique_count || global_counters.not_verified_count) ) {
-        printf("\n\tIf a puzzle may have multiple solutions use either\n\t -ro (find one solution) or -rm (check for multiple solutions)!\n");
-    }
+    // Stats / timing report + trailing summary warnings. main() owns the
+    // wall clock (starttime) and passes it in; print_stats samples the
+    // duration at report time inside the chosen branch, exactly as the
+    // original inline code did.
+    print_stats(starttime, global_counters, npuzzles, outnpuzzles, opts);
 
     if ( trace_out_fp != nullptr && trace_out_fp != stdout ) {
         fclose(trace_out_fp);

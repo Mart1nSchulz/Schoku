@@ -1,7 +1,7 @@
 // Out-of-class definition of `SolveCtx<verbose>::phase_guess()`.
-// AlphaEvolve mutation unit: this file is the entire surface for make_guess + (OPT_UQR) post-guess update
-// strategy; replace the function body to mutate the strategy without
-// touching the rest of the solver.
+// phase_guess() invokes GridState::make_guess() (defined in
+// solver/make_guess.hpp); under OPT_UQR this file also defines the
+// post-guess update phase phase_guess_made_with_incr().
 //
 // CONTRACT: private include fragment, must be #included exactly once
 // from inside `namespace Schoku { ... }` after solver/solve_ctx.hpp.

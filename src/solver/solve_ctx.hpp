@@ -9,14 +9,10 @@
 // defined out-of-class in its own header under solver/phases/. The
 // dispatcher in solver/solve.hpp calls ctx.phase_X() and uses the
 // returned SolverPhase to drive the next iteration. Returning a
-// SolverPhase from any nesting depth correctly exits the lambda /
-// method (the original `goto X` semantics) — fixing the bug in the
-// reverted commit 1d43328 where `phase=X; continue;` continued the
-// inner for/while instead of the outer for(;;) switch.
+// SolverPhase from any nesting depth exits the method.
 //
-// Each phase is the AlphaEvolve mutation unit: replace a single
-// solver/phases/<name>.hpp file to mutate one strategy's
-// implementation, leaving the rest of the solver intact.
+// Each phase method lives in its own solver/phases/<name>.hpp file,
+// holding one strategy's implementation.
 #pragma once
 
 enum SolverPhase {
@@ -92,10 +88,44 @@ struct SolveCtx {
     // Sub-phase helpers called from phase_hidden_search() in sequence.
     // Each returns Phase_HiddenSearch on natural completion (continue to
     // the next helper) or any other SolverPhase to short-circuit back to
-    // the dispatcher (semantically equivalent to the pre-refactor `goto X`
-    // exits inside the original block). Bodies live in their own headers.
+    // the dispatcher (returning any other SolverPhase short-circuits back
+    // to the dispatcher). Bodies live in their own headers.
     SolverPhase do_naked_sets_new();
+    // Shared "drain to_change, eliminate candidates, emit trace, bump counter"
+    // step for naked-set rows (used twice inside do_naked_sets_new()).
+    // Returns true if any candidate was eliminated (caller redirects to
+    // Phase_Search), false otherwise. Defined in naked_sets_new.hpp.
+    bool eliminate_naked_set_row(unsigned char cl, unsigned short m, unsigned char row, unsigned char cnt, bit128_t &to_change);
     SolverPhase do_naked_sets_main();
     SolverPhase do_fishes();
+
+    // Verdict from the shared fish consequence-emit block (helper 1).
+    // The block always ends inside `if(clean_bits)`, so it either drives a
+    // sashimi placement (FishEnter -> caller returns Phase_Enter) or marks a
+    // search (FishSearch -> caller sets dosearch). The final
+    // `if(dosearch) return Phase_Search` stays at the call site.
+    enum FishEmit { FishEnter, FishSearch };
+
+    // Shared sub-blocks of do_fishes(), one per identical pair across the
+    // row-scan and col-scan halves. Defined out-of-class in fishes.hpp,
+    // always_inline so codegen is identical to the inline originals.
+
+    // Helper 1: final consequence-emit (row ~447-493 / col ~803-847).
+    // Sets e_digit/e_i for sashimi placements, drains clean_bits removing
+    // digit `dgt`, mirrors trace::eliminate under unit `trace_elim_unit`.
+    FishEmit emit_fish_consequences(bit128_t &clean_bits, const unsigned char fincells[2],
+                                    unsigned char dgt, unsigned char cnt, char trace_elim_unit);
+
+    // Helper 2: Case-1 (sashimi) local eliminate loop (row ~357-376 /
+    // col ~712-731). Drains clean_bits removing digit `dgt`, unit `u`.
+    void eliminate_fish_case1(bit128_t &clean_bits, unsigned char dgt, char u);
+
+#ifdef OPT_FSH
+    // Helper 3: alt-triple synthesis (row ~503-516 / col ~857-870).
+    // Scans the bi-value positions in pair_locs for a pair whose union has
+    // popcount 3; on success writes that union to alt_base_x and returns true.
+    bool synthesize_fish_alt_triple(cbbv_t &cbbv, unsigned int pair_cnt,
+                                    unsigned int pair_locs, unsigned int &alt_base_x);
+#endif
     SolverPhase do_unique_rectangles();
 };

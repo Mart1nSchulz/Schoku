@@ -1,13 +1,10 @@
 // Out-of-class definition of `SolveCtx<verbose>::do_naked_sets_main()`.
-// AlphaEvolve mutation unit: this file is the entire surface for Algorithm 4 — naked sets (main variant, OPT_SETS).
-// Replace the function body to mutate the strategy without touching
-// the rest of the solver.
+// This file contains the complete implementation of Algorithm 4 — naked sets (main variant, OPT_SETS).
 //
 // Returns Phase_HiddenSearch when the block finishes without firing
 // any redirect (the dispatcher then continues to the next block in
 // phase_hidden_search). Any other returned SolverPhase short-circuits
-// back to the dispatcher (semantically identical to the pre-refactor
-// `goto X` exits inside the block).
+// back to the dispatcher.
 //
 // Build flag: this body is empty when OPT_SETS is undefined; the helper
 // then unconditionally returns Phase_HiddenSearch.
@@ -313,7 +310,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                                 unsigned char k = 0xff;
                                 unsigned short complement = 0;
                                 Kind kind = j?Box:Col;
-                                bit128_t s = { *(bit128_t*)&big_index_lut[i][kind][0] & ~grid_state->set23_found[kind] };
+                                bit128_t s = { *(bit128_t*)&big_index_lut[i][kind][0] & ~grid_state->set23_found[kind].u128 };
                                 bool set23_cond1 = (cnt <= 3);
                                 bool set23_cond2 = (uls[j] <= cnt+3);
                                 for ( unsigned char k_m = 0; k_m<9; k_m++ ) {

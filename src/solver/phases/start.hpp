@@ -1,7 +1,6 @@
 // Out-of-class definition of `SolveCtx<verbose>::phase_start()`.
-// AlphaEvolve mutation unit: this file is the entire surface for per-iteration grid_state setup
-// strategy; replace the function body to mutate the strategy without
-// touching the rest of the solver.
+// This file contains the complete implementation of per-iteration grid_state setup
+// strategy.
 //
 // CONTRACT: private include fragment, must be #included exactly once
 // from inside `namespace Schoku { ... }` after solver/solve_ctx.hpp.

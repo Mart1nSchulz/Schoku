@@ -11,11 +11,8 @@ tests/compat/*.o
 # Sample input datasets (kept out of repo; tests/data/ has the canonical copies)
 src/puzzles_*.txt
 
+# Default solver output
+src/solutions.txt
+
 # macOS
 .DS_Store
-
-# Editor / tooling local state
-.claude/
-schoku-pre-sm
-src/schoku-pre-sm
-src/solutions.txt

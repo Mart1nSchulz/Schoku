@@ -14,7 +14,7 @@ puzzles_invalid5	-x -t1 -rO	t1_rO
 puzzles_invalid5	-x -t8 -rO	t8_rO
 puzzles_big5000	-x -t8 -ms	t8_ms
 puzzles_big5000	-x -t8 -mn	t8_mn
-# AlphaEvolve mutation buckets: each row is a sub-corpus stratified by the
+# Test buckets: each row is a sub-corpus stratified by the
 # most-advanced technique its solution path requires (per sudoku_rs_core's
 # rater, max-tier rule). Goal: a mutation in one Schoku phase localises to
 # the bucket(s) that exercise it. -t1 is deterministic (no thread race).

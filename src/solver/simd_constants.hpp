@@ -1,11 +1,8 @@
 // Solver SIMD/vector constants.
 //
-// Centralized into one file for AlphaEvolve discoverability: the
-// optimizer can scan this single header to find every named SIMD
-// constant the solver depends on, with the comment explaining where
-// it's used. Replacing or augmenting a constant here is the surgical
-// way to mutate the solver's vector-instruction footprint without
-// touching strategy code.
+// Centralized into one file so all SIMD/vector constants live in one
+// place: every named SIMD constant the solver depends on is declared
+// here, with a comment explaining where it's used.
 //
 // CONTRACT: this is a private include fragment, not a self-contained
 // header. It must be #included exactly once, from inside

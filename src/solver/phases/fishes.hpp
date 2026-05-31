@@ -1,13 +1,10 @@
 // Out-of-class definition of `SolveCtx<verbose>::do_fishes()`.
-// AlphaEvolve mutation unit: this file is the entire surface for Fish patterns: X-Wing/sword/jelly/squirmbag (OPT_FSH).
-// Replace the function body to mutate the strategy without touching
-// the rest of the solver.
+// This file contains the complete implementation of Fish patterns: X-Wing/sword/jelly/squirmbag (OPT_FSH).
 //
 // Returns Phase_HiddenSearch when the block finishes without firing
 // any redirect (the dispatcher then continues to the next block in
 // phase_hidden_search). Any other returned SolverPhase short-circuits
-// back to the dispatcher (semantically identical to the pre-refactor
-// `goto X` exits inside the block).
+// back to the dispatcher.
 //
 // Build flag: this body is empty when OPT_FSH is undefined; the helper
 // then unconditionally returns Phase_HiddenSearch.
@@ -15,6 +12,134 @@
 // CONTRACT: private include fragment, must be #included exactly once
 // from inside `namespace Schoku { ... }` after solver/solve_ctx.hpp.
 #pragma once
+
+
+// Helper 1 — final consequence-emit block, shared verbatim between the
+// row-scan (was ~447-493) and col-scan (was ~803-847) halves. The two
+// originals differed only in comment text. Caller keeps the `if(clean_bits)`
+// guard and the trailing `if(dosearch) return Phase_Search`.
+template <Verbosity verbose>
+__attribute__((always_inline)) inline typename SolveCtx<verbose>::FishEmit
+SolveCtx<verbose>::emit_fish_consequences(bit128_t &clean_bits, const unsigned char fincells[2],
+                                          unsigned char dgt, unsigned char cnt, char trace_elim_unit) {
+#ifdef OPT_FSH
+    if ( verbose != VNone ) {
+        counters.fishes_updated++;
+    }
+    if ( clean_bits.check_indexbit(fincells[0]) ) {
+        e_digit = 1<<dgt;
+        e_i = fincells[1];
+    } else if ( clean_bits.check_indexbit(fincells[1]) ) {
+        e_digit = 1<<dgt;
+        e_i = fincells[0];
+    }
+    unsigned short dgt_mask_bit = 1<<dgt;
+    // Consequence unit matches the FISH orientation, set by the plain
+    // antecedent emit just before the call (overrides the per-half scan
+    // default used for Case-2 orphans).
+    bool tracing = (trace::current != nullptr);
+    char u = trace_elim_unit;
+    int level = tracing ? (int)grid_state->stackpointer : 0;
+    while (clean_bits) {
+        unsigned char cl = tzcnt_and_mask(clean_bits);
+        if ( candidates[cl] & dgt_mask_bit ) {
+            candidates[cl] &= ~dgt_mask_bit;
+            if ( verbose == VDebug ) {
+                solverData.printf("%s ", cl2txt[cl]);
+            }
+            if ( tracing ) {
+                trace::eliminate("fish", u,
+                                 cl/9, cl%9, dgt_mask_bit,
+                                 level);
+            }
+        }
+    }
+    if ( verbose == VDebug ) {
+        if ( e_digit == 0 ) {
+            solverData.printf("\n");
+        } else {
+            solverData.printf("\ncells %s and %s are mutually exclusive (sashimi %s on digit %d),\nenter the remaining ", cl2txt[fincells[0]], cl2txt[fincells[1]], fish_names[cnt-2], dgt+1);
+        }
+    }
+    if ( e_digit ) {
+        // Sashimi-driven placement. Antecedent is the sashimi pattern
+        // (Phase 3.1) — until then this remains a deduced-single placeholder.
+        trace::next_entry_reason = trace::ER_DeducedSingle;
+        return FishEnter;
+    }
+    return FishSearch;
+#else
+    (void)clean_bits; (void)fincells; (void)dgt; (void)cnt; (void)trace_elim_unit;
+    return FishSearch;
+#endif
+}
+
+// Helper 2 — Case-1 (sashimi/finned) local eliminate loop, shared between
+// the row-scan (was ~357-376) and col-scan (was ~712-731) halves. The two
+// originals differed only in the trace unit char ('r' vs 'c'), passed as `u`.
+// The `dgt_bits &= ~clean_bits` line stays at the call site (see contract).
+template <Verbosity verbose>
+__attribute__((always_inline)) inline void
+SolveCtx<verbose>::eliminate_fish_case1(bit128_t &clean_bits, unsigned char dgt, char u) {
+#ifdef OPT_FSH
+    unsigned short dgt_mask_bit = 1<<dgt;
+    // Sashimi/finned Case-1 has its own local removal loop. Mirror
+    // trace::eliminate emission so finned consequences aren't dropped from
+    // the JSONL. (Antecedent for finned is Phase 3.1; events here are
+    // orphans for now — consequence-only.)
+    bool tracing = (trace::current != nullptr);
+    int level = tracing ? (int)grid_state->stackpointer : 0;
+    while (clean_bits) {
+        unsigned char cl = tzcnt_and_mask(clean_bits);
+        if ( candidates[cl] & dgt_mask_bit ) {
+            candidates[cl] &= ~dgt_mask_bit;
+            if ( verbose == VDebug ) {
+                solverData.printf("%s ", cl2txt[cl]);
+            }
+            if ( tracing ) {
+                trace::eliminate("fish", u,
+                                 cl/9, cl%9, dgt_mask_bit,
+                                 level);
+            }
+        }
+    }
+    if ( verbose == VDebug ) {
+        solverData.printf("\n");
+    }
+#else
+    (void)clean_bits; (void)dgt; (void)u;
+#endif
+}
+
+#ifdef OPT_FSH
+// Helper 3 — alt-triple synthesis, shared between the row-scan (was
+// ~503-516) and col-scan (was ~857-870) halves. The two originals differed
+// only in the local found-flag name and which transposed/non-transposed
+// cbbv vector they sampled, both supplied by the caller. The `t==8 &&
+// pair_cnt>=3` guard and the `if(!found) continue; t=7; pair_locs=0;` tail
+// stay at the call site.
+template <Verbosity verbose>
+__attribute__((always_inline)) inline bool
+SolveCtx<verbose>::synthesize_fish_alt_triple(cbbv_t &cbbv, unsigned int pair_cnt,
+                                              unsigned int pair_locs, unsigned int &alt_base_x) {
+    bool found = false;
+    unsigned char pos[9];
+    for ( int i=pair_cnt-1; pair_locs; i-- ) {
+        pos[i] = 8-tzcnt_and_mask(pair_locs);
+    }
+    unsigned short res = 0;
+    for ( unsigned int i=0; i<pair_cnt-1 && !found; i++) {
+        for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
+            if ( ( __popcnt16(res = cbbv.v16[pos[i]] | cbbv.v16[pos[k]])) == 3 ) {
+                alt_base_x = res;
+                found = true;
+                break;
+            }
+        }
+    }
+    return found;
+}
+#endif
 
 
 template <Verbosity verbose>
@@ -347,33 +472,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 counters.fishes_updated++;
                             }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
-                            unsigned short dgt_mask_bit = 1<<dgt;
-                            // Sashimi/finned Case-1 has its own local
-                            // removal loop. Mirror trace::eliminate
-                            // emission so finned consequences aren't
-                            // dropped from the JSONL. (Antecedent for
-                            // finned is Phase 3.1; events here are orphans
-                            // for now — consequence-only.)
-                            bool tracing = (trace::current != nullptr);
-                            char u = 'r';   // finned row-fish (Case-1, row scan)
-                            int level = tracing ? (int)grid_state->stackpointer : 0;
-                            while (clean_bits) {
-                                unsigned char cl = tzcnt_and_mask(clean_bits);
-                                if ( candidates[cl] & dgt_mask_bit ) {
-                                    candidates[cl] &= ~dgt_mask_bit;
-                                    if ( verbose == VDebug ) {
-                                        solverData.printf("%s ", cl2txt[cl]);
-                                    }
-                                    if ( tracing ) {
-                                        trace::eliminate("fish", u,
-                                                         cl/9, cl%9, dgt_mask_bit,
-                                                         level);
-                                    }
-                                }
-                            }
-                            if ( verbose == VDebug ) {
-                                solverData.printf("\n");
-                            }
+                            eliminate_fish_case1(clean_bits, dgt, 'r'); // finned row-fish (Case-1, row scan)
                             dosearch = true;
                         }
                     }
@@ -444,49 +543,10 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     } // Case 2
                 } // else
                 if ( clean_bits ) {
-                    if ( verbose != VNone ) {
-                        counters.fishes_updated++;
-                    }
-                    if ( clean_bits.check_indexbit(fincells[0]) ) {
-                        e_digit = 1<<dgt;
-                        e_i = fincells[1];
-                    } else if ( clean_bits.check_indexbit(fincells[1]) ) {
-                        e_digit = 1<<dgt;
-                        e_i = fincells[0];
-                    }
-                    unsigned short dgt_mask_bit = 1<<dgt;
-                    // Consequence unit matches the FISH orientation, set
-                    // by the plain antecedent emit just above (overrides
-                    // the row-scan default 'r' used for Case-2 orphans).
-                    bool tracing = (trace::current != nullptr);
-                    char u = trace_elim_unit;
-                    int level = tracing ? (int)grid_state->stackpointer : 0;
-                    while (clean_bits) {
-                        unsigned char cl = tzcnt_and_mask(clean_bits);
-                        if ( candidates[cl] & dgt_mask_bit ) {
-                            candidates[cl] &= ~dgt_mask_bit;
-                            if ( verbose == VDebug ) {
-                                solverData.printf("%s ", cl2txt[cl]);
-                            }
-                            if ( tracing ) {
-                                trace::eliminate("fish", u,
-                                                 cl/9, cl%9, dgt_mask_bit,
-                                                 level);
-                            }
-                        }
-                    }
-                    if ( verbose == VDebug ) {
-                        if ( e_digit == 0 ) {
-                            solverData.printf("\n");
-                        } else {
-                            solverData.printf("\ncells %s and %s are mutually exclusive (sashimi %s on digit %d),\nenter the remaining ", cl2txt[fincells[0]], cl2txt[fincells[1]], fish_names[cnt-2], dgt+1);
-                        }
-                    }
-                    if ( e_digit ) {
-                        // Sashimi-driven placement. Antecedent is the
-                        // sashimi pattern (Phase 3.1) — until then this
-                        // remains a deduced-single placeholder.
-                        trace::next_entry_reason = trace::ER_DeducedSingle;
+                    // Shared final consequence-emit (helper 1). Row-scan
+                    // default trace_elim_unit is 'r'; the plain antecedent
+                    // emit above overrides it to match the fish orientation.
+                    if ( emit_fish_consequences(clean_bits, fincells, dgt, cnt, trace_elim_unit) == FishEnter ) {
                         return Phase_Enter;
                     }
                     dosearch = true;
@@ -500,20 +560,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
             unsigned int pair_cnt = __popcnt16(pair_locs);
             bool fish_alt_found = false;
             if ( t == 8 && pair_cnt >= 3 ) {
-                unsigned char pos[9];
-                for ( int i=pair_cnt-1; pair_locs; i-- ) {
-                    pos[i] = 8-tzcnt_and_mask(pair_locs);
-                }
-                unsigned short res = 0;
-                for ( unsigned int i=0; i<pair_cnt-1 && !fish_alt_found; i++) {
-                    for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
-                        if ( ( __popcnt16(res = cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]])) == 3 ) {
-                            alt_base_x = res;
-                            fish_alt_found = true;
-                            break;
-                        }
-                    }
-                }
+                fish_alt_found = synthesize_fish_alt_triple(cbbv_v, pair_cnt, pair_locs, alt_base_x);
             }
             if ( !fish_alt_found ) {
                 continue;
@@ -529,7 +576,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
         // transpose cbbv_v
         cbbv_t cbbv_col_v {};
 
-        unsigned short *mskp = &cbbv_col_v.v16[8];
+        unsigned short *mskp = &cbbv_col_v.u16[8];   // u16 alias: clang forbids &v16[8]
         __m256i c = _mm256_srli_epi16(cbbv_v.m256,1);
         *mskp-- = _mm_movemask_epi8(_mm_packus_epi16(_mm256_castsi256_si128(c),_mm256_extracti128_si256(c,1)));
         c = _mm256_and_si256(cbbv_v.m256, maskff);
@@ -702,33 +749,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 counters.fishes_updated++;
                             }
                             dgt_bits.u128 &= ~clean_bits.u128; // for Case 2
-                            unsigned short dgt_mask_bit = 1<<dgt;
-                            // Sashimi/finned Case-1 has its own local
-                            // removal loop. Mirror trace::eliminate
-                            // emission so finned consequences aren't
-                            // dropped from the JSONL. (Antecedent for
-                            // finned is Phase 3.1; events here are orphans
-                            // for now — consequence-only.)
-                            bool tracing = (trace::current != nullptr);
-                            char u = 'c';   // finned col-fish (Case-1, col scan)
-                            int level = tracing ? (int)grid_state->stackpointer : 0;
-                            while (clean_bits) {
-                                unsigned char cl = tzcnt_and_mask(clean_bits);
-                                if ( candidates[cl] & dgt_mask_bit ) {
-                                    candidates[cl] &= ~dgt_mask_bit;
-                                    if ( verbose == VDebug ) {
-                                        solverData.printf("%s ", cl2txt[cl]);
-                                    }
-                                    if ( tracing ) {
-                                        trace::eliminate("fish", u,
-                                                         cl/9, cl%9, dgt_mask_bit,
-                                                         level);
-                                    }
-                                }
-                            }
-                            if ( verbose == VDebug ) {
-                                solverData.printf("\n");
-                            }
+                            eliminate_fish_case1(clean_bits, dgt, 'c'); // finned col-fish (Case-1, col scan)
                             dosearch = true;
                         }
                     }
@@ -800,47 +821,10 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     }  // Case 2
                 }
                 if ( clean_bits ) {
-                    if ( verbose != VNone ) {
-                        counters.fishes_updated++;
-                    }
-                    if ( clean_bits.check_indexbit(fincells[0]) ) {
-                        e_digit = 1<<dgt;
-                        e_i = fincells[1];
-                    } else if ( clean_bits.check_indexbit(fincells[1]) ) {
-                        e_digit = 1<<dgt;
-                        e_i = fincells[0];
-                    }
-                    unsigned short dgt_mask_bit = 1<<dgt;
-                    // Mirror of row-scan. Plain emit block sets
-                    // trace_elim_unit to its antecedent's base; Case-2
-                    // orphans use the default 'c' (col-scan).
-                    bool tracing = (trace::current != nullptr);
-                    char u = trace_elim_unit;
-                    int level = tracing ? (int)grid_state->stackpointer : 0;
-                    while (clean_bits) {
-                        unsigned char cl = tzcnt_and_mask(clean_bits);
-                        if ( candidates[cl] & dgt_mask_bit) {
-                            candidates[cl] &= ~dgt_mask_bit;
-                            if ( verbose == VDebug ) {
-                                solverData.printf("%s ", cl2txt[cl]);
-                            }
-                            if ( tracing ) {
-                                trace::eliminate("fish", u,
-                                                 cl/9, cl%9, dgt_mask_bit,
-                                                 level);
-                            }
-                        }
-                    }
-                    if ( verbose == VDebug ) {
-                        if ( e_digit == 0 ) {
-                            solverData.printf("\n");
-                        } else {
-                            solverData.printf("\ncells %s and %s are mutually exclusive (sashimi %s on digit %d),\nenter the remaining ", cl2txt[fincells[0]], cl2txt[fincells[1]], fish_names[cnt-2], dgt+1);
-                        }
-                    }
-                    if ( e_digit ) {
-                        // Sashimi-driven placement — Phase 3.1.
-                        trace::next_entry_reason = trace::ER_DeducedSingle;
+                    // Shared final consequence-emit (helper 1). Col-scan
+                    // default trace_elim_unit is 'c'; the plain antecedent
+                    // emit above overrides it to match the fish orientation.
+                    if ( emit_fish_consequences(clean_bits, fincells, dgt, cnt, trace_elim_unit) == FishEnter ) {
                         return Phase_Enter;
                     }
                     dosearch = true;
@@ -854,20 +838,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
             unsigned int pair_cnt = __popcnt16(pair_locs);
             bool fish2_alt_found = false;
             if ( t == 8 && pair_cnt >= 3 ) {
-                unsigned char pos[9];
-                for ( int i=pair_cnt-1; pair_locs; i-- ) {
-                    pos[i] = 8-tzcnt_and_mask(pair_locs);
-                }
-                unsigned short res = 0;
-                for ( unsigned int i=0; i<pair_cnt-1 && !fish2_alt_found; i++) {
-                    for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
-                        if ( ( __popcnt16(res = cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]])) == 3 ) {
-                            alt_base_x = res;
-                            fish2_alt_found = true;
-                            break;
-                        }
-                    }
-                }
+                fish2_alt_found = synthesize_fish_alt_triple(cbbv_col_v, pair_cnt, pair_locs, alt_base_x);
             }
             if ( !fish2_alt_found ) {
                 continue;

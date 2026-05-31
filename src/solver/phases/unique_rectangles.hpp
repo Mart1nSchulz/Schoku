@@ -1,13 +1,10 @@
 // Out-of-class definition of `SolveCtx<verbose>::do_unique_rectangles()`.
-// AlphaEvolve mutation unit: this file is the entire surface for Unique avoidable rectangles (OPT_UQR).
-// Replace the function body to mutate the strategy without touching
-// the rest of the solver.
+// This file contains the complete implementation of Unique avoidable rectangles (OPT_UQR).
 //
 // Returns Phase_HiddenSearch when the block finishes without firing
 // any redirect (the dispatcher then continues to the next block in
 // phase_hidden_search). Any other returned SolverPhase short-circuits
-// back to the dispatcher (semantically identical to the pre-refactor
-// `goto X` exits inside the block).
+// back to the dispatcher.
 //
 // Build flag: this body is empty when OPT_UQR is undefined; the helper
 // then unconditionally returns Phase_HiddenSearch.

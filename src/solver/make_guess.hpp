@@ -20,6 +20,22 @@
 // include site is already inside `namespace Schoku`.
 #pragma once
 
+// Render the 81-cell grid into a printable string for debug output.
+// A cell that is still unlocked prints as '0'; a locked cell prints the
+// digit of its single remaining candidate (49 == '1', via tzcnt).
+// Debug-output only (callers guard with verbose==VDebug / debug>1), so this
+// has zero hot-path impact. `unlocked` is taken by non-const reference
+// because bit128_t::check_indexbit is non-const.
+inline void build_gridout_string(bit128_t &unlocked, const unsigned short *candidates, char gridout[82]) {
+    for (unsigned char j = 0; j < 81; ++j) {
+        if ( unlocked.check_indexbit(j) ) {
+            gridout[j] = '0';
+        } else {
+            gridout[j] = digit_char(candidates[j]);
+        }
+    }
+}
+
 // this form of make_guess establishes a 'contract' between the caller's lambda
 // and the creation of the new GridState.
 // Due to its overhead, it is not the fastest, but the most flexible form to make a guess.
@@ -51,27 +67,14 @@ inline GridState* GridState::make_guess(unsigned char cell_index, F &&gridUpdate
         fprintf(output, "guess at level >%d< - new level >%d<\nguess %s\n", stackpointer, new_grid_state->stackpointer, msgs[0]);
         char gridout[82];
         if ( debug > 1 ) {
-            for (unsigned char j = 0; j < 81; ++j) {
-                if ( unlocked.check_indexbit(j) ) {
-                    gridout[j] = '0';
-                } else {
-                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
-                }
-            }
+            build_gridout_string(unlocked, candidates, gridout);
             fprintf(output, "guess at %s\nsaved grid_state level >%d<: %.81s\n",
                    cl2txt[cell_index], stackpointer, gridout);
         }
         fprintf(output, "saved state for level %d: %s\n",
                stackpointer, msgs[1]);
         if ( debug > 1 ) {
-            unsigned short *candidates = new_grid_state->candidates;
-            for (unsigned char j = 0; j < 81; ++j) {
-                if ( new_grid_state->unlocked.check_indexbit(j) ) {
-                    gridout[j] = '0';
-                } else {
-                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
-                }
-            }
+            build_gridout_string(new_grid_state->unlocked, new_grid_state->candidates, gridout);
             fprintf(output, "grid_state at level >%d< now: %.81s\n",
                    new_grid_state->stackpointer, gridout);
         }
@@ -163,7 +166,6 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
     unsigned short other_cand  = *wo_musts & ~select_cand;
     unsigned char off = tpos;
 
-    off = tpos;
     // Update candidates
     for ( unsigned char k=0; k<3; k++, tpos += inc) {
         new_grid_state->candidates[tpos] &= ~select_cand;
@@ -190,13 +192,7 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
     if ( verbose != VNone ) {
         char gridout[82];
         if ( debug > 1 ) {
-            for (unsigned char j = 0; j < 81; ++j) {
-                if ( unlocked.check_indexbit(j) ) {
-                    gridout[j] = '0';
-                } else {
-                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
-                }
-            }
+            build_gridout_string(unlocked, candidates, gridout);
             solverData->printf("guess at %s\nsaved grid_state level >%d<: %.81s\n",
                    cl2txt[off], stackpointer, gridout);
         }
@@ -205,14 +201,7 @@ inline GridState* GridState::make_guess(SolverData *solverData) {
                    stackpointer, 1+_tzcnt_u32(other_cand), type==0?"row":"col", cl2txt[off]);
         }
         if ( debug > 1 ) {
-            unsigned short *candidates = new_grid_state->candidates;
-            for (unsigned char j = 0; j < 81; ++j) {
-                if ( new_grid_state->unlocked.check_indexbit(j) ) {
-                    gridout[j] = '0';
-                } else {
-                    gridout[j] = 49+_tzcnt_u32(candidates[j]);
-                }
-            }
+            build_gridout_string(new_grid_state->unlocked, new_grid_state->candidates, gridout);
             solverData->printf("grid_state at level >%d< now: %.81s\n",
                    new_grid_state->stackpointer, gridout);
         }
@@ -469,7 +458,7 @@ inline GridState* GridState::make_guess(unsigned char guess_index, unsigned shor
             if ( (candidates[j] & (candidates[j]-1)) ) {
                 gridout[j] = '0';
             } else {
-                gridout[j] = 49+_tzcnt_u32(candidates[j]);
+                gridout[j] = digit_char(candidates[j]);
             }
         }
         fprintf(output, "guess at %s\nsaved grid_state level >%d<: %.81s\n",
@@ -496,7 +485,7 @@ inline GridState* GridState::make_guess(unsigned char guess_index, unsigned shor
             if ( (candidates[j] & (candidates[j]-1)) ) {
                 gridout[j] = '0';
             } else {
-                gridout[j] = 49+_tzcnt_u32(candidates[j]);
+                gridout[j] = digit_char(candidates[j]);
             }
         }
         fprintf(output, "grid_state at level >%d< now: %.81s\n",

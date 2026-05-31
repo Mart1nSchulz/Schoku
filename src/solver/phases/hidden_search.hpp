@@ -1,7 +1,7 @@
 // Out-of-class definition of `SolveCtx<verbose>::phase_hidden_search()`.
-// AlphaEvolve mutation unit: this file is the entire surface for hidden singles + triads + naked sets + fishes + UQR
-// strategy; replace the function body to mutate the strategy without
-// touching the rest of the solver.
+// Implements the hidden-single and triad search, then dispatches the
+// optional naked-set / fish / unique-rectangle sub-phases (each defined
+// in its own solver/phases/<name>.hpp).
 //
 // CONTRACT: private include fragment, must be #included exactly once
 // from inside `namespace Schoku { ... }` after solver/solve_ctx.hpp.

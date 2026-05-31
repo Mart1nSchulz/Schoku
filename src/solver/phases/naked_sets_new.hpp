@@ -1,13 +1,10 @@
 // Out-of-class definition of `SolveCtx<verbose>::do_naked_sets_new()`.
-// AlphaEvolve mutation unit: this file is the entire surface for Algorithm 4 — naked sets (NEW variant, OPT_NEWSETS).
-// Replace the function body to mutate the strategy without touching
-// the rest of the solver.
+// This file contains the complete implementation of Algorithm 4 — naked sets (NEW variant, OPT_NEWSETS).
 //
 // Returns Phase_HiddenSearch when the block finishes without firing
 // any redirect (the dispatcher then continues to the next block in
 // phase_hidden_search). Any other returned SolverPhase short-circuits
-// back to the dispatcher (semantically identical to the pre-refactor
-// `goto X` exits inside the block).
+// back to the dispatcher.
 //
 // Build flag: this body is empty when OPT_NEWSETS is undefined; the helper
 // then unconditionally returns Phase_HiddenSearch.
@@ -16,6 +13,74 @@
 // from inside `namespace Schoku { ... }` after solver/solve_ctx.hpp.
 #pragma once
 
+
+// Shared "drain to_change, eliminate candidates, emit trace, bump counter"
+// step extracted from the two identical blocks in do_naked_sets_new().
+// Kept always_inline so codegen is identical to the inline originals.
+template <Verbosity verbose>
+__attribute__((always_inline)) inline bool SolveCtx<verbose>::eliminate_naked_set_row(unsigned char cl, unsigned short m, unsigned char row, unsigned char cnt, bit128_t &to_change) {
+#ifdef OPT_NEWSETS
+    unsigned short cdi = candidates[cl];
+    unsigned short cdin = ~cdi;
+    bool found = false;
+    // Buffer the eliminate events until we know the set
+    // actually changed something; otherwise we'd emit
+    // a ghost antecedent + zero consequences for the
+    // "set reported but no changes made" fallthrough.
+    struct ElimRec { unsigned char j; unsigned short removed; };
+    ElimRec elim_buf[18];
+    int n_elim = 0;
+    while (to_change) {
+        unsigned char j = tzcnt_and_mask(to_change);
+        // if this cell is not part of our set
+        if (candidates[j] & cdin ) {
+            // if there are bits that need removing
+            if (candidates[j] & cdi) {
+                unsigned short removed = candidates[j] & cdi;
+                candidates[j] &= cdin;
+                if ( trace::current && n_elim < 18 ) {
+                    elim_buf[n_elim].j = j;
+                    elim_buf[n_elim].removed = removed;
+                    n_elim++;
+                }
+                found = true;
+            }
+        }
+    }
+    if ( found ) {
+        if ( trace::current ) {
+            // Antecedent + buffered consequences.
+            unsigned char sc[4];
+            int nsc = 0;
+            unsigned int mm = m & 0x1ff;
+            while ( mm && nsc < 4 ) {
+                int k = _tzcnt_u32(mm);
+                mm &= mm - 1;
+                sc[nsc++] = (unsigned char)(row*9 + k);
+            }
+            const char* kind = (cnt==2)?"naked_pair":
+                               (cnt==3)?"naked_triple":"naked_quad";
+            trace::naked_set(kind, 'r', sc, nsc,
+                             candidates[cl],
+                             (int)grid_state->stackpointer);
+            for ( int e = 0; e < n_elim; e++ ) {
+                trace::eliminate("naked_set", 'r',
+                                 elim_buf[e].j/9,
+                                 elim_buf[e].j%9,
+                                 elim_buf[e].removed,
+                                 (int)grid_state->stackpointer);
+            }
+        }
+        if ( verbose != VNone ) {
+            counters.naked_sets_found++;
+        }
+        return true;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
 
 template <Verbosity verbose>
 __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_sets_new() {
@@ -284,66 +349,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                                 solverData.printf("%s %s (row): %-7s %s\n", complement?"hidden":"naked ", __popcnt16(complement)==2?"pair":"set ", ret, cl2txt[k]);
                             }
                         }
-                        unsigned short cdi = candidates[cl];
-                        unsigned short cdin = ~cdi;
-                        bool found = false;
-                        // Buffer the eliminate events until we know the set
-                        // actually changed something; otherwise we'd emit
-                        // a ghost antecedent + zero consequences for the
-                        // "set reported but no changes made" fallthrough
-                        // a few lines below.
-                        struct ElimRec { unsigned char j; unsigned short removed; };
-                        ElimRec elim_buf[18];
-                        int n_elim = 0;
-//dump_bits(to_change,"to_change");
-//dump_board(candidates, "board");
-                        while (to_change) {
-                            unsigned char j = tzcnt_and_mask(to_change);
-//dbgprintf(1,"j=%d,",j);
-                            // if this cell is not part of our set
-                            if (candidates[j] & cdin ) {
-                                // if there are bits that need removing
-                                if (candidates[j] & cdi) {
-                                    unsigned short removed = candidates[j] & cdi;
-                                    candidates[j] &= cdin;
-                                    if ( trace::current && n_elim < 18 ) {
-                                        elim_buf[n_elim].j = j;
-                                        elim_buf[n_elim].removed = removed;
-                                        n_elim++;
-                                    }
-//dbgprintf(1,"%s,",cl2txt[j]);
-                                    //to_visit_again.set_indexbit(j);
-                                    found = true;
-                                }
-                            }
-                        }
-                        if ( found ) {
-                            if ( trace::current ) {
-                                // Antecedent + buffered consequences.
-                                unsigned char sc[4];
-                                int nsc = 0;
-                                unsigned int mm = m & 0x1ff;
-                                while ( mm && nsc < 4 ) {
-                                    int k = _tzcnt_u32(mm);
-                                    mm &= mm - 1;
-                                    sc[nsc++] = (unsigned char)(row*9 + k);
-                                }
-                                const char* kind = (cnt==2)?"naked_pair":
-                                                   (cnt==3)?"naked_triple":"naked_quad";
-                                trace::naked_set(kind, 'r', sc, nsc,
-                                                 candidates[cl],
-                                                 (int)grid_state->stackpointer);
-                                for ( int e = 0; e < n_elim; e++ ) {
-                                    trace::eliminate("naked_set", 'r',
-                                                     elim_buf[e].j/9,
-                                                     elim_buf[e].j%9,
-                                                     elim_buf[e].removed,
-                                                     (int)grid_state->stackpointer);
-                                }
-                            }
-                            if ( verbose != VNone ) {
-                                counters.naked_sets_found++;
-                            }
+                        if ( eliminate_naked_set_row(cl, m, row, cnt, to_change) ) {
                             return Phase_Search;
                         }
                     }
@@ -460,62 +466,7 @@ __attribute__((always_inline)) inline SolverPhase SolveCtx<verbose>::do_naked_se
                                 solverData.printf("%s %s (row): %-7s %s\n", complement?"hidden":"naked ", __popcnt16(complement)==2?"pair":"set ", ret, cl2txt[row*9+k%9]);
                             }
                         }
-                        unsigned short cdi = candidates[cl];
-                        unsigned short cdin = ~cdi;
-                        bool found = false;
-                        // Buffer eliminations until we know the set
-                        // actually mutated the grid; emit antecedent +
-                        // consequences together below.
-                        struct ElimRec { unsigned char j; unsigned short removed; };
-                        ElimRec elim_buf[18];
-                        int n_elim = 0;
-//dump_bits(to_change,"to_change");
-                        while (to_change) {
-                            unsigned char j = tzcnt_and_mask(to_change);
-//dbgprintf(1,"j=%d,",j);
-                            // if this cell is not part of our set
-                            if (candidates[j] & cdin ) {
-                                // if there are bits that need removing
-                                if (candidates[j] & cdi) {
-                                    unsigned short removed = candidates[j] & cdi;
-                                    candidates[j] &= cdin;
-                                    if ( trace::current && n_elim < 18 ) {
-                                        elim_buf[n_elim].j = j;
-                                        elim_buf[n_elim].removed = removed;
-                                        n_elim++;
-                                    }
-//dbgprintf(1,"%s,",cl2txt[j]);
-                                    //to_visit_again.set_indexbit(j);
-                                    found = true;
-                                }
-                            }
-                        }
-                        if ( found ) {
-                            if ( trace::current ) {
-                                unsigned char sc[4];
-                                int nsc = 0;
-                                unsigned int mm = m & 0x1ff;
-                                while ( mm && nsc < 4 ) {
-                                    int k = _tzcnt_u32(mm);
-                                    mm &= mm - 1;
-                                    sc[nsc++] = (unsigned char)(row*9 + k);
-                                }
-                                const char* kind = (cnt==2)?"naked_pair":
-                                                   (cnt==3)?"naked_triple":"naked_quad";
-                                trace::naked_set(kind, 'r', sc, nsc,
-                                                 candidates[cl],
-                                                 (int)grid_state->stackpointer);
-                                for ( int e = 0; e < n_elim; e++ ) {
-                                    trace::eliminate("naked_set", 'r',
-                                                     elim_buf[e].j/9,
-                                                     elim_buf[e].j%9,
-                                                     elim_buf[e].removed,
-                                                     (int)grid_state->stackpointer);
-                                }
-                            }
-                            if ( verbose != VNone ) {
-                                counters.naked_sets_found++;
-                            }
+                        if ( eliminate_naked_set_row(cl, m, row, cnt, to_change) ) {
                             return Phase_Search;
                         }
                     }

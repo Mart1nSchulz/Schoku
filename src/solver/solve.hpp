@@ -11,16 +11,8 @@
 //   - every namespace-scope helper, type, global, and macro that
 //     solve() references (e.g. enter_digit's helpers, the bit128_t
 //     index lookups, OPT_* feature flags).
-// The single-TU layout (everything inlined into schoku.cpp) is
-// preserved.
 //
-// Each phase header is the AlphaEvolve mutation unit for one strategy:
-// replace solver/phases/<name>.hpp to mutate that strategy without
-// touching the rest of the solver. Phase_HiddenSearch is currently
-// monolithic (3686 lines fused-pipeline of hidden-singles + triads +
-// naked-sets + OPT_FSH + OPT_UQR); future work splits it into smaller
-// swap-units (fish_rows / fish_cols / unique_rectangles / naked_sets_*
-// while Block A — Algorithms 2+3 — stays as one fused unit).
+// Each phase header holds one strategy's implementation.
 #pragma once
 
 #include "solve_ctx.hpp"
@@ -85,7 +77,7 @@ Status solve(signed char grid[81], GridState stack[], int line, Counters &counte
             if ( grid_state->unlocked.check_indexbit(j) ) {
                 gridout[j] = '0';
             } else {
-                gridout[j] = 49+_tzcnt_u32(candidates[j]);
+                gridout[j] = digit_char(candidates[j]);
             }
         }
         solverData.printf("Line %d: %.81s\n", line, gridout);

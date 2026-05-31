@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Side-by-side benchmark of Schoku vs sudoku_rs_core on cuda-host2 (gcc/x86),
-# stratified by AlphaEvolve test bucket. Both tools run with 8 threads.
+# stratified by test bucket. Both tools run with 8 threads.
 #
 # Caveat: rust `rate-batch` also computes the rating (tier + technique
 # frontier) on top of solving, while schoku only solves. The comparison is

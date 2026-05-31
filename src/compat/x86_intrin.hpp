@@ -1,13 +1,7 @@
-// Architecture-aware master include for x86 intrinsic surface used by the
-// solver. On native x86 we pull in <x86intrin.h> directly. On other targets
-// (currently aarch64 / Apple Silicon) we delegate AVX2/SSE to simde and
-// supply BMI/POPCNT/LZCNT/TZCNT as scalar fallbacks.
-//
-// Supported toolchains for x86: gcc, clang, and Cygwin (which ships
-// <x86intrin.h> in its mingw-w64 headers). Native MSVC (cl.exe) is NOT a
-// supported target — it doesn't ship <x86intrin.h>; only <intrin.h>. The
-// original schoku targeted Cygwin gcc, not native MSVC, so this is not a
-// regression.
+// Toolchain entry point for x86 intrinsics. On x86 targets (gcc/clang) this
+// includes <x86intrin.h> directly. On aarch64 (e.g. Apple Silicon) AVX2/SSE
+// are provided through simde; the BMI/ABM scalar intrinsics not covered there
+// are supplied by compat/bmi_shim.hpp.
 //
 // The MSVC-style names (_bittestandreset*, __popcnt*) are defined in
 // msvc_intrin.hpp and are always available.

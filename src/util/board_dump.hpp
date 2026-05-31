@@ -19,6 +19,12 @@
 
 inline void format_candidate_set(char *ret, unsigned short candidates);
 
+// ASCII digit for a solved cell: the single set candidate bit's position
+// (0..8) plus '1'. ('1' == 49.) Caller guarantees exactly one bit is set.
+inline char digit_char(unsigned short candidate) {
+    return '1' + _tzcnt_u32(candidate);
+}
+
 // a helper function to print a sudoku board,
 // given the 81 cells solved or with candidates.
 //
@@ -49,7 +55,7 @@ inline void dump_puzzle(unsigned short *candidates, bit128_t &unlocked, const ch
             if ( unlocked.check_indexbit(t) ) {
                 gridout[j] = '0';
             } else {
-                gridout[j] = 49+_tzcnt_u32(candidates[t]);
+                gridout[j] = digit_char(candidates[t]);
             }
         }
         dbgprintf(filter, "%s %.81s\n", msg, gridout);

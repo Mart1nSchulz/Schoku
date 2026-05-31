@@ -1,10 +1,10 @@
 // MSVC-style intrinsic shims used by schoku.cpp, mapped onto gcc/clang builtins.
 //
-// The original sources targeted Cygwin/MSVC and called these names directly.
-// We use them on Linux/macOS where neither gcc nor clang ships them. On
-// Cygwin and on real MSVC the names already exist (via <intrin.h>); we
-// include the platform header there and skip our shims so we never shadow
-// the natives.
+// These MSVC-style intrinsics (_bittestandreset*, __popcnt*, etc.) are
+// provided on toolchains that don't ship them. On toolchains that do ship
+// them (via <intrin.h>) the platform header is included and the shims are
+// skipped; each name is guarded so a name a toolchain already provides isn't
+// redefined.
 //
 // This header has no SIMD dependencies and is safe to include on any
 // architecture; it intentionally does NOT pull in <x86intrin.h>.
@@ -18,8 +18,7 @@
 #define SCHOKU_HAVE_NATIVE_MSVC_INTRIN 1
 #elif defined(__CYGWIN__)
 // Cygwin's gcc ships its own <intrin.h> that defines the MSVC-flavoured
-// names (_bittestandreset*, __popcnt*, etc.). Use it directly — staying on
-// the Cygwin-native path preserves the original schoku build there.
+// names (_bittestandreset*, __popcnt*, etc.). Use it directly.
 #include <intrin.h>
 #define SCHOKU_HAVE_NATIVE_MSVC_INTRIN 1
 #endif
