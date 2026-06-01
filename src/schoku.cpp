@@ -86,7 +86,8 @@
 #include <fcntl.h>
 #include <omp.h>
 #include <stdbool.h>
-#include <intrin.h>
+#include <x86intrin.h>
+#include "schoku_intrin.h"
 #include <sys/stat.h>
 #include <sys/mman.h>
 
@@ -163,15 +164,11 @@ union {
         return this->u128 & b;
     }
 
-    inline bool check_indexbit(unsigned char idx) {
-        return this->u8[idx>>3] & (1<<(idx & 0x7));
+    inline bool check_indexbit(unsigned int idx) {
+        return bittest(this->u32[idx>>5], idx & 0x1f);
     }
-    inline bool check_and_mask_index(unsigned char idx) {
-        return _bittestandreset64((long long int *)&this->u64[idx>>6], idx & 0x3f);
-    }
-    inline void set_indexbit(unsigned char idx) {
-        // slightly faster than _bittestandset
-        this->u8[idx>>3] |= 1<<(idx & 0x7);
+    inline void set_indexbit(unsigned int idx) {
+        bittestandset(this->u32[idx>>5], idx & 0x1f);
     }
     inline void set_indexbits(unsigned long long mask, unsigned char pos, unsigned char bitcount) {
         mask &= (unsigned long long)((1LL<<bitcount)-1);  // since the bit count is specific, enforce it
@@ -205,14 +202,14 @@ union {
     // need to use u8 to avoid aliasing error, but in reality, it's u16 we want,
     // or the u64 access would go beyond the data. Sigh.
     inline unsigned long long get_indexbits(unsigned char pos, unsigned char bitcount) {
+
         unsigned char posb = pos >> 4;
         pos &= 0xf;
-        unsigned long long res = (*(unsigned long long*)(&u8[posb<<1])) >> pos;
-        if ( pos+bitcount > 63 ) {
-            res |= ((unsigned long long)u16[posb+4]) << (64 - pos);
+        unsigned long long res = _bextr_u64(*(unsigned long long*)(&u8[posb<<1]), pos, bitcount);
+        if ( pos+bitcount <= 64 ) {
+            return res;
         }
-        // clip result
-        return _bextr_u64(res, 0, bitcount);
+        return res | _bextr_u64(*(unsigned long long*)(&u8[(posb<<1)+4]), 0, bitcount+pos-64))<<(64-pos);
     }
     inline unsigned char popcount() {
         return _popcnt64(u64[0]) + _popcnt32(u32[2]);
@@ -951,7 +948,7 @@ public:
     }
 
     template<Verbosity verbose>
-    inline bool stage_cell_resolution( unsigned short e_digit, unsigned char e_i, const char *msg = "" );
+    inline bool stage_cell_resolution( unsigned short e_digit, unsigned int e_i, const char *msg = "" );
 
     template<Verbosity verbose>
     inline bool update_candidates() {
@@ -1078,7 +1075,7 @@ inline void initialize_and_stage(signed char grid[81], bit128_t &digit_bits9, un
 // Only make_guess uses this member function.
 protected:
 template<Verbosity verbose=VNone>
-inline __attribute__((always_inline)) void enter_digit( unsigned short digit, unsigned char i) {
+inline __attribute__((always_inline)) void enter_digit( unsigned short digit, int i) {
     // lock this cell and and remove this digit from the candidates in this row, column and box
 
     bit128_t to_update;
@@ -1086,15 +1083,15 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
         printf(" %x at %s\n", _tzcnt_u32(digit)+1, cl2txt[i]);
     }
 #ifndef NDEBUG
-    if ( __popcnt16(digit) != 1 && warnings != 0 ) {
+    if ( short_popcnt16(digit) != 1 && warnings != 0 ) {
         printf("error in enter_digit: %x\n", digit);
     }
 #endif
 
     if (i < 64) {
-        _bittestandreset64((long long int *)&unlocked.u64[0], i);
+        bittestandreset64(unlocked.u64[0], i);
     } else {
-        _bittestandreset64((long long int *)&unlocked.u64[1], i-64);
+        bittestandreset64(unlocked.u64[1], i-64);
     }
 
     candidates[i] = digit;
@@ -1139,7 +1136,7 @@ inline GridState* make_guess(TriadInfo &triad_info, bit128_t &bivalues, Counters
         while (totest) {
             int ti = tzcnt_and_mask(totest);
             int can_ti = ti-ti/10;   // 'canonical' triad index
-            if ( __popcnt16 (wo_musts[ti]) == 2 ) {
+            if ( short_popcnt16 (wo_musts[ti]) == 2 ) {
                 // get and check the unlocked indexbits for the triad
                 unsigned int b;
                 if ( type == 0 ) {
@@ -1470,11 +1467,11 @@ inline GridState* make_guess(bit128_t &bivalues, Counters &counters) {
 //                        score++;
 //                    }
                     score_index = box_start_by_boxindex[boxi];
-                    if ( __popcnt16(candidates[score_index+pos1]) <= 3 ) {
+                    if ( short_popcnt16(candidates[score_index+pos1]) <= 3 ) {
                         score++;
                         score_index += pos2;
                     } else {
-                        if ( __popcnt16(candidates[score_index+pos2]) <= 3 ) {
+                        if ( short_popcnt16(candidates[score_index+pos2]) <= 3 ) {
                             score++;
                         }
                         score_index += pos1;
@@ -1506,7 +1503,7 @@ inline GridState* make_guess(bit128_t &bivalues, Counters &counters) {
         unsigned long long to_visit = unlocked.u64[0];
         while ( best_cnt > 3 && to_visit != 0 ) {
             i_rel = tzcnt_and_mask(to_visit);
-            cnt = __popcnt16(candidates[i_rel]);
+            cnt = short_popcnt16(candidates[i_rel]);
             if (cnt < best_cnt) {
                 best_cnt = cnt;
                 guess_index = i_rel;
@@ -1516,7 +1513,7 @@ inline GridState* make_guess(bit128_t &bivalues, Counters &counters) {
         to_visit = unlocked.u64[1];
         while ( best_cnt > 3 && to_visit != 0 ) {
             i_rel = tzcnt_and_mask(to_visit) + 64;
-            cnt = __popcnt16(candidates[i_rel]);
+            cnt = short_popcnt16(candidates[i_rel]);
             if (cnt < best_cnt) {
                 best_cnt = cnt;
                 guess_index = i_rel;
@@ -1589,14 +1586,14 @@ inline GridState* make_guess(unsigned char guess_index, unsigned short digit, Co
 // this code would complete the stageing infrastructure if we need it.
 // for now, there is no speed gain associated to it.
 template <Verbosity verbose>
-inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned char e_i, const char *msg ) {
+inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned int e_i, const char *msg ) {
 
     bit128_t to_update;
 
     assert( e_digit != 0 );
 
 #ifndef NDEBUG
-    if ( __popcnt16(e_digit) != 1 ) {
+    if ( short_popcnt16(e_digit) != 1 ) {
         if ( warnings != 0 ) {
             printf("error in e_digit: %x\n", e_digit);
         }
@@ -1604,9 +1601,9 @@ inline bool SolverData::stage_cell_resolution( unsigned short e_digit, unsigned 
 #endif
 
     if (e_i < 64) {
-        _bittestandreset64((long long int *)&grid_state->unlocked.u64[0], e_i);
+        bittestandreset64(grid_state->unlocked.u64[0], e_i);
     } else {
-        _bittestandreset64((long long int *)&grid_state->unlocked.u64[1], e_i-64);
+        bittestandreset64(grid_state->unlocked.u64[1], e_i-64);
     }
 
     grid_state->candidates[e_i] = e_digit;
@@ -1703,13 +1700,13 @@ inline bool SolverData::update_candidates(bit128_t &update_stage_9_bits, unsigne
             mask = compress_epi16_boolean(c1, c2) & m;
             if ( mask ) {
                 do {
-                    unsigned char e_i = i+tzcnt_and_mask(mask);
+                    unsigned int e_i = i+tzcnt_and_mask(mask);
                     // manually inlined from stage_cell_resolution (not a big imporevement)
                     unsigned short e_digit = grid_state->candidates[e_i];
                     bit128_t to_update;
 
 #ifndef NDEBUG
-                    if ( __popcnt16(e_digit) != 1 ) {
+                    if ( short_popcnt16(e_digit) != 1 ) {
                         if ( warnings != 0 ) {
                             printf("error in e_digit: %x\n", e_digit);
                         }
@@ -1717,9 +1714,9 @@ inline bool SolverData::update_candidates(bit128_t &update_stage_9_bits, unsigne
 #endif
 
                     if (e_i < 64) {
-                        _bittestandreset64((long long int *)&grid_state->unlocked.u64[0], e_i);
+                        bittestandreset64(grid_state->unlocked.u64[0], e_i);
                     } else {
-                        _bittestandreset64((long long int *)&grid_state->unlocked.u64[1], e_i-64);
+                        bittestandreset64(grid_state->unlocked.u64[1], e_i-64);
                     }
 
                     // unnecessary, we get here for naked singles only!
@@ -1820,7 +1817,7 @@ Status solve(signed char gridin[81], signed char grid[81], GridState stack[], in
 
     // The 'API' for code that uses the 'goto enter:' method of entering digits
     unsigned short e_digit = 0;
-    unsigned char e_i = 0;
+    unsigned int e_i = 0;
 
     bit128_t bivalues;
 
@@ -1959,7 +1956,7 @@ enter:
             printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
         }
 #ifndef NDEBUG
-        if ( __popcnt16(e_digit) != 1 ) {
+        if ( short_popcnt16(e_digit) != 1 ) {
             if ( warnings != 0 ) {
                 printf("error in e_digit: %x\n", e_digit);
             }
@@ -1967,11 +1964,10 @@ enter:
 #endif
 
         if (e_i < 64) {
-            _bittestandreset64((long long int *)&unlocked[0], e_i);
+            bittestandreset64(unlocked[0], e_i);
         } else {
-            _bittestandreset64((long long int *)&unlocked[1], e_i-64);
+            bittestandreset64(unlocked[1], e_i-64);
         }
-
         candidates[e_i] = e_digit;
         current_entered_count++;
 
@@ -2033,7 +2029,7 @@ enter:
                     goto back;
                 }
             }
-            if (__popcnt16(candidates[80]) == 1) {
+            if (short_popcnt16(candidates[80]) == 1) {
                 // Enter the digit and update candidates
                 if ( verbose == VDebug ) {
                     printf("naked  single      ");
@@ -2512,7 +2508,7 @@ hidden_search:
                     int idx_ = idx + ((mask1 & 0xff)?0:1);
                     e_i = i + idx_;
                     e_digit = ((v16us)row_mask)[idx];
-                    if ( __popcnt16(e_digit) == 1 ) {
+                    if ( short_popcnt16(e_digit) == 1 ) {
                         if ( verbose == VDebug ) {
                             printf("hidden single (row)");
                         }
@@ -2622,7 +2618,7 @@ hidden_search:
                     e_i = 72 + s_idx;
                     e_digit = ((v8us)row_mask)[s_idx];
                     // Check that the single is indeed a single
-                    if ( __popcnt16(e_digit) == 1 ) {
+                    if ( short_popcnt16(e_digit) == 1 ) {
                         if ( verbose == VDebug ) {
                             printf("hidden single (row)");
                         }
@@ -2747,7 +2743,7 @@ hidden_search:
                 printf("triad set (col): %-9s %s\n", ret, cl2txt[tidx/10*3*9+tidx%10]);
             }
             // mask off resolved triad:
-            _bittestandreset((int*)&grid_state->triads_unlocked[Col], tidx);
+            bittestandreset(grid_state->triads_unlocked[Col], tidx);
 //            unsigned char off = tidx%10+tidx/10*27;
 //            grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
 //            grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
@@ -2782,7 +2778,7 @@ hidden_search:
             unsigned char tidx = tzcnt_and_mask(m);
             unsigned char off  = row_triad_index_to_offset[tidx];
 
-            _bittestandreset((int *)&grid_state->triads_unlocked[Row], tidx);
+            bittestandreset(grid_state->triads_unlocked[Row], tidx);
             if ( !tr.check_indexbit(off)) {  // locked
                 continue;
             }
@@ -3108,7 +3104,7 @@ hidden_search:
                                  _mm256_cmpgt_epi16(c,_mm256_setzero_si256()),
                                  _mm256_cmpeq_epi16(lsb,c)));
 
-        bivalues.u16[5] = (__popcnt16(candidates[80]) == 2)?1:0;
+        bivalues.u16[5] = (short_popcnt16(candidates[80]) == 2)?1:0;
         // bivalues is now set for subsequent steps
     }
 
@@ -3168,7 +3164,7 @@ hidden_search:
             } else {
                 goto no_bug;
             }
-            if ( __popcnt16(candidates[target]) == 3 ) {
+            if ( short_popcnt16(candidates[target]) == 3 ) {
                 unsigned char row = row_index[target];
                 unsigned short cand3 = candidates[target];
                 unsigned short digit = 0;
@@ -3548,7 +3544,7 @@ using namespace Schoku;
 			fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
 		}
 	}
-	err = munmap(output, (size_t)npuzzles*164);
+	err = munmap(output, (size_t)outnpuzzles*164);
 	if ( err == -1 ) {
 		if (errno ) {
 			fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
