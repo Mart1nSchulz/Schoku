@@ -1,0 +1,18 @@
+# Build artifacts
+src/schoku
+src/schoku.o
+src/*.o
+tests/compat/test_pdep_pext
+tests/compat/test_tzcnt_lzcnt
+tests/compat/test_popcnt_blsi
+tests/compat/test_msvc
+tests/compat/*.o
+
+# Sample input datasets (kept out of repo; tests/data/ has the canonical copies)
+src/puzzles_*.txt
+
+# Default solver output
+src/solutions.txt
+
+# macOS
+.DS_Store
