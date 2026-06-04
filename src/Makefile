@@ -10,12 +10,12 @@ TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
 DFLAGS := -DNDEBUG -DOPT_BIVALS
-#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_SETS -DOPT_FSH -DOPT_UQR
+#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_FSH -DOPT_SETS -DOPT_UQR
 # OPT_BIVALS
 #     opportunistic bi-values processing (naked pairs and triples, Y-wings)
 #     on by default, when compiled.
 # OPT_SETS
-#     resolves naked sets (complementary sets are labeled hidden sets
+#     resolves naked sets (complementary sets are labeled hidden sets)
 # OPT_FSH
 #     resolves fishes (X-wing, sword fish and jellyfish)
 # OPT_UQR
