@@ -9,8 +9,11 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
-DFLAGS := -DNDEBUG
-#DFLAGS := -DNDEBUG -DOPT_SETS -DOPT_FSH -DOPT_UQR
+DFLAGS := -DNDEBUG -DOPT_DGT
+#DFLAGS := -DNDEBUG -DOPT_DGT -DOPT_SETS -DOPT_FSH -DOPT_UQR
+# OPT_DGT
+#     digit placement templates vlidation reduces guesses significantly for hard puzzles
+#     at relative high speed
 # OPT_SETS
 #     resolves naked sets (complementary sets are labeled hidden sets
 # OPT_FSH
