@@ -10,12 +10,14 @@ TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
 #DFLAGS := -DNDEBUG
-DFLAGS := -DNDEBUG -DOPT_NEWSETS
-#DFLAGS := -DNDEBUG -DOPT_NEWSETS -DOPT_FSH -DOPT_UQR
+DFLAGS := -DNDEBUG -DOPT_DGT
+#DFLAGS := -DNDEBUG -DOPT_NEWSETS -DOPT_FSH -DOPT_DGT -DOPT_UQR
 # OPT_SETS
-#     resolves naked sets (complementary sets are labeled hidden sets
+#     resolves naked sets (complementary sets are labeled hidden sets)
 # OPT_FSH
 #     resolves fishes (X-wing, sword fish and jellyfish)
+# OPT_DGT
+#     resolves digit candidate placements (covering fishes and more)
 # OPT_UQR
 #     resolves (avoidable) unique rectangles
 

@@ -11,13 +11,19 @@
  * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
  * You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
  *
- * Based on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
+ * Based originally on the sudoku solver by Mirage ( https://codegolf.stackexchange.com/users/106606/mirage )
  * at https://codegolf.stackexchange.com/questions/190727/the-fastest-sudoku-solver
- * on Sep 22, 2021
+ * on Sep 22, 2021.
  *
  * Version 0.9.6
  *
  * Performance changes:
+ * digit-based templated digit placement analysis reduces guesses significantly for hard puzzles
+ * at relative high speed.
+ *
+ * Major new feature:
+ * OPT_DGT Single digit placement analysis.  Fast, excellent yield and tunable.
+ *
  * One minor tweak to the triad based make_guess to avoid plain pairs
  *
  * The new naked set search is much faster and may turn out to be performance neutral.
@@ -25,15 +31,17 @@
  *
  * replaced atomic counters with a single value class/instance and
  * leveraged OMP reduction constructs for aggregating the results.
- * Much faster execution with -x option.
+ * Much faster execution when using the -x option.
  *
  * Functional changes:
- * Only rows are searched for hidden singles at this point; it should be easy enough
- * to add cols and boxes
- * but with lesser performance.
+ * Some changes to acommodate both Cygwin and Linux environments, intrin.h is a
+ * Windoish header that now is no longer used.
+ * The cell location for debug logs now uses [1,1] as its origin.  Other options can be specified.
+ *
+ * Only cols are searched for hidden singles, an significant performance enahancement.
  *
  * An environment variable (SCHOKU_GUESS_REPORT is now checked and if set produces
- * a simple list of all puzzles (with line number!) that required a guess. 
+ * a simple list of all puzzles (with line number!) that required a guess / or no guess. 
  *
  * Performance measurement and statistics:
  *
@@ -48,38 +56,38 @@
  *
  * schoku version: 0.9.6
  * command options: -x
- * compile options: OPT_SETS OPT_FSH OPT_UQR
+ * compile options: OPT_DGT
  *      49151    17.0/puzzle  puzzles entered and presets
- *      49151  2519285/s  puzzles solved
- *     19.5ms   396ns/puzzle  solving time
+ *      49151  2531495/s  puzzles solved
+ *     19.4ms   395ns/puzzle  solving time
  *     38596   78.53%  puzzles solved without guessing
- *     21618    0.44/puzzle  guesses
- *     13622    0.28/puzzle  back tracks
- *    169120    3.44/puzzle  digits entered and retracted
- *     22467    0.46/puzzle  'rounds'
- *    371660    7.56/puzzle  triads resolved
- *    963409   19.60/puzzle  triad updates
- *       711  bi-value universal graves avoided (BUG+1)
+ *     21584    0.44/puzzle  guesses
+ *     13497    0.27/puzzle  back tracks
+ *    167845    3.41/puzzle  digits entered and retracted
+ *     22431    0.46/puzzle  'rounds'
+ *    371352    7.56/puzzle  triads resolved
+ *    962785   19.59/puzzle  triad updates
+ *       709  bi-value universal graves avoided (BUG+1)
  *       138  bi-value universal graves detected
  *       134  board states without bivalues
  *
- * command options: -x -ms
- * compile options: OPT_SETS OPT_FSH OPT_UQR
+ * command options: -x -md
+ * compile options: OPT_DGT
  *      49151    17.0/puzzle  puzzles entered and presets
- *      49151  2526316/s  puzzles solved
- *     24.2ms   395ns/puzzle  solving time
- *      40497   82.39%  puzzles solved without guessing
- *      15028    0.31/puzzle  guesses
- *       8774    0.18/puzzle  back tracks
- *     109827    2.23/puzzle  digits entered and retracted
- *      22753    0.46/puzzle  'rounds'
- *     356921    7.26/puzzle  triads resolved
- *     944818   19.22/puzzle  triad updates
- *       6995    0.14/puzzle  naked sets found
- *      93227    1.90/puzzle  sections searched for naked sets
- *        816  bi-value universal graves avoided (BUG+1)
- *        169  bi-value universal graves detected
- *        91  board states without bivalues
+ *      49151  2359059/s  puzzles solved
+ *     20.8ms   423ns/puzzle  solving time
+ *      41184   83.79%  puzzles solved without guessing
+ *      16845    0.34/puzzle  guesses
+ *      10748    0.22/puzzle  back tracks
+ *     135587    2.76/puzzle  digits entered and retracted
+ *      24357    0.50/puzzle  'rounds'
+ *     360849    7.34/puzzle  triads resolved
+ *     949492   19.32/puzzle  triad updates
+ *      31447    0.64/puzzle  single digit placement compatibility tests
+ *       6716    0.14/puzzle  single digit placement incompatibilities found
+ *        727  bi-value universal graves avoided (BUG+1)
+ *         43  bi-value universal graves detected
+ *         80  board states without bivalues
  *
  */
 #include <array>
@@ -104,6 +112,12 @@ namespace Schoku {
 const char *version_string = "0.9.6";
 
 const char *compilation_options =
+#ifdef OPT_DGT
+// Global checking of digit candidates is a main feature.  Covers the same space as OPT_FSH before
+// Uses an innovative algorithm, which has no corresponding human solving strategy.
+//
+"OPT_DGT "
+#endif
 #ifdef OPT_SETS
 // Naked sets detection is a main feature.  The complement of naked sets are hidden sets,
 // which are labeled as such when they are more concise to report.
@@ -129,19 +143,657 @@ const char *compilation_options =
 #endif
 ""
 ;
-// USE_ROW_HIDDEN_SEARCH:
-// if set to 1, provides code to search row hidden singles.
-// if set to 0, triad processing will isolate hidden singles in their column.
-// Turning off row search is a little faster
-#ifndef USE_ROW_HIDDEN_SEARCH
-#define USE_ROW_HIDDEN_SEARCH 0
-#endif
 
 // using type v16us for the built-in vector of unsigned short[16]
 using v16us  = __v16hu;
 using v8us   = __v8hu;
 using v16usb = __v16hu;	// for boolean representation
 using v8usb  = __v8hu;	// for boolean representation
+
+// a complete configuration of candidates for a single digit.
+// the array u8 contains 3 horizontal bands' applicable placement patterns
+// a bit pattern of six bits in canonical order of the bands.
+// the second group of 4 unsigned chars contains 3 vertical bands' applicable placement patterns.
+union BandPlacements {
+    unsigned long long u64;
+    unsigned char u8[8];
+};
+
+#ifdef OPT_DGT
+
+// Band Reduction lookup tables (for a single digit)  See OPT_DGT
+// The placement bitmaps are precombined for two bands (horizontal and vertical),
+// so this takes just two lookups.
+// The intersection of the 2x2 bands for 2x2 boxes can be preevaluated for validity easily.
+// The last bands' lookup tables are prepared for the 3rd band horizontally and vertically.
+// Once combined, we have a testable placement, which is valid if it is a subset of the candidates.
+
+typedef struct {
+    unsigned short eliminations;  // possible eliminations of locked candidates
+                                  // however, the algorithm already in place is still
+                                  // a bit faster than using this information. 
+    unsigned short config;        // the covering configs as bit set.
+} BandReduction;
+
+alignas(64)
+BandReduction bandredux[512] {
+    // Beware: numbers are given in octal notation!
+    // A value of 0177777 aka -1 indicates an invalid input value.
+    // A config value of 0 also indicates an invalid input value as
+    // all candidates lock each other out and no possible
+    // placement pattern exists.
+    /* 00 combo = 0 */ { 0177777, 0177777},
+    /* 01 combo = 0 */ { 0177777, 0177777},
+    /* 02 combo = 0 */ { 0177777, 0177777},
+    /* 03 combo = 0 */ { 0177777, 0177777},
+    /* 04 combo = 0 */ { 0177777, 0177777},
+    /* 05 combo = 0 */ { 0177777, 0177777},
+    /* 06 combo = 0 */ { 0177777, 0177777},
+    /* 07 combo = 0 */ { 0177777, 0177777},
+    /* 010 combo = 0 */ { 0177777, 0177777},
+    /* 011 combo = 0 */ { 0177777, 0177777},
+    /* 012 combo = 0 */ { 0177777, 0177777},
+    /* 013 combo = 0 */ { 0177777, 0177777},
+    /* 014 combo = 0 */ { 0177777, 0177777},
+    /* 015 combo = 0 */ { 0177777, 0177777},
+    /* 016 combo = 0 */ { 0177777, 0177777},
+    /* 017 combo = 0 */ { 0177777, 0177777},
+    /* 020 combo = 0 */ { 0177777, 0177777},
+    /* 021 combo = 0 */ { 0177777, 0177777},
+    /* 022 combo = 0 */ { 0177777, 0177777},
+    /* 023 combo = 0 */ { 0177777, 0177777},
+    /* 024 combo = 0 */ { 0177777, 0177777},
+    /* 025 combo = 0 */ { 0177777, 0177777},
+    /* 026 combo = 0 */ { 0177777, 0177777},
+    /* 027 combo = 0 */ { 0177777, 0177777},
+    /* 030 combo = 0 */ { 0177777, 0177777},
+    /* 031 combo = 0 */ { 0177777, 0177777},
+    /* 032 combo = 0 */ { 0177777, 0177777},
+    /* 033 combo = 0 */ { 0177777, 0177777},
+    /* 034 combo = 0 */ { 0177777, 0177777},
+    /* 035 combo = 0 */ { 0177777, 0177777},
+    /* 036 combo = 0 */ { 0177777, 0177777},
+    /* 037 combo = 0 */ { 0177777, 0177777},
+    /* 040 combo = 0 */ { 0177777, 0177777},
+    /* 041 combo = 0 */ { 0177777, 0177777},
+    /* 042 combo = 0 */ { 0177777, 0177777},
+    /* 043 combo = 0 */ { 0177777, 0177777},
+    /* 044 combo = 0 */ { 0177777, 0177777},
+    /* 045 combo = 0 */ { 0177777, 0177777},
+    /* 046 combo = 0 */ { 0177777, 0177777},
+    /* 047 combo = 0 */ { 0177777, 0177777},
+    /* 050 combo = 0 */ { 0177777, 0177777},
+    /* 051 combo = 0 */ { 0177777, 0177777},
+    /* 052 combo = 0 */ { 0177777, 0177777},
+    /* 053 combo = 0 */ { 0177777, 0177777},
+    /* 054 combo = 0 */ { 0177777, 0177777},
+    /* 055 combo = 0 */ { 0177777, 0177777},
+    /* 056 combo = 0 */ { 0177777, 0177777},
+    /* 057 combo = 0 */ { 0177777, 0177777},
+    /* 060 combo = 0 */ { 0177777, 0177777},
+    /* 061 combo = 0 */ { 0177777, 0177777},
+    /* 062 combo = 0 */ { 0177777, 0177777},
+    /* 063 combo = 0 */ { 0177777, 0177777},
+    /* 064 combo = 0 */ { 0177777, 0177777},
+    /* 065 combo = 0 */ { 0177777, 0177777},
+    /* 066 combo = 0 */ { 0177777, 0177777},
+    /* 067 combo = 0 */ { 0177777, 0177777},
+    /* 070 combo = 0 */ { 0177777, 0177777},
+    /* 071 combo = 0 */ { 0177777, 0177777},
+    /* 072 combo = 0 */ { 0177777, 0177777},
+    /* 073 combo = 0 */ { 0177777, 0177777},
+    /* 074 combo = 0 */ { 0177777, 0177777},
+    /* 075 combo = 0 */ { 0177777, 0177777},
+    /* 076 combo = 0 */ { 0177777, 0177777},
+    /* 077 combo = 0 */ { 0177777, 0177777},
+    /* 0100 combo = 0 */ { 0177777, 0177777},
+    /* 0101 combo = 0 */ { 0177777, 0177777},
+    /* 0102 combo = 0 */ { 0177777, 0177777},
+    /* 0103 combo = 0 */ { 0177777, 0177777},
+    /* 0104 combo = 0 */ { 0177777, 0177777},
+    /* 0105 combo = 0 */ { 0177777, 0177777},
+    /* 0106 combo = 0 */ { 0177777, 0177777},
+    /* 0107 combo = 0 */ { 0177777, 0177777},
+    /* 0110 combo = 0 */ { 0177777, 0177777},
+    /* 0111 combo = 0 */ { 0177777, 0177777},
+    /* 0112 combo = 0 */ { 0177777, 0177777},
+    /* 0113 combo = 0 */ { 0177777, 0177777},
+    /* 0114 combo = 0 */ { 0177777, 0177777},
+    /* 0115 combo = 0 */ { 0177777, 0177777},
+    /* 0116 combo = 0 */ { 0116, 00},
+    /* 0117 combo = 0 */ { 0117, 00},
+    /* 0120 combo = 0 */ { 0177777, 0177777},
+    /* 0121 combo = 0 */ { 0177777, 0177777},
+    /* 0122 combo = 0 */ { 0177777, 0177777},
+    /* 0123 combo = 0 */ { 0177777, 0177777},
+    /* 0124 combo = 124 */ { 00, 040},
+    /* 0125 combo = 124 */ { 01, 040},
+    /* 0126 combo = 124 */ { 02, 040},
+    /* 0127 combo = 124 */ { 03, 040},
+    /* 0130 combo = 0 */ { 0177777, 0177777},
+    /* 0131 combo = 0 */ { 0177777, 0177777},
+    /* 0132 combo = 0 */ { 0177777, 0177777},
+    /* 0133 combo = 0 */ { 0177777, 0177777},
+    /* 0134 combo = 124 */ { 010, 040},
+    /* 0135 combo = 124 */ { 011, 040},
+    /* 0136 combo = 124 */ { 012, 040},
+    /* 0137 combo = 124 */ { 013, 040},
+    /* 0140 combo = 0 */ { 0177777, 0177777},
+    /* 0141 combo = 0 */ { 0177777, 0177777},
+    /* 0142 combo = 142 */ { 00, 010},
+    /* 0143 combo = 142 */ { 01, 010},
+    /* 0144 combo = 0 */ { 0177777, 0177777},
+    /* 0145 combo = 0 */ { 0177777, 0177777},
+    /* 0146 combo = 142 */ { 04, 010},
+    /* 0147 combo = 142 */ { 05, 010},
+    /* 0150 combo = 0 */ { 0177777, 0177777},
+    /* 0151 combo = 0 */ { 0177777, 0177777},
+    /* 0152 combo = 142 */ { 010, 010},
+    /* 0153 combo = 142 */ { 011, 010},
+    /* 0154 combo = 0 */ { 0177777, 0177777},
+    /* 0155 combo = 0 */ { 0177777, 0177777},
+    /* 0156 combo = 142 */ { 014, 010},
+    /* 0157 combo = 142 */ { 015, 010},
+    /* 0160 combo = 0 */ { 0177777, 0177777},
+    /* 0161 combo = 0 */ { 0161, 00},
+    /* 0162 combo = 142 */ { 020, 010},
+    /* 0163 combo = 142 */ { 021, 010},
+    /* 0164 combo = 124 */ { 040, 040},
+    /* 0165 combo = 124 */ { 041, 040},
+    /* 0166 combo = 166 */ { 00, 050},
+    /* 0167 combo = 166 */ { 01, 050},
+    /* 0170 combo = 0 */ { 0177777, 0177777},
+    /* 0171 combo = 0 */ { 0171, 00},
+    /* 0172 combo = 142 */ { 030, 010},
+    /* 0173 combo = 142 */ { 031, 010},
+    /* 0174 combo = 124 */ { 050, 040},
+    /* 0175 combo = 124 */ { 051, 040},
+    /* 0176 combo = 166 */ { 010, 050},
+    /* 0177 combo = 166 */ { 011, 050},
+    /* 0200 combo = 0 */ { 0177777, 0177777},
+    /* 0201 combo = 0 */ { 0177777, 0177777},
+    /* 0202 combo = 0 */ { 0177777, 0177777},
+    /* 0203 combo = 0 */ { 0177777, 0177777},
+    /* 0204 combo = 0 */ { 0177777, 0177777},
+    /* 0205 combo = 0 */ { 0177777, 0177777},
+    /* 0206 combo = 0 */ { 0177777, 0177777},
+    /* 0207 combo = 0 */ { 0177777, 0177777},
+    /* 0210 combo = 0 */ { 0177777, 0177777},
+    /* 0211 combo = 0 */ { 0177777, 0177777},
+    /* 0212 combo = 0 */ { 0177777, 0177777},
+    /* 0213 combo = 0 */ { 0177777, 0177777},
+    /* 0214 combo = 214 */ { 00, 020},
+    /* 0215 combo = 214 */ { 01, 020},
+    /* 0216 combo = 214 */ { 02, 020},
+    /* 0217 combo = 214 */ { 03, 020},
+    /* 0220 combo = 0 */ { 0177777, 0177777},
+    /* 0221 combo = 0 */ { 0177777, 0177777},
+    /* 0222 combo = 0 */ { 0177777, 0177777},
+    /* 0223 combo = 0 */ { 0177777, 0177777},
+    /* 0224 combo = 0 */ { 0177777, 0177777},
+    /* 0225 combo = 0 */ { 0225, 00},
+    /* 0226 combo = 0 */ { 0177777, 0177777},
+    /* 0227 combo = 0 */ { 0227, 00},
+    /* 0230 combo = 0 */ { 0177777, 0177777},
+    /* 0231 combo = 0 */ { 0177777, 0177777},
+    /* 0232 combo = 0 */ { 0177777, 0177777},
+    /* 0233 combo = 0 */ { 0177777, 0177777},
+    /* 0234 combo = 214 */ { 020, 020},
+    /* 0235 combo = 214 */ { 021, 020},
+    /* 0236 combo = 214 */ { 022, 020},
+    /* 0237 combo = 214 */ { 023, 020},
+    /* 0240 combo = 0 */ { 0177777, 0177777},
+    /* 0241 combo = 241 */ { 00, 02},
+    /* 0242 combo = 0 */ { 0177777, 0177777},
+    /* 0243 combo = 241 */ { 02, 02},
+    /* 0244 combo = 0 */ { 0177777, 0177777},
+    /* 0245 combo = 241 */ { 04, 02},
+    /* 0246 combo = 0 */ { 0177777, 0177777},
+    /* 0247 combo = 241 */ { 06, 02},
+    /* 0250 combo = 0 */ { 0177777, 0177777},
+    /* 0251 combo = 241 */ { 010, 02},
+    /* 0252 combo = 0 */ { 0252, 00},
+    /* 0253 combo = 241 */ { 012, 02},
+    /* 0254 combo = 214 */ { 040, 020},
+    /* 0255 combo = 255 */ { 00, 022},
+    /* 0256 combo = 214 */ { 042, 020},
+    /* 0257 combo = 255 */ { 02, 022},
+    /* 0260 combo = 0 */ { 0177777, 0177777},
+    /* 0261 combo = 241 */ { 020, 02},
+    /* 0262 combo = 0 */ { 0177777, 0177777},
+    /* 0263 combo = 241 */ { 022, 02},
+    /* 0264 combo = 0 */ { 0177777, 0177777},
+    /* 0265 combo = 241 */ { 024, 02},
+    /* 0266 combo = 0 */ { 0177777, 0177777},
+    /* 0267 combo = 241 */ { 026, 02},
+    /* 0270 combo = 0 */ { 0177777, 0177777},
+    /* 0271 combo = 241 */ { 030, 02},
+    /* 0272 combo = 0 */ { 0272, 00},
+    /* 0273 combo = 241 */ { 032, 02},
+    /* 0274 combo = 214 */ { 060, 020},
+    /* 0275 combo = 255 */ { 020, 022},
+    /* 0276 combo = 214 */ { 062, 020},
+    /* 0277 combo = 255 */ { 022, 022},
+    /* 0300 combo = 0 */ { 0177777, 0177777},
+    /* 0301 combo = 0 */ { 0177777, 0177777},
+    /* 0302 combo = 0 */ { 0177777, 0177777},
+    /* 0303 combo = 0 */ { 0177777, 0177777},
+    /* 0304 combo = 0 */ { 0177777, 0177777},
+    /* 0305 combo = 0 */ { 0177777, 0177777},
+    /* 0306 combo = 0 */ { 0177777, 0177777},
+    /* 0307 combo = 0 */ { 0177777, 0177777},
+    /* 0310 combo = 0 */ { 0177777, 0177777},
+    /* 0311 combo = 0 */ { 0177777, 0177777},
+    /* 0312 combo = 0 */ { 0177777, 0177777},
+    /* 0313 combo = 0 */ { 0177777, 0177777},
+    /* 0314 combo = 214 */ { 0100, 020},
+    /* 0315 combo = 214 */ { 0101, 020},
+    /* 0316 combo = 214 */ { 0102, 020},
+    /* 0317 combo = 214 */ { 0103, 020},
+    /* 0320 combo = 0 */ { 0177777, 0177777},
+    /* 0321 combo = 0 */ { 0177777, 0177777},
+    /* 0322 combo = 0 */ { 0177777, 0177777},
+    /* 0323 combo = 0 */ { 0177777, 0177777},
+    /* 0324 combo = 124 */ { 0200, 040},
+    /* 0325 combo = 124 */ { 0201, 040},
+    /* 0326 combo = 124 */ { 0202, 040},
+    /* 0327 combo = 124 */ { 0203, 040},
+    /* 0330 combo = 0 */ { 0177777, 0177777},
+    /* 0331 combo = 0 */ { 0177777, 0177777},
+    /* 0332 combo = 0 */ { 0177777, 0177777},
+    /* 0333 combo = 0 */ { 0177777, 0177777},
+    /* 0334 combo = 334 */ { 00, 060},
+    /* 0335 combo = 334 */ { 01, 060},
+    /* 0336 combo = 334 */ { 02, 060},
+    /* 0337 combo = 334 */ { 03, 060},
+    /* 0340 combo = 0 */ { 0177777, 0177777},
+    /* 0341 combo = 241 */ { 0100, 02},
+    /* 0342 combo = 142 */ { 0200, 010},
+    /* 0343 combo = 343 */ { 00, 012},
+    /* 0344 combo = 0 */ { 0344, 00},
+    /* 0345 combo = 241 */ { 0104, 02},
+    /* 0346 combo = 142 */ { 0204, 010},
+    /* 0347 combo = 343 */ { 04, 012},
+    /* 0350 combo = 0 */ { 0177777, 0177777},
+    /* 0351 combo = 241 */ { 0110, 02},
+    /* 0352 combo = 142 */ { 0210, 010},
+    /* 0353 combo = 343 */ { 010, 012},
+    /* 0354 combo = 214 */ { 0140, 020},
+    /* 0355 combo = 255 */ { 0100, 022},
+    /* 0356 combo = 356 */ { 00, 030},
+    /* 0357 combo = 357 */ { 00, 032},
+    /* 0360 combo = 0 */ { 0177777, 0177777},
+    /* 0361 combo = 241 */ { 0120, 02},
+    /* 0362 combo = 142 */ { 0220, 010},
+    /* 0363 combo = 343 */ { 020, 012},
+    /* 0364 combo = 124 */ { 0240, 040},
+    /* 0365 combo = 365 */ { 00, 042},
+    /* 0366 combo = 166 */ { 0200, 050},
+    /* 0367 combo = 367 */ { 00, 052},
+    /* 0370 combo = 0 */ { 0177777, 0177777},
+    /* 0371 combo = 241 */ { 0130, 02},
+    /* 0372 combo = 142 */ { 0230, 010},
+    /* 0373 combo = 343 */ { 030, 012},
+    /* 0374 combo = 334 */ { 040, 060},
+    /* 0375 combo = 375 */ { 00, 062},
+    /* 0376 combo = 376 */ { 00, 070},
+    /* 0377 combo = 377 */ { 00, 072},
+    /* 0400 combo = 0 */ { 0177777, 0177777},
+    /* 0401 combo = 0 */ { 0177777, 0177777},
+    /* 0402 combo = 0 */ { 0177777, 0177777},
+    /* 0403 combo = 0 */ { 0177777, 0177777},
+    /* 0404 combo = 0 */ { 0177777, 0177777},
+    /* 0405 combo = 0 */ { 0177777, 0177777},
+    /* 0406 combo = 0 */ { 0177777, 0177777},
+    /* 0407 combo = 0 */ { 0177777, 0177777},
+    /* 0410 combo = 0 */ { 0177777, 0177777},
+    /* 0411 combo = 0 */ { 0177777, 0177777},
+    /* 0412 combo = 412 */ { 00, 04},
+    /* 0413 combo = 412 */ { 01, 04},
+    /* 0414 combo = 0 */ { 0177777, 0177777},
+    /* 0415 combo = 0 */ { 0177777, 0177777},
+    /* 0416 combo = 412 */ { 04, 04},
+    /* 0417 combo = 412 */ { 05, 04},
+    /* 0420 combo = 0 */ { 0177777, 0177777},
+    /* 0421 combo = 421 */ { 00, 01},
+    /* 0422 combo = 0 */ { 0177777, 0177777},
+    /* 0423 combo = 421 */ { 02, 01},
+    /* 0424 combo = 0 */ { 0177777, 0177777},
+    /* 0425 combo = 421 */ { 04, 01},
+    /* 0426 combo = 0 */ { 0177777, 0177777},
+    /* 0427 combo = 421 */ { 06, 01},
+    /* 0430 combo = 0 */ { 0177777, 0177777},
+    /* 0431 combo = 421 */ { 010, 01},
+    /* 0432 combo = 412 */ { 020, 04},
+    /* 0433 combo = 433 */ { 00, 05},
+    /* 0434 combo = 0 */ { 0434, 00},
+    /* 0435 combo = 421 */ { 014, 01},
+    /* 0436 combo = 412 */ { 024, 04},
+    /* 0437 combo = 433 */ { 04, 05},
+    /* 0440 combo = 0 */ { 0177777, 0177777},
+    /* 0441 combo = 0 */ { 0177777, 0177777},
+    /* 0442 combo = 0 */ { 0177777, 0177777},
+    /* 0443 combo = 0 */ { 0443, 00},
+    /* 0444 combo = 0 */ { 0177777, 0177777},
+    /* 0445 combo = 0 */ { 0177777, 0177777},
+    /* 0446 combo = 0 */ { 0177777, 0177777},
+    /* 0447 combo = 0 */ { 0447, 00},
+    /* 0450 combo = 0 */ { 0177777, 0177777},
+    /* 0451 combo = 0 */ { 0177777, 0177777},
+    /* 0452 combo = 412 */ { 040, 04},
+    /* 0453 combo = 412 */ { 041, 04},
+    /* 0454 combo = 0 */ { 0177777, 0177777},
+    /* 0455 combo = 0 */ { 0177777, 0177777},
+    /* 0456 combo = 412 */ { 044, 04},
+    /* 0457 combo = 412 */ { 045, 04},
+    /* 0460 combo = 0 */ { 0177777, 0177777},
+    /* 0461 combo = 421 */ { 040, 01},
+    /* 0462 combo = 0 */ { 0177777, 0177777},
+    /* 0463 combo = 421 */ { 042, 01},
+    /* 0464 combo = 0 */ { 0177777, 0177777},
+    /* 0465 combo = 421 */ { 044, 01},
+    /* 0466 combo = 0 */ { 0177777, 0177777},
+    /* 0467 combo = 421 */ { 046, 01},
+    /* 0470 combo = 0 */ { 0177777, 0177777},
+    /* 0471 combo = 421 */ { 050, 01},
+    /* 0472 combo = 412 */ { 060, 04},
+    /* 0473 combo = 433 */ { 040, 05},
+    /* 0474 combo = 0 */ { 0474, 00},
+    /* 0475 combo = 421 */ { 054, 01},
+    /* 0476 combo = 412 */ { 064, 04},
+    /* 0477 combo = 433 */ { 044, 05},
+    /* 0500 combo = 0 */ { 0177777, 0177777},
+    /* 0501 combo = 0 */ { 0177777, 0177777},
+    /* 0502 combo = 0 */ { 0177777, 0177777},
+    /* 0503 combo = 0 */ { 0177777, 0177777},
+    /* 0504 combo = 0 */ { 0177777, 0177777},
+    /* 0505 combo = 0 */ { 0177777, 0177777},
+    /* 0506 combo = 0 */ { 0177777, 0177777},
+    /* 0507 combo = 0 */ { 0177777, 0177777},
+    /* 0510 combo = 0 */ { 0177777, 0177777},
+    /* 0511 combo = 0 */ { 0177777, 0177777},
+    /* 0512 combo = 412 */ { 0100, 04},
+    /* 0513 combo = 412 */ { 0101, 04},
+    /* 0514 combo = 0 */ { 0177777, 0177777},
+    /* 0515 combo = 0 */ { 0177777, 0177777},
+    /* 0516 combo = 412 */ { 0104, 04},
+    /* 0517 combo = 412 */ { 0105, 04},
+    /* 0520 combo = 0 */ { 0177777, 0177777},
+    /* 0521 combo = 421 */ { 0100, 01},
+    /* 0522 combo = 0 */ { 0522, 00},
+    /* 0523 combo = 421 */ { 0102, 01},
+    /* 0524 combo = 124 */ { 0400, 040},
+    /* 0525 combo = 525 */ { 00, 041},
+    /* 0526 combo = 124 */ { 0402, 040},
+    /* 0527 combo = 525 */ { 02, 041},
+    /* 0530 combo = 0 */ { 0177777, 0177777},
+    /* 0531 combo = 421 */ { 0110, 01},
+    /* 0532 combo = 412 */ { 0120, 04},
+    /* 0533 combo = 433 */ { 0100, 05},
+    /* 0534 combo = 124 */ { 0410, 040},
+    /* 0535 combo = 525 */ { 010, 041},
+    /* 0536 combo = 536 */ { 00, 044},
+    /* 0537 combo = 537 */ { 00, 045},
+    /* 0540 combo = 0 */ { 0177777, 0177777},
+    /* 0541 combo = 0 */ { 0177777, 0177777},
+    /* 0542 combo = 142 */ { 0400, 010},
+    /* 0543 combo = 142 */ { 0401, 010},
+    /* 0544 combo = 0 */ { 0177777, 0177777},
+    /* 0545 combo = 0 */ { 0177777, 0177777},
+    /* 0546 combo = 142 */ { 0404, 010},
+    /* 0547 combo = 142 */ { 0405, 010},
+    /* 0550 combo = 0 */ { 0177777, 0177777},
+    /* 0551 combo = 0 */ { 0177777, 0177777},
+    /* 0552 combo = 552 */ { 00, 014},
+    /* 0553 combo = 552 */ { 01, 014},
+    /* 0554 combo = 0 */ { 0177777, 0177777},
+    /* 0555 combo = 0 */ { 0177777, 0177777},
+    /* 0556 combo = 552 */ { 04, 014},
+    /* 0557 combo = 552 */ { 05, 014},
+    /* 0560 combo = 0 */ { 0177777, 0177777},
+    /* 0561 combo = 421 */ { 0140, 01},
+    /* 0562 combo = 142 */ { 0420, 010},
+    /* 0563 combo = 563 */ { 00, 011},
+    /* 0564 combo = 124 */ { 0440, 040},
+    /* 0565 combo = 525 */ { 040, 041},
+    /* 0566 combo = 166 */ { 0400, 050},
+    /* 0567 combo = 567 */ { 00, 051},
+    /* 0570 combo = 0 */ { 0177777, 0177777},
+    /* 0571 combo = 421 */ { 0150, 01},
+    /* 0572 combo = 552 */ { 020, 014},
+    /* 0573 combo = 573 */ { 00, 015},
+    /* 0574 combo = 124 */ { 0450, 040},
+    /* 0575 combo = 525 */ { 050, 041},
+    /* 0576 combo = 576 */ { 00, 054},
+    /* 0577 combo = 577 */ { 00, 055},
+    /* 0600 combo = 0 */ { 0177777, 0177777},
+    /* 0601 combo = 0 */ { 0177777, 0177777},
+    /* 0602 combo = 0 */ { 0177777, 0177777},
+    /* 0603 combo = 0 */ { 0177777, 0177777},
+    /* 0604 combo = 0 */ { 0177777, 0177777},
+    /* 0605 combo = 0 */ { 0177777, 0177777},
+    /* 0606 combo = 0 */ { 0177777, 0177777},
+    /* 0607 combo = 0 */ { 0177777, 0177777},
+    /* 0610 combo = 0 */ { 0177777, 0177777},
+    /* 0611 combo = 0 */ { 0611, 00},
+    /* 0612 combo = 412 */ { 0200, 04},
+    /* 0613 combo = 412 */ { 0201, 04},
+    /* 0614 combo = 214 */ { 0400, 020},
+    /* 0615 combo = 214 */ { 0401, 020},
+    /* 0616 combo = 616 */ { 00, 024},
+    /* 0617 combo = 616 */ { 01, 024},
+    /* 0620 combo = 0 */ { 0177777, 0177777},
+    /* 0621 combo = 421 */ { 0200, 01},
+    /* 0622 combo = 0 */ { 0177777, 0177777},
+    /* 0623 combo = 421 */ { 0202, 01},
+    /* 0624 combo = 0 */ { 0177777, 0177777},
+    /* 0625 combo = 421 */ { 0204, 01},
+    /* 0626 combo = 0 */ { 0177777, 0177777},
+    /* 0627 combo = 421 */ { 0206, 01},
+    /* 0630 combo = 0 */ { 0177777, 0177777},
+    /* 0631 combo = 421 */ { 0210, 01},
+    /* 0632 combo = 412 */ { 0220, 04},
+    /* 0633 combo = 433 */ { 0200, 05},
+    /* 0634 combo = 214 */ { 0420, 020},
+    /* 0635 combo = 635 */ { 00, 021},
+    /* 0636 combo = 616 */ { 020, 024},
+    /* 0637 combo = 637 */ { 00, 025},
+    /* 0640 combo = 0 */ { 0177777, 0177777},
+    /* 0641 combo = 241 */ { 0400, 02},
+    /* 0642 combo = 0 */ { 0177777, 0177777},
+    /* 0643 combo = 241 */ { 0402, 02},
+    /* 0644 combo = 0 */ { 0177777, 0177777},
+    /* 0645 combo = 241 */ { 0404, 02},
+    /* 0646 combo = 0 */ { 0177777, 0177777},
+    /* 0647 combo = 241 */ { 0406, 02},
+    /* 0650 combo = 0 */ { 0177777, 0177777},
+    /* 0651 combo = 241 */ { 0410, 02},
+    /* 0652 combo = 412 */ { 0240, 04},
+    /* 0653 combo = 653 */ { 00, 06},
+    /* 0654 combo = 214 */ { 0440, 020},
+    /* 0655 combo = 255 */ { 0400, 022},
+    /* 0656 combo = 616 */ { 040, 024},
+    /* 0657 combo = 657 */ { 00, 026},
+    /* 0660 combo = 0 */ { 0177777, 0177777},
+    /* 0661 combo = 661 */ { 00, 03},
+    /* 0662 combo = 0 */ { 0177777, 0177777},
+    /* 0663 combo = 661 */ { 02, 03},
+    /* 0664 combo = 0 */ { 0177777, 0177777},
+    /* 0665 combo = 661 */ { 04, 03},
+    /* 0666 combo = 0 */ { 0177777, 0177777},
+    /* 0667 combo = 661 */ { 06, 03},
+    /* 0670 combo = 0 */ { 0177777, 0177777},
+    /* 0671 combo = 661 */ { 010, 03},
+    /* 0672 combo = 412 */ { 0260, 04},
+    /* 0673 combo = 673 */ { 00, 07},
+    /* 0674 combo = 214 */ { 0460, 020},
+    /* 0675 combo = 675 */ { 00, 023},
+    /* 0676 combo = 616 */ { 060, 024},
+    /* 0677 combo = 677 */ { 00, 027},
+    /* 0700 combo = 0 */ { 0177777, 0177777},
+    /* 0701 combo = 0 */ { 0177777, 0177777},
+    /* 0702 combo = 0 */ { 0177777, 0177777},
+    /* 0703 combo = 0 */ { 0177777, 0177777},
+    /* 0704 combo = 0 */ { 0177777, 0177777},
+    /* 0705 combo = 0 */ { 0177777, 0177777},
+    /* 0706 combo = 0 */ { 0177777, 0177777},
+    /* 0707 combo = 0 */ { 0177777, 0177777},
+    /* 0710 combo = 0 */ { 0177777, 0177777},
+    /* 0711 combo = 0 */ { 0711, 00},
+    /* 0712 combo = 412 */ { 0300, 04},
+    /* 0713 combo = 412 */ { 0301, 04},
+    /* 0714 combo = 214 */ { 0500, 020},
+    /* 0715 combo = 214 */ { 0501, 020},
+    /* 0716 combo = 616 */ { 0100, 024},
+    /* 0717 combo = 616 */ { 0101, 024},
+    /* 0720 combo = 0 */ { 0177777, 0177777},
+    /* 0721 combo = 421 */ { 0300, 01},
+    /* 0722 combo = 0 */ { 0722, 00},
+    /* 0723 combo = 421 */ { 0302, 01},
+    /* 0724 combo = 124 */ { 0600, 040},
+    /* 0725 combo = 525 */ { 0200, 041},
+    /* 0726 combo = 124 */ { 0602, 040},
+    /* 0727 combo = 525 */ { 0202, 041},
+    /* 0730 combo = 0 */ { 0177777, 0177777},
+    /* 0731 combo = 421 */ { 0310, 01},
+    /* 0732 combo = 412 */ { 0320, 04},
+    /* 0733 combo = 433 */ { 0300, 05},
+    /* 0734 combo = 334 */ { 0400, 060},
+    /* 0735 combo = 735 */ { 00, 061},
+    /* 0736 combo = 736 */ { 00, 064},
+    /* 0737 combo = 737 */ { 00, 065},
+    /* 0740 combo = 0 */ { 0177777, 0177777},
+    /* 0741 combo = 241 */ { 0500, 02},
+    /* 0742 combo = 142 */ { 0600, 010},
+    /* 0743 combo = 343 */ { 0400, 012},
+    /* 0744 combo = 0 */ { 0744, 00},
+    /* 0745 combo = 241 */ { 0504, 02},
+    /* 0746 combo = 142 */ { 0604, 010},
+    /* 0747 combo = 343 */ { 0404, 012},
+    /* 0750 combo = 0 */ { 0177777, 0177777},
+    /* 0751 combo = 241 */ { 0510, 02},
+    /* 0752 combo = 552 */ { 0200, 014},
+    /* 0753 combo = 753 */ { 00, 016},
+    /* 0754 combo = 214 */ { 0540, 020},
+    /* 0755 combo = 255 */ { 0500, 022},
+    /* 0756 combo = 756 */ { 00, 034},
+    /* 0757 combo = 757 */ { 00, 036},
+    /* 0760 combo = 0 */ { 0177777, 0177777},
+    /* 0761 combo = 661 */ { 0100, 03},
+    /* 0762 combo = 142 */ { 0620, 010},
+    /* 0763 combo = 763 */ { 00, 013},
+    /* 0764 combo = 124 */ { 0640, 040},
+    /* 0765 combo = 765 */ { 00, 043},
+    /* 0766 combo = 166 */ { 0600, 050},
+    /* 0767 combo = 767 */ { 00, 053},
+    /* 0770 combo = 0 */ { 0177777, 0177777},
+    /* 0771 combo = 661 */ { 0110, 03},
+    /* 0772 combo = 552 */ { 0220, 014},
+    /* 0773 combo = 773 */ { 00, 017},
+    /* 0774 combo = 334 */ { 0440, 060},
+    /* 0775 combo = 775 */ { 00, 063},
+    /* 0776 combo = 776 */ { 00, 074},
+    /* 0777 combo = 777 */ { 00, 077}
+};
+
+alignas(32)
+const __m128i h2bandplacement[36] {
+        _mm_set_epi64x(0,0700070007700070007),
+        _mm_set_epi64x(0,0700070007070700007),
+        _mm_set_epi64x(0,0700070007700007070),
+        _mm_set_epi64x(0,0700070007007700070),
+        _mm_set_epi64x(0,0700070007070007700),
+        _mm_set_epi64x(0,0700070007007070700),
+        _mm_set_epi64x(0,0070700007700070007),
+        _mm_set_epi64x(0,0070700007070700007),
+        _mm_set_epi64x(0,0070700007700007070),
+        _mm_set_epi64x(0,0070700007007700070),
+        _mm_set_epi64x(0,0070700007070007700),
+        _mm_set_epi64x(0,0070700007007070700),
+        _mm_set_epi64x(0,0700007070700070007),
+        _mm_set_epi64x(0,0700007070070700007),
+        _mm_set_epi64x(0,0700007070700007070),
+        _mm_set_epi64x(0,0700007070007700070),
+        _mm_set_epi64x(0,0700007070070007700),
+        _mm_set_epi64x(0,0700007070007070700),
+        _mm_set_epi64x(0,0007700070700070007),
+        _mm_set_epi64x(0,0007700070070700007),
+        _mm_set_epi64x(0,0007700070700007070),
+        _mm_set_epi64x(0,0007700070007700070),
+        _mm_set_epi64x(0,0007700070070007700),
+        _mm_set_epi64x(0,0007700070007070700),
+        _mm_set_epi64x(0,0070007700700070007),
+        _mm_set_epi64x(0,0070007700070700007),
+        _mm_set_epi64x(0,0070007700700007070),
+        _mm_set_epi64x(0,0070007700007700070),
+        _mm_set_epi64x(0,0070007700070007700),
+        _mm_set_epi64x(0,0070007700007070700),
+        _mm_set_epi64x(0,0007070700700070007),
+        _mm_set_epi64x(0,0007070700070700007),
+        _mm_set_epi64x(0,0007070700700007070),
+        _mm_set_epi64x(0,0007070700007700070),
+        _mm_set_epi64x(0,0007070700070007700),
+        _mm_set_epi64x(0,0007070700007070700)
+};
+
+alignas(64)
+__m128i h3bandplacement[6] {
+        _mm_set_epi64x(00000000000000000340034,00007000000000000000000),
+        _mm_set_epi64x(00000000000000000034340,00007000000000000000000),
+        _mm_set_epi64x(00000000000000000340003,01070000000000000000000),
+        _mm_set_epi64x(00000000000000000003740,00070000000000000000000),
+        _mm_set_epi64x(00000000000000000034003,01700000000000000000000),
+        _mm_set_epi64x(00000000000000000003434,00700000000000000000000),
+};
+
+__m128i v3bandplacement[6] {
+        _mm_set_epi64x(00000000000000000200200,00400200200200100100100),
+        _mm_set_epi64x(00000000000000000100100,00200400400400100100100),
+        _mm_set_epi64x(00000000000000000200200,00400100100100200200200),
+        _mm_set_epi64x(00000000000000000040040,00100400400400200200200),
+        _mm_set_epi64x(00000000000000000100100,00200100100100400400400),
+        _mm_set_epi64x(00000000000000000040040,00100200200200400400400),
+};
+
+__m128i v2bandplacement[36] {
+        _mm_set_epi64x(00000000000000000022022,00044022022022011011011),
+        _mm_set_epi64x(00000000000000000021021,00042024024024011011011),
+        _mm_set_epi64x(00000000000000000022022,00044021021021012012012),
+        _mm_set_epi64x(00000000000000000020420,01041024024024012012012),
+        _mm_set_epi64x(00000000000000000021021,00042021021021014014014),
+        _mm_set_epi64x(00000000000000000020420,01041022022022014014014),
+        _mm_set_epi64x(00000000000000000012012,00024042042042011011011),
+        _mm_set_epi64x(00000000000000000011011,00022044044044011011011),
+        _mm_set_epi64x(00000000000000000012012,00024041041041012012012),
+        _mm_set_epi64x(00000000000000000010410,01021044044044012012012),
+        _mm_set_epi64x(00000000000000000011011,00022041041041014014014),
+        _mm_set_epi64x(00000000000000000010410,01021042042042014014014),
+        _mm_set_epi64x(00000000000000000022022,00044012012012021021021),
+        _mm_set_epi64x(00000000000000000021021,00042014014014021021021),
+        _mm_set_epi64x(00000000000000000022022,00044011011011022022022),
+        _mm_set_epi64x(00000000000000000020420,01041014014014022022022),
+        _mm_set_epi64x(00000000000000000021021,00042011011011024024024),
+        _mm_set_epi64x(00000000000000000020420,01041012012012024024024),
+        _mm_set_epi64x(00000000000000000006006,00014042042042021021021),
+        _mm_set_epi64x(00000000000000000005005,00012044044044021021021),
+        _mm_set_epi64x(00000000000000000006006,00014041041041022022022),
+        _mm_set_epi64x(00000000000000000004404,01011044044044022022022),
+        _mm_set_epi64x(00000000000000000005005,00012041041041024024024),
+        _mm_set_epi64x(00000000000000000004404,01011042042042024024024),
+        _mm_set_epi64x(00000000000000000012012,00024012012012041041041),
+        _mm_set_epi64x(00000000000000000011011,00022014014014041041041),
+        _mm_set_epi64x(00000000000000000012012,00024011011011042042042),
+        _mm_set_epi64x(00000000000000000010410,01021014014014042042042),
+        _mm_set_epi64x(00000000000000000011011,00022011011011044044044),
+        _mm_set_epi64x(00000000000000000010410,01021012012012044044044),
+        _mm_set_epi64x(00000000000000000006006,00014022022022041041041),
+        _mm_set_epi64x(00000000000000000005005,00012024024024041041041),
+        _mm_set_epi64x(00000000000000000006006,00014021021021042042042),
+        _mm_set_epi64x(00000000000000000004404,01011024024024042042042),
+        _mm_set_epi64x(00000000000000000005005,00012021021021044044044),
+        _mm_set_epi64x(00000000000000000004404,01011022022022044044044),
+};
+#endif
 
 // Kind enum
 // used for access to data tables and for templates depending on the Kind of section
@@ -171,8 +823,10 @@ enum Verbosity {
    VDebug = 2
 };
 
-// bit128_t type
+// bit128_t aggregate type
 // used for all 81-bit fields to support different access patterns.
+// Note that aggregate type means: don't invent new constructors!  That would negate the
+// the benefit of having an aggregate union type.
 typedef
 union bit128_t {
     __uint128_t    u128;
@@ -214,12 +868,21 @@ union bit128_t {
         return this->u128 = this->u128 & b;
     }
 
+    template<unsigned int off=0>
     inline bool check_indexbit(unsigned int idx) {
+        if ( off ) {
+            idx += off;
+        }
         // slightly faster than bittest
         return this->u32[idx>>5] & (1<<(idx & 0x1f));
         // return bittest(this->u32[idx>>5], idx & 0x1f);
     }
+
+    template<unsigned int off=0>
     inline void set_indexbit(unsigned int idx) {
+        if ( off ) {
+            idx += off;
+        }
         // slightly faster than bittestandset
         this->u32[idx>>5] |= 1<<(idx & 0x1f);
         // bittestandset(this->u32[idx>>5], idx & 0x1f);
@@ -376,7 +1039,6 @@ const unsigned long long small_index_lut[9][3][2] = {
 
 alignas(64)
 // lookup tables that may or may not speed things up by avoiding division
-// heavily used
 const unsigned char index_by_kind[3][81] = {
 {    0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -409,8 +1071,8 @@ const unsigned char index_by_kind[3][81] = {
     6, 6, 6, 7, 7, 7, 8, 8, 8
 } };
 
-    // Mapping of the row triads processing order to canonical order (not considering the
-    // gaps every 10 elements):
+    // Mapping of the non_canonical triads processing order to canonical order
+    // (not considering the gaps every 10 elements):
     // [Note: This permutation is its own reverse, which is called an involution]
     const unsigned char row_triad_canonical_map[27] = {
         0,  1,  2,   9, 10, 11,  18, 19, 20,
@@ -432,7 +1094,7 @@ const unsigned char index_by_kind[3][81] = {
          9,12,15,36,39,42,63,66,69,0xff,
         18,21,24,45,48,51,72,75,78,0xff };
 
-    // find the 3-bit positional pattern given the 'band' index 0..8
+    // find the (row) 3-bit positional pattern within any band by index 0..8
     const unsigned int bandbits_by_index[9] = {
         0x7, 0x7<<3, 0x7<<6, 0x7<<9, 0x7<<12, 0x7<<15, 0x7<<18, 0x7<<21, 0x7<<24 };
 
@@ -541,87 +1203,87 @@ const unsigned long long big_index_lut[81][4][2] = {
 // For printing a cell location, use the following table.
 // It is mutable so that the 0-based representation can be made 1-based (or 'A'-based) on start-up.
 char cl2txt[81][6] = {
-        /*   0 */  "[0,0]",
-        /*   1 */  "[0,1]",
-        /*   2 */  "[0,2]",
-        /*   3 */  "[0,3]",
-        /*   4 */  "[0,4]",
-        /*   5 */  "[0,5]",
-        /*   6 */  "[0,6]",
-        /*   7 */  "[0,7]",
-        /*   8 */  "[0,8]",
-        /*   9 */  "[1,0]",
-        /*  10 */  "[1,1]",
-        /*  11 */  "[1,2]",
-        /*  12 */  "[1,3]",
-        /*  13 */  "[1,4]",
-        /*  14 */  "[1,5]",
-        /*  15 */  "[1,6]",
-        /*  16 */  "[1,7]",
-        /*  17 */  "[1,8]",
-        /*  18 */  "[2,0]",
-        /*  19 */  "[2,1]",
-        /*  20 */  "[2,2]",
-        /*  21 */  "[2,3]",
-        /*  22 */  "[2,4]",
-        /*  23 */  "[2,5]",
-        /*  24 */  "[2,6]",
-        /*  25 */  "[2,7]",
-        /*  26 */  "[2,8]",
-        /*  27 */  "[3,0]",
-        /*  28 */  "[3,1]",
-        /*  29 */  "[3,2]",
-        /*  30 */  "[3,3]",
-        /*  31 */  "[3,4]",
-        /*  32 */  "[3,5]",
-        /*  33 */  "[3,6]",
-        /*  34 */  "[3,7]",
-        /*  35 */  "[3,8]",
-        /*  36 */  "[4,0]",
-        /*  37 */  "[4,1]",
-        /*  38 */  "[4,2]",
-        /*  39 */  "[4,3]",
-        /*  40 */  "[4,4]",
-        /*  41 */  "[4,5]",
-        /*  42 */  "[4,6]",
-        /*  43 */  "[4,7]",
-        /*  44 */  "[4,8]",
-        /*  45 */  "[5,0]",
-        /*  46 */  "[5,1]",
-        /*  47 */  "[5,2]",
-        /*  48 */  "[5,3]",
-        /*  49 */  "[5,4]",
-        /*  50 */  "[5,5]",
-        /*  51 */  "[5,6]",
-        /*  52 */  "[5,7]",
-        /*  53 */  "[5,8]",
-        /*  54 */  "[6,0]",
-        /*  55 */  "[6,1]",
-        /*  56 */  "[6,2]",
-        /*  57 */  "[6,3]",
-        /*  58 */  "[6,4]",
-        /*  59 */  "[6,5]",
-        /*  60 */  "[6,6]",
-        /*  61 */  "[6,7]",
-        /*  62 */  "[6,8]",
-        /*  63 */  "[7,0]",
-        /*  64 */  "[7,1]",
-        /*  65 */  "[7,2]",
-        /*  66 */  "[7,3]",
-        /*  67 */  "[7,4]",
-        /*  68 */  "[7,5]",
-        /*  69 */  "[7,6]",
-        /*  70 */  "[7,7]",
-        /*  71 */  "[7,8]",
-        /*  72 */  "[8,0]",
-        /*  73 */  "[8,1]",
-        /*  74 */  "[8,2]",
-        /*  75 */  "[8,3]",
-        /*  76 */  "[8,4]",
-        /*  77 */  "[8,5]",
-        /*  78 */  "[8,6]",
-        /*  79 */  "[8,7]",
-        /*  80 */  "[8,8]"
+        /*   0 */  "[1,1]",
+        /*   1 */  "[1,2]",
+        /*   2 */  "[1,3]",
+        /*   3 */  "[1,4]",
+        /*   4 */  "[1,5]",
+        /*   5 */  "[1,6]",
+        /*   6 */  "[1,7]",
+        /*   7 */  "[1,8]",
+        /*   8 */  "[1,9]",
+        /*   9 */  "[2,1]",
+        /*  10 */  "[2,2]",
+        /*  11 */  "[2,3]",
+        /*  12 */  "[2,4]",
+        /*  13 */  "[2,5]",
+        /*  14 */  "[2,6]",
+        /*  15 */  "[2,7]",
+        /*  16 */  "[2,8]",
+        /*  17 */  "[2,9]",
+        /*  18 */  "[3,1]",
+        /*  19 */  "[3,2]",
+        /*  20 */  "[3,3]",
+        /*  21 */  "[3,4]",
+        /*  22 */  "[3,5]",
+        /*  23 */  "[3,6]",
+        /*  24 */  "[3,7]",
+        /*  25 */  "[3,8]",
+        /*  26 */  "[3,9]",
+        /*  27 */  "[4,1]",
+        /*  28 */  "[4,2]",
+        /*  29 */  "[4,3]",
+        /*  30 */  "[4,4]",
+        /*  31 */  "[4,5]",
+        /*  32 */  "[4,6]",
+        /*  33 */  "[4,7]",
+        /*  34 */  "[4,8]",
+        /*  35 */  "[4,9]",
+        /*  36 */  "[5,1]",
+        /*  37 */  "[5,2]",
+        /*  38 */  "[5,3]",
+        /*  39 */  "[5,4]",
+        /*  40 */  "[5,5]",
+        /*  41 */  "[5,6]",
+        /*  42 */  "[5,7]",
+        /*  43 */  "[5,8]",
+        /*  44 */  "[5,9]",
+        /*  45 */  "[6,1]",
+        /*  46 */  "[6,2]",
+        /*  47 */  "[6,3]",
+        /*  48 */  "[6,4]",
+        /*  49 */  "[6,5]",
+        /*  50 */  "[6,6]",
+        /*  51 */  "[6,7]",
+        /*  52 */  "[6,8]",
+        /*  53 */  "[6,9]",
+        /*  54 */  "[7,1]",
+        /*  55 */  "[7,2]",
+        /*  56 */  "[7,3]",
+        /*  57 */  "[7,4]",
+        /*  58 */  "[7,5]",
+        /*  59 */  "[7,6]",
+        /*  60 */  "[7,7]",
+        /*  61 */  "[7,8]",
+        /*  62 */  "[7,9]",
+        /*  63 */  "[8,1]",
+        /*  64 */  "[8,2]",
+        /*  65 */  "[8,3]",
+        /*  66 */  "[8,4]",
+        /*  67 */  "[8,5]",
+        /*  68 */  "[8,6]",
+        /*  69 */  "[8,7]",
+        /*  70 */  "[8,8]",
+        /*  71 */  "[8,9]",
+        /*  72 */  "[9,1]",
+        /*  73 */  "[9,2]",
+        /*  74 */  "[9,3]",
+        /*  75 */  "[9,4]",
+        /*  76 */  "[9,5]",
+        /*  77 */  "[9,6]",
+        /*  78 */  "[9,7]",
+        /*  79 */  "[9,8]",
+        /*  80 */  "[9,9]"
     };
 
 const signed char box_perp_ind_incr[9] = { 1, 1, 7, 1, 1, 7, 1, 1, -20};
@@ -658,11 +1320,11 @@ const __m256i lut_hi = _mm256_set_epi8('?', '?', '?', '?', '?', '?', '?', '8', '
 const __m256i ones = _mm256_set1_epi16(1);
 
 // used in verify:
-const __m256i mask9 { -1LL, -1LL, 0xffffLL, 0 };
+const __m256i mask9 = _mm256_setr_epi64x(-1LL, -1LL, 0xffffLL, 0);
 const __m256i ones9 = _mm256_and_si256(ones, mask9);
 
 // used in triads:
-const __m256i mask11hi { 0LL, 0LL, 0xffffLL<<48, ~0LL };
+const __m256i mask11hi = _mm256_setr_epi64x(0LL, 0LL, 0xffffLL<<48, ~0LL);
 const __m256i mask1ff   = _mm256_set1_epi16(0x1ff);
 const __m256i mask9x1ff = _mm256_and_si256(mask1ff, mask9);
 
@@ -685,7 +1347,7 @@ const __m256i shuff_row_mask2 = _mm256_setr_epi8( 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 
                                                   8, 9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
 
 // used in triad resolution
-const __m256i mask27 { -1LL, (long long int)0xffffffffffff00ffLL, (long long int)0xffffffff00ffffffLL, 0xffffffffffLL };
+const __m256i mask27    = _mm256_setr_epi64x(-1LL, (long long int)0xffffffffffff00ffLL, (long long int)0xffffffff00ffffffLL, 0xffffffffffLL);
 const __m256i threes    = _mm256_set1_epi8 ( 3 );
 const __m256i fours     = _mm256_set1_epi8 ( 4 );
 //   popcnt by nibble
@@ -701,6 +1363,11 @@ const __m256i mask_1ff = _mm256_setr_epi16(0x1ff, 0x1ff<<1, 0x1ff<<2, 0x1ff<<3, 
 const __m256i hrs_shifts = _mm256_setr_epi16(0x7fff, 0x8000>>1, 0x8000>>2, 0x8000>>3, 0x8000>>4, 0x8000>>5, 0x8000>>6, (unsigned)0x8000>>7,
                                              0x7fff, 0x8000>>1, 0x8000>>2, 0x8000>>3, 0x8000>>4, 0x8000>>5, 0x8000>>6, (unsigned)0x8000>>7);
 
+// used with mode_dgt
+const __m256i shuff_col_ordered1 = _mm256_setr_epi8( 0, 1, 2,-1,-1,-1,12,13,14, 3, 4, 5,-1,-1,-1,15,
+                                                     8, 9,-1,-1, 0,-1,-1,-1,10,11,12,-1,-1,-1,-1,-1);
+const __m256i shuff_col_ordered2 = _mm256_setr_epi8(-1,-1, 6, 7,-1, 8, 9,10,-1,-1,-1,-1,-1,-1,-1,-1,
+                                                    -1,-1,-1, 2, 3, 4,-1,-1,-1,-1,-1,-1, 5, 6, 7,-1);
 // used in NEWSETS:
 const __m256i true_epi16 = _mm256_set1_epi16(0xffff);
 
@@ -718,6 +1385,8 @@ const __m256i linerotate[2] = {
                        0,1,2,3,4,5,-1,-1,10,11,12,13,8,9,-1,-1) };
 #endif
 
+const __uint128_t mask_81bit = (((__uint128_t)0x1ffff)<<64)+0xffffffffffffffff;
+
 class
 alignas(64)
 Counters {
@@ -730,6 +1399,8 @@ public:
     long long naked_sets_found;             // how many naked sets did we actually find
     long long unique_rectangles_checked;   // how many unique rectangles were checked
     long long unique_rectangles_avoided;   // how many unique rectangles were avoided
+    long long single_digit_placement_checks;  // how many checks of a single digits candidate placements?
+    long long single_digit_incompatibilities; // how many times found anything superfluous?
     long long fishes_detected;             // how many fishes were identified
     long long fishes_excluded;             // how many square fishes were found and excluded
     long long fishes_specials_detected;    // how many special fish patterns were identified ((subset of fishes_detected)
@@ -747,7 +1418,7 @@ public:
     long not_verified_count;               // puzzles non verified (with -v)
     long verified_count;                   // puzzles successfully verified (with -v)
     long no_bivals_count;                  // counts board states without bivalues
-inline Counters &operator += (Counters &a) {
+inline Counters &operator += (const Counters &a) {
     this->past_naked_count += a.past_naked_count;
     this->digits_entered_and_retracted += a.digits_entered_and_retracted;
     this->triads_resolved += a.triads_resolved;
@@ -756,6 +1427,8 @@ inline Counters &operator += (Counters &a) {
     this->naked_sets_found += a.naked_sets_found;  
     this->unique_rectangles_checked += a.unique_rectangles_checked;
     this->unique_rectangles_avoided += a.unique_rectangles_avoided;
+    this->single_digit_placement_checks += a.single_digit_placement_checks;
+    this->single_digit_incompatibilities += a.single_digit_incompatibilities;
     this->fishes_detected += a.fishes_detected;
     this->fishes_excluded += a.fishes_excluded;
     this->fishes_specials_detected += a.fishes_specials_detected;
@@ -844,8 +1517,13 @@ const unsigned char row_combos[3][2] = { {0,1}, {0,2}, {1,2} };
 
 #endif
 
+// wrapping index table for mode_dgt
+const unsigned char index_table_dgt[] = { 0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7 };
+
 bool bmi2_support = false;
 bool pext_support = false;
+
+bool do_pencilmarks = false;
 
 // stats and command line options
 int reportstats     = 0; // collect and report some statistics
@@ -855,6 +1533,7 @@ int debug           = 0; // provide step by step output on the solution
 int thorough_check  = 0; // check for back tracking even if no guess was made.
 int numthreads      = 0; // if not 0, number of threads
 int warnings        = 0; // display warnings
+int dgt_complexity_cutoff = 144; // tunable mode_dgt cutoff value (see complexity_cutoff_table)
 int report_guess_puzzles = 0; // display puzzles that did use guessing
 int report_noguess_puzzles = 0; // display puzzles that not use guessing
 
@@ -871,10 +1550,12 @@ typedef enum {
 Rules rules;
 
 // execution modes at runtime
+bool mode_dgt=false;            // 'X', see OPT_DGT
 bool mode_sets=false;           // 'S', see OPT_SETS
 bool mode_newsets=false;        // 'N', see OPT_NEWSETS
-bool mode_uqr=false;            // 'U', see OPT_UQR
 bool mode_fish=false;			// 'F', see OPT_FSH
+bool mode_uqr=false;            // 'U', see OPT_UQR
+bool dgt_tune_for_speed=true;   // limits each digit to one productive result
 
 signed char *output;	// used with the memory mapped output file
 
@@ -914,6 +1595,10 @@ inline void dump_m256i(__m256i x, const char *msg="", int filter=-1) {
 
 inline void dump_m256i_epi16(__m256i x, const char *msg="", int filter=-1) {
     dbgprintf(filter, "%s %x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x\n", msg, ((__v16hu)x)[0],((__v16hu)x)[1],((__v16hu)x)[2],((__v16hu)x)[3],((__v16hu)x)[4],((__v16hu)x)[5],((__v16hu)x)[6],((__v16hu)x)[7], ((__v16hu)x)[8],((__v16hu)x)[9],((__v16hu)x)[10],((__v16hu)x)[11],((__v16hu)x)[12],((__v16hu)x)[13],((__v16hu)x)[14],((__v16hu)x)[15]);
+}
+
+inline void dump_m256i_epi8(__m256i x, const char *msg="", int filter=-1) {
+    dbgprintf(filter, "%s %x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x\n", msg, ((__v32qu)x)[0],((__v32qu)x)[1],((__v32qu)x)[2],((__v32qu)x)[3],((__v32qu)x)[4],((__v32qu)x)[5],((__v32qu)x)[6],((__v32qu)x)[7], ((__v32qu)x)[8],((__v32qu)x)[9],((__v32qu)x)[10],((__v32qu)x)[11],((__v32qu)x)[12],((__v32qu)x)[13],((__v32qu)x)[14],((__v32qu)x)[15]);
 }
 
 inline void dump_m128i_epi16(__m128i x, const char *msg="", int filter=-1) {
@@ -978,6 +1663,60 @@ inline void dump_bits(__uint128_t bits, const char *msg="", int filter=-1) {
         }
     }
 }
+
+int getPencilmarks(FILE *inf, char ** linep, unsigned short ** boardsp) {
+                const char *separators = " \t\n\r\"'*#,.-;:+|~";
+                bit128_t separator_ix {};
+                for (const char *x = separators; *x != 0; x++ ) {
+                    separator_ix.set_indexbit(*x-1);
+                }
+                size_t n;
+                size_t npuzzles = 0;
+                getdelim(linep, &n, '0', inf);
+                char *line = *linep;
+                unsigned short *boards = (unsigned short *)linep;
+                *boardsp = boards;
+
+                if ( line[n-1] == '0' ) {
+                    fprintf(stderr, "'0' is not allowed in pencilmark input\n");
+                    exit(0);
+                }
+                boards = (unsigned short *)line; // overwriting input as we go
+                char *pline = line;
+
+                while ( (long unsigned int)(pline - line) < (size_t)n ) {
+                    for (int group = 0; group < 81; group++ ) {
+                        while ( !isdigit(pline[0]) && (long unsigned int)(pline - line) < (size_t)n ) {
+                             // check for valid separator characters:
+                             if ( *pline && !separator_ix.check_indexbit(*pline-1) ) {
+                                 fprintf(stderr, "invalid separator: %c\n", *pline);
+                                 exit(0);
+                             }
+                             pline++;
+                        }
+                        char *startgrp = pline;
+                        boards[group] = 0;
+                        while ( isdigit(pline[0]) && (long unsigned int)(pline - line) < (size_t)n ) {
+                             boards[group] |= 1<<(pline[0] - '1');
+                             pline++;
+                        }
+                        char *endgrp = pline;
+                        if ( endgrp - startgrp > 9 ) {
+                            fprintf(stderr, "nine digits at most allowed in group of digits\n");
+                            exit(0);
+                        }
+                    }
+                    while ( *pline != '\n' && (long unsigned int)(pline - line) < (size_t)n ) {
+                        pline++;
+                    }
+                    if ( (long unsigned int)(pline - line) == (size_t)n ) {
+                        break;
+                    }
+                    npuzzles++;
+                    boards += 81;
+                }
+                return npuzzles;
+            }
 
 inline unsigned char tzcnt_and_mask(unsigned long long &mask) {
     unsigned char ret = _tzcnt_u64(mask);
@@ -1145,6 +1884,11 @@ inline __m128i uncompress(__m128i in) {
 inline __m256i uncompress(__m256i in) {
         __m256i out =  _mm256_and_si256(mask_1ff,_mm256_unpacklo_epi16(in, _mm256_bsrli_epi128(in, 1)));
         return _mm256_and_si256(mask1ff, _mm256_mulhrs_epi16(out, hrs_shifts));
+}
+
+// unscramble a 'row' from its intermediate representation [ see get_boxes_as_cols ]
+inline __m256i unscramble(__m256i in) {
+   return _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(in, shuf), shuf8x32);
 }
 
 inline void format_candidate_set(char *ret, unsigned short candidates);
@@ -1364,6 +2108,7 @@ class
 alignas(64)
 TriadInfo {
 public:
+    unsigned short row_triads_canonical[32];  //  27 triads, linear in canonical order, no gaps
     unsigned short row_triads[36];            //  27 triads, in groups of 9 with a gap of 1
     unsigned short col_triads[36];            //  27 triads, in groups of 9 with a gap of 1
     unsigned short row_triads_wo_musts[36];   //  triads minus tmusts for guessing
@@ -1380,54 +2125,27 @@ private:
 public:
     FILE *outfile;
     Counters &counters;
-// Note that the candidate_bits_by_value also offers the opportunity to find hidden sets in rows (extensible)
-// Similar to fishes and naked sets, only those sets that are fully expressed for a digit
-// by all position bits will be found (all pairs will be found though).
-// To examplify the idea:
-// for ( unsigned char row=0; row<9; row++ ) {
-//     // candidate bits by position:
-//     cbbv_t cbbp_v;
-//     unsigned char off = 9*row;
-//     cbbp_v.m256 = _mm256_setr_epi16( candidate_bits_by_value[0]>>off,
-//                                      candidate_bits_by_value[1]>>off,
-//                                      candidate_bits_by_value[2]>>off,
-//                                      candidate_bits_by_value[3]>>off,
-//                                      candidate_bits_by_value[4]>>off,
-//                                      candidate_bits_by_value[5]>>off,
-//                                      candidate_bits_by_value[6]>>off,
-//                                      candidate_bits_by_value[7]>>off,
-//                                      candidate_bits_by_value[8]>>off,0,0,0,0,0,0,0,0));
-//
-//        iterate over the digit sets:
-//        for (unsigned char ds=0; ds<9; ds++) {
-//          // for the given digit, the count N for the tentative hidden set is: cnt.
-//          // take each digit set and compare to all other digits.
-//          //
-//          unsigned char cnt = short_popcnt16(cbbp_v.v16[ds]);
-//          if ( cnt <= 4 && cnt > 1) {
-//              __m256i dsv = _mm256_and_si256(_mm256_set1_epi16(cbbp_v.v16[ds]),mask9);
-//              // set of rows that are a subset of dsv
-//              __m256i issub_v = _mm256_cmpeq_epi16(dsv, _mm256_or_si256(dsv, cbbp_v.m256));
-//              unsigned short subs = 0x1ff & compress_epi16_boolean(issub_v);
-//              if ( short_popcnt16(subs) == cnt ) { // then issub_v / subs indicate the digits of the hidden subset
-//                                               // while cbbp_v.v16[ds] gives the indicess within the row
-//                  // the cleanup is very simple...
-//...
-//
-// for columns and boxes, the loading of cbbp_v would be more tedious...
-//
-// Note also that any cnt of 2 identifies a bi-local (i.e. strong link) for that row and digit.
-//
-public:
+    BandPlacements bandplacements[9];
     bool bivaluesValid;
     bool cbbvsValid;
     bool sectionSetUnlockedValid[3];
     __m256i *boxes_as_cols;   // stashed in the next grid_state
     TriadInfo triadInfo;
+    unsigned char  guess_hint_score=0;  // general score of this hint index
     unsigned char  guess_hint_index;
     unsigned short guess_hint_digit;
 
     inline SolverData(Counters &counters, FILE *outf): outfile(outf), counters(counters) {}
+
+    inline void reset() {
+        bivaluesValid = false;
+        cbbvsValid = false;
+        sectionSetUnlockedValid[0] = sectionSetUnlockedValid[1] = 
+                                     sectionSetUnlockedValid[2] = false;
+        guess_hint_digit = 0;
+        guess_hint_score = 0;
+        boxes_as_cols = 0;
+    }
 
     inline int printf ( const char * format, ... ) {
         va_list args;
@@ -1509,10 +2227,11 @@ public:
         return candidate_bits_by_value;
     }
 
-    // get_boxes_as_cols returns a tranposition of the candidates such that
+    // get_boxes_as_cols returns a permutation of the candidates such that
     // each box is represented as a column and each __m256i ('row') represents the same cell of the nine boxes.
     // This allows for example to count digits within a box, which in return allows
     // to identify hidden pairs within boxes.
+    template<bool unscramble>
     inline
     __m256i *get_boxes_as_cols(unsigned short *candidates, __m256i *p_boxes_as_cols) {
         if ( boxes_as_cols != 0 ) {
@@ -1574,7 +2293,7 @@ public:
         // --> [5,0], [5,3],  [5,6] - [5,1], [5,4], +[5,7]
         boxes_as_cols[5] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
 
-        // process row 2 of each band
+        // process row 3 of each band
         band2 = *(__m128i_u*)(inp+27+18);
         tmp_align2 = *(__m128i_u*)(inp+27+18+8);
         band1 = *(__m128i_u*)(inp+18);
@@ -1591,16 +2310,46 @@ public:
         // --> [8,0], [8,3], +[8,6] - [8,1], [8,4], +[8,7]
         boxes_as_cols[8] = _mm256_blend_epi16(_mm256_alignr_epi8(tmp_align,tmp_row,4),_mm256_zextsi128_si256(_mm_alignr_epi8(tmp_align2,band2,2)), 0x92);
 
-        boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
-        boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
-        boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
-        boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
-        boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
-        boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
-        boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
-        boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
-        boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        if ( unscramble ) {
+            boxes_as_cols[0] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[0], shuf), shuf8x32);
+            boxes_as_cols[1] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[1], shuf), shuf8x32);
+            boxes_as_cols[2] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[2], shuf), shuf8x32);
+            boxes_as_cols[3] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[3], shuf), shuf8x32);
+            boxes_as_cols[4] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[4], shuf), shuf8x32);
+            boxes_as_cols[5] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[5], shuf), shuf8x32);
+            boxes_as_cols[6] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[6], shuf), shuf8x32);
+            boxes_as_cols[7] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[7], shuf), shuf8x32);
+            boxes_as_cols[8] = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(boxes_as_cols[8], shuf), shuf8x32);
+        }
         return boxes_as_cols;
+    }
+
+    template<bool do_unscramble=false>
+    inline
+    __m256i get_column_bilocates(__m256i_u *candidates_cols) {
+        // fudged and sideways carry-save adder
+        __m256i accu[3];
+        __m256i tmp, cpairs;
+        __m256i carry = candidates_cols[1];
+        accu[0] = _mm256_xor_si256(candidates_cols[0], carry);
+        accu[1] = _mm256_and_si256(candidates_cols[0], carry);
+        accu[2] = _mm256_setzero_si256();
+        for (unsigned int i=2; i<9; i++ ) {
+           carry   = candidates_cols[i];
+           tmp     = _mm256_xor_si256(accu[0], carry);
+           carry   = _mm256_and_si256(accu[0], carry);
+           accu[0] = tmp;
+           tmp     = _mm256_xor_si256(accu[1], carry);
+           carry   = _mm256_and_si256(accu[1], carry);
+           accu[1] = tmp;
+           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
+        }
+        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+        if ( do_unscramble ) {
+            cpairs = unscramble(cpairs);
+        }
+
+        return _mm256_and_si256(cpairs, mask9x1ff);
     }
 
     template<Kind kind>
@@ -1624,8 +2373,8 @@ template <bool transposed=false>
 // base: the base (column indices) of the fish found
 // subs: the row indices for the grid
 // hassubs_prp_x: the row indices that intersect the base columns
-// clean_bits: all bits of digits to be cleaned
-// dgt_bits: all bits for the respective digit (same but different presentation as cbbv_v)
+// clean_bits: all bits of digits to be cleaned (X)
+// dgt_bits: all bits for the respective digit (o) (same but different presentation as cbbv_v)
 //
 inline void show_fish(cbbv_t &cbbv, unsigned short base, unsigned short subs, unsigned short hassubs, bit128_t &clean_bits, bit128_t &dgt_bits, SolverData &solverData, const char *msg="") {
     solverData.printf("%s:\n", msg);
@@ -1652,8 +2401,8 @@ template <bool transposed=false>
 // parameters:
 // cbbv_v: the bits for the respective digit
 // subs: the row indices for the grid
-// fins/fincnt: the fins and their number
-// clean_bits: all bits of digits to be cleaned
+// fins/fincnt: the fins and their number (@)
+// clean_bits: all bits of digits to be cleaned (X)
 // dgt_bits: all bits for the respective digit (same but different presentation as cbbv_v)
 //
 inline void show_fish(cbbv_t &cbbv, unsigned short subs, unsigned char fincnt, unsigned char *fins, bit128_t &clean_bits, bit128_t &dgt_bits, SolverData &solverData, const char *msg="") {
@@ -1678,6 +2427,30 @@ inline void show_fish(cbbv_t &cbbv, unsigned short subs, unsigned char fincnt, u
             } else {
                 solverData.printf(dgt_bits.check_indexbit(i_)? ".":"-");
             }
+        }
+        if ( i_%9 == 8 ) {
+            solverData.printf("\n");
+        } else if ( i_%3 == 2 ) {
+            solverData.printf(" ");
+        }
+    }
+}
+#endif
+
+#ifdef OPT_DGT
+// parameters:
+// dgt_bits: all bits for the respective digit (o)
+// cleaned_bits: all bits for the respective digit being cleaned (X)
+//
+inline void show_dgt_placement(bit128_t &dgt_bits, bit128_t &cleaned_bits, SolverData &solverData, const char *msg="") {
+    solverData.printf("%s:\n", msg);
+    for ( int i_=0; i_<81; i_++ ) {
+        if ( cleaned_bits.check_indexbit(i_) ) {
+            solverData.printf("X");
+        } else if ( dgt_bits.check_indexbit(i_) ) {
+            solverData.printf("o");
+        } else {
+            solverData.printf("-");
         }
         if ( i_%9 == 8 ) {
             solverData.printf("\n");
@@ -1715,6 +2488,9 @@ public:
                                       // aligned on 16 bytes
     bit128_t unlocked;                // for keeping track of which cells still need to be resolved. Set bits correspond to cells that still have multiple possibilities
     bit128_t updated;                 // for keeping track of which cell's candidates may have been changed since last time we looked for naked sets. Set bits correspond to changed candidates in these cells
+                                      // 'updated' contains 'hidden' 9 bits at offset 96 to indicate
+                                      // that the general digit algorithm has run on that digit,
+                                      // and won't need to be run again to achieve maximum performance.
     bit128_t set23_found[3];          // for keeping track of found sets of size 2 and 3
 
 // GridState is normally copied for recursion
@@ -1745,7 +2521,8 @@ inline void initialize(char gridin[81], Counters &counters) {
 
     bit128_t locked = { .u128 = ~unlocked.u128 };
     locked.u64[1] &= 0x1ffff;
-    // count preset candidates
+
+    // update global preset count
     if ( verbose != VNone ) {
         counters.preset_count += locked.popcount();
     }
@@ -1801,12 +2578,42 @@ inline void initialize(char gridin[81], Counters &counters) {
 
 }
 
+// the following flavor of initialize accepts a populated board (e.g. from pencilmarks)
+template<Verbosity verbose>
+inline void initialize(unsigned short board[81], Counters &counters) {
+    flags = 0;
+
+    triads_unlocked[0] = triads_unlocked[1] = 0x1ffLL | (0x1ffLL<<10) | (0x1ffLL<<20);
+    set23_found[0] = set23_found[1] = set23_found[2] = {__int128 {0}};
+
+    // set this.unlocked
+    unlocked.u128 = mask_81bit;
+
+    // treat single candidates as presets
+    for ( int i=0; i<81; i++ ) {
+        if ( __builtin_popcount(board[i])==1 ) {
+            unlocked.unset_indexbit(i);
+        }
+    }
+    updated = unlocked;
+
+    bit128_t locked = { .u128 = ~unlocked.u128 };
+    locked.u64[1] &= 0x1ffff;
+
+    // update global preset count
+    if ( verbose != VNone ) {
+        counters.preset_count += locked.popcount();
+    }
+    memcpy(candidates, board, 81*sizeof(unsigned short));
+}
+
 // Normally digits are entered by a 'goto enter;'.
 // enter_digit is not used in that case.
 // Only make_guess uses this member function.
+
 protected:
 template<Verbosity verbose=VNone>
-inline __attribute__((always_inline)) void enter_digit( unsigned short digit, unsigned char i, FILE *outfile) {
+inline __attribute__((always_inline)) void enter_digit( unsigned short digit, unsigned int i, FILE *outfile) {
     // lock this cell and and remove this digit from the candidates in this row, column and box
 
     bit128_t to_update;
@@ -1846,6 +2653,25 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
 }
 
 public:
+// this method removes candidates from the board according to a specified location pattern.
+template<bool remove=true>
+inline void mask_candidates(bit128_t &to_update, unsigned short vmask) {
+    __m256i mask = _mm256_set1_epi16(remove?~vmask:vmask);
+    to_update.u128 = to_update & unlocked;
+    for (unsigned char j = 0; j < 80; j += 16) {
+        unsigned short m = to_update.u16[j>>4];
+        __m256i c = _mm256_load_si256((__m256i*) &candidates[j]);
+        // expand ~m (locked) to boolean vector
+        __m256i mlocked = expand_bitvector(~m);
+        // apply mask (remove bit), preserving the locked cells
+        c = and_unless(c, mask, mlocked);
+        _mm256_store_si256((__m256i*) &candidates[j], c);
+    }
+    if ( to_update.check_indexbit(80) ) {
+        candidates[80] &= remove?~vmask:vmask;
+    }
+}
+
 // this form of make_guess establishes a 'contract' between the caller's lambda
 // and the creation of the new GridState.
 // Due to its overhead, it is not the fastest, but the most flexible form to make a guess.
@@ -1940,8 +2766,7 @@ inline GridState* make_guess(SolverData *solverData) {
         while (totest) {
             int ti = tzcnt_and_mask(totest);
             int can_ti = ti-ti/10;   // 'canonical' triad index
-            unsigned short altpair = wo_musts[ti];
-            if ( short_popcnt16 (altpair) == 2 ) {
+            if ( short_popcnt16 (wo_musts[ti]) == 2 ) {
                 // get and check the unlocked indexbits for the triad
                 unsigned int b;
                 if ( type == 0 ) {
@@ -1959,11 +2784,6 @@ inline GridState* make_guess(SolverData *solverData) {
                 goto found;
             }
         }
-    }
-
-    // leverage any guess hints (e.g. by the fish algorithm)
-    if ( solverData->guess_hint_digit != 0 ) {
-        return make_guess<verbose>(solverData->guess_hint_index, solverData->guess_hint_digit, solverData->counters, solverData->outfile);
     }
 
     // if no suitable triad found, find a suitable bi-value.
@@ -2062,14 +2882,20 @@ inline GridState* make_guess(SolverData &solverData) {
     unsigned short best_digit = 0;
     unsigned long long bivals = bivalues.u64[t];
 
+    // leverage any guess hints (e.g. by the digit placement algorithm)
+    if ( solverData.guess_hint_digit != 0 ) {
+        return make_guess<verbose>(solverData.guess_hint_index, solverData.guess_hint_digit, solverData.counters, solverData.outfile);
+    }
+
     if ( bivals ) {
         unsigned char cnt = 0;
         best_score = -1;
+        short score = 0;
         while ( bivals ) {
             unsigned char search_index = tzcnt_and_mask(bivals) + (t<<6);
             bit128_t bv2 = { .u128= bivalues & *(bit128_t*)&big_index_lut[search_index][All][0] };
             search_digit = 0;
-            short score = 0;
+            score = 0;
             cands = candidates[search_index];
             bool malus = false;
             while ( bv2 ) {
@@ -2111,37 +2937,14 @@ inline GridState* make_guess(SolverData &solverData) {
         return make_guess<verbose>(guess_index, digit, counters, outfile);
     }
 
-    // Trivalue scoring
-    //
-    // very unlikely except for very hard puzzles while under 27 cells solved.
-    // a puzzle with no bivalues is always hard - extra effort and solving algos are
-    // appropriate.
-    //
     if ( verbose != VNone ) {
         counters.no_bivals_count++;
     }
 
-    __m256i *boxes_as_cols = solverData.get_boxes_as_cols(candidates, (__m256i*)(this+1));
-
     {
-        // fudged and sideways carry-save adder
-        __m256i accu[3];
-        __m256i tmp, cpairs;
-        __m256i carry = boxes_as_cols[1];
-        accu[0] = _mm256_xor_si256(boxes_as_cols[0], carry);
-        accu[1] = _mm256_and_si256(boxes_as_cols[0], carry);
-        accu[2] = _mm256_setzero_si256();
-        for (unsigned int i=2; i<9; i++ ) {
-           carry   = boxes_as_cols[i];
-           tmp     = _mm256_xor_si256(accu[0], carry);
-           carry   = _mm256_and_si256(accu[0], carry);
-           accu[0] = tmp;
-           tmp     = _mm256_xor_si256(accu[1], carry);
-           carry   = _mm256_and_si256(accu[1], carry);
-           accu[1] = tmp;
-           accu[2] = _mm256_or_si256(carry, accu[2]);  // value > 2
-        }
-        cpairs = _mm256_andnot_si256(accu[2],_mm256_andnot_si256(accu[0],accu[1]));
+        __m256i *boxes_as_cols = solverData.get_boxes_as_cols<false>(candidates, (__m256i*)(this+1));
+
+        __m256i cpairs = solverData.get_column_bilocates<true>(boxes_as_cols);
 
         if ( !_mm256_testz_si256 ( cpairs, cpairs) ) {
             // cpairs contains, for each box, the digits that are conjugate pairs
@@ -2179,8 +2982,7 @@ inline GridState* make_guess(SolverData &solverData) {
                     // check for hidden pair
                     if ( mskByStart[lpos1] == mskpos ) {
                         // this is a hidden pair, simply guess dgti in pos1
-                        // this will resolve at minimum 2 cells;
-                        // make a guess right away
+                        // this will resolve at minimum 2 cells
                         unsigned short cands = dgtByStart[lpos1] | dgt; 
                         candidates[score_index+pos1] &= cands;
                         candidates[score_index+pos2] &= cands;
@@ -2230,7 +3032,12 @@ inline GridState* make_guess(SolverData &solverData) {
         }
     }
 
-    // find a trivalue cell if nothing else helps.
+    // Trivalue scoring
+    //
+    // very unlikely except for very hard puzzles while under 27 cells solved.
+    // a puzzle with no bivalues is always hard - extra effort and solving algos are
+    // appropriate.
+    //
 
     unsigned char cnt;
     unsigned char best_cnt = 16;
@@ -2369,6 +3176,10 @@ Status solve(char gridin[81], char gridout[81], GridState stack[], int line, Cou
     unsigned char last_band_uqr = 0;
 #endif
 
+#ifdef OPT_DGT
+    unsigned int next_dgt = 0;
+#endif
+
     unsigned short last_entered_count_col_triads = 0;
 
     int unique_check_mode = 0;
@@ -2445,7 +3256,7 @@ back:
     if ( verbose != VNone && reportstats ) {
         counters.digits_entered_and_retracted +=
             (_popcnt64((grid_state-1)->unlocked.u64[0] & ~grid_state->unlocked.u64[0]))
-          + (_popcnt32((grid_state-1)->unlocked.u64[1] & ~grid_state->unlocked.u64[1]));
+          + (_popcnt32((grid_state-1)->unlocked.u32[2] & ~grid_state->unlocked.u32[2]));
     }
 
     // Go back to the state when the last guess was made
@@ -2462,6 +3273,10 @@ back:
 start:
 
     e_digit = 0;
+
+#ifdef OPT_DGT
+    next_dgt = 0;
+#endif
 
     // at start, set everything that depends on grid_state:
     check_back = grid_state->stackpointer || thorough_check || rules != Regular || unique_check_mode;
@@ -2641,7 +3456,7 @@ enter:
     // its uniqueness, if requested.
     //
     // Check if it's solved, if it ever gets solved it will be solved after looking for naked singles
-    if ( *(__uint128_t*)unlocked == 0) {
+    if ( ((*(__uint128_t*)unlocked) & mask_81bit) == 0) {
         bool verify_one = false;
         // Solved it
         if ( rules == Multiple && (unique_check_mode == 1 || grid_state->flags < 0) ) {
@@ -2706,7 +3521,7 @@ enter:
                     solverData.printf("Solution found and verified\n");
                 }
                 status.verified = true;
-                if ( reportstats ) {
+                if ( verbose != VNone && reportstats ) {
                     if ( unique_check_mode == 0 ) {
                         counters.verified_count++;
                     }
@@ -2768,12 +3583,7 @@ enter:
 
 hidden_search:
     // reset solverData
-    solverData.bivaluesValid = false;
-    solverData.cbbvsValid = false;
-    solverData.sectionSetUnlockedValid[0] = solverData.sectionSetUnlockedValid[1] = 
-                                            solverData.sectionSetUnlockedValid[2] = false;
-    solverData.guess_hint_digit = 0;
-    solverData.boxes_as_cols = 0;
+    solverData.reset();
 
     // Algorithm 2 - Find hidden singles
     // For all sections (ie. rows/columns/boxes):
@@ -2794,21 +3604,13 @@ hidden_search:
     // - andnot with 0x1ff and then check all non-zero results to be singletons, or otherwise
     //   back track.
     //
-    // Combine 8 cells from 2 rows into one __m256i vector. (9th row: use __m128i vector)
-    // Rotate and or until each vector element represents 7 cells or'ed (except the cell
-    // directly corresponding to its position, containing the hidden single if there is one).
-    // Broadcast the nineth cell and or it for good measure, then andnot with 0x1ff
-    // to isolate the hidden singles.
-    // For the nineth cell, rotate and or one last time and use just one element of the result
-    // to check the nineth cell for a hidden single.  These are grouped together and then checked.
+    // All this could be applied similarly to rows and boxes.
+    // But, after a bit of discovering and checking, it turns out to be more efficient
+    // not to examine rows and boxes for hidden singles.
+    // This sounds odd, but by slightly more frequently using the (locked set elimination)
+    // triad checking, we can forgo the effort to examine rows and boxes for hidden singles.
     //
-    // For boxes, loading of the data is the most expensive.
-    // Either the 'column' approach or the 'row' approach will work.
-    // However, box hidden single search can just be eliminated, an the triad processing
-    // will just eliminate all column/row-based occurrances of the single outside of the box.
-    // This way, the expensive loading of the boxes is eliminated.
-    //
-    // All checks use compression to a bit vector
+    // The only remnant of the rows checking is the creation of the row triad information.
     //
     // Algorithm 3
     // Definition: An intersection of row/box and col/box consisting of three cells
@@ -2830,7 +3632,7 @@ hidden_search:
     // The collection of the triads data (Algorithm 3 Part 1) is intermingled with
     // that of algorithm 2 for speed.
     // Part 2 of Algorithm 3 allows to detect all fully resolved triads (sets).
-    // Note that this is not normally part of the locked set solution strategy.
+    // Note that this is not normally part of the locked set solving strategy.
     // Part 3 of Algorithm 3 allows to determine which candidate value can only occur
     // in a specific triad and not in the other triads of the row/column and box.
     // Terminology:
@@ -2848,7 +3650,7 @@ hidden_search:
     // peered with two triads of  the same row and with two triads of the same box,
     // - If a given candidate value does not occur in either of the peer pairs (peer-mustnt),
     //   this triad must contain that candidate value (must).
-    // - Any candidate only occurring in a a triad (must) because if doesn't occur in
+    // - Any candidate only occurring in a triad (must) because it doesn't occur in
     //   either its box peers or its row/column peers cannot occur in any of the pair of peers.
     // - Since 3 is the upper limit of must candidates, once these three are known from
     //   part 2 of the algorithm, these become the fixed 'must' set for the triad.
@@ -2858,11 +3660,21 @@ hidden_search:
     // pairs of peer-mustnt (horizontally and vertically) and join the two results.
     // This is then a "must" of the given triad, and augmented by the must if the triad is resolved.
     // Using the peers musts, their union is a "must not" for the given triad.
-    // By joining it to the orginal "must not" we obtain an equal or super set for the new "must not".
+    // By joining it to the orginal "must not" we obtain an equal or super set for the new "must".
     // This "must not" in turn can then be be applied to remove the excessive candidates from
     // the triad.
     //
+    // Yet another side advantage is the ability to take note of triads with 2 musts and
+    // 4 candidates. These represent a valuable guessing strategy and can also be used as
+    // search targets for naked sets.
+    // 
     // These computations are easily implemented as SIMD operations.
+    //
+    // One more bit of information how important triads are in Sudoku:
+    // A band contains nine triads, that are, as we have seen already interdependant with
+    // respect to locked candidates.  These nine triads can later be used to determine
+    // the possible placement of candidates of a single digit and allow for eliminations
+    // for that digit's candidates.
     //
     // To recap: parts 1 - 3 of Algorithm 3 are fast and effective - especially if the
     // hidden single search is leveraged for the initial union of the triads' candidates.
@@ -2876,7 +3688,12 @@ hidden_search:
     //   18, 19, 20, 21, 22, 23, 24, 25, 26
     //  
     // row_triads are canonically naturally numbered 0, 1, 2, for the first row, 3, 4, 5 for the second
-    // and so on.  These are stored in three arrays of 10 ushort, captured 3 per row,
+    // and so on.  Row triads are stored in 2 different forms.
+    // The first form is linear in canonical order (TriadInfo.row_triads_canonical)
+    //    0,  1,  2,  3,  4,  5,  6,  7,  8,
+    //    9, 10, 11, 12, 13, 14, 15, 16, 17,
+    //   18, 19, 20, 21, 22, 23, 24, 25, 26
+    // The second form (TriadInfo.row/col_triads) consists of three arrays of 10 ushort, captured 3 per row,
     // 3 rows stacked vertically with the subsequent 3 rows offset by 3:
     //    0,  1,  2,  9, 10, 11, 18, 19, 20, -
     //    3,  4,  5, 12, 13, 14, 21, 22, 23, -
@@ -2885,11 +3702,12 @@ hidden_search:
     // 3 horizontal triads side by side and 3 vertical triads in the same positions
     // of the two other rows.  The ordering described above satisfies this requirement.
     //
-    // For technical reasons, an (unused) 10th triad is injected between each set of 9 triads
+    // For technical reasons, an (unused) 10th ushort value is injected between each set of 9 triads
     // for a total of 29 triad values.
     //
-    // various methods are used to efficiently save the triads in the processing order,
+    // Various methods are used to efficiently save the triads in the processing order,
     // which go beyond the end of the arrays normally needed.
+    //
 
     TriadInfo &triad_info = solverData.triadInfo;
 
@@ -2998,37 +3816,9 @@ hidden_search:
 
         // rows
         //
-        // The grid is processed as indicated by the keys below:
-        // P1 P1 P1 P1 P1 P1 P1 P1 C9
-        // P1 P1 P1 P1 P1 P1 P1 P1 C9
-        // P2 P2 P2 P2 P2 P2 P2 P2 C9
-        // P2 P2 P2 P2 P2 P2 P2 P2 C9
-        // P3 P3 P3 P3 P2 P3 P3 P3 C9
-        // P3 P3 P3 P3 P4 P3 P3 P3 C9
-        // P4 P4 P4 P4 P4 P4 P4 P4 C9
-        // P4 P4 P4 P4 P4 P4 P4 P4 C9
-        // R9 R9 R9 R9 R9 R9 R9 R9 C9
+        // capture row-based triad values only
 
-        // Px: processed in pairs of rows, for their first 8 cells
-        // C9: the 9th cell of each of the rows is prepared
-        //     and stored in row_9th_cand_vert.  row_9th_cand_vert is then processed at the end.
-        // R9: is processed for 8 cells
-
-        // The examination of each row and its cells is made up of three steps:
-        // 1 - or the other values of the row
-        // 2 - check that the row or box contains all digits
-        // 3 - check negated or'ed value for non-zero candidates.
-        //     if there are multiple candidates, back track,
-        //     enter any valid singletons found
-
-        // row_9th_cand_vert cumulates the 9th row or'ed singleton candidates
-        // which are processed in the end.
-#if USE_ROW_HIDDEN_SEARCH
-        v16us row_9th_cand_vert;
-#endif
         unsigned char irow = 0;
-
-        // find hidden singles in rows
 
         for (unsigned char i = 0; i < 72; i += 18, irow+=2) {
             // rows, in pairs
@@ -3039,9 +3829,6 @@ hidden_search:
             unsigned short the9thcand_row[2] = { candidates[i+8], candidates[i+17] };
 
             __m256i row_or7 = _mm256_setzero_si256();
-#if USE_ROW_HIDDEN_SEARCH
-            __m256i row_or8;
-#endif
             __m256i row_9th = _mm256_set_m128i(_mm_set1_epi16(the9thcand_row[1]),_mm_set1_epi16(the9thcand_row[0]));
 
             __m256i row_triad_capture[2];
@@ -3057,76 +3844,13 @@ hidden_search:
                 // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
                 c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
                 row_or7 = _mm256_or_si256(c1_, row_or7);
-                // triad capture: after 2 rounds, row triad 3 of this row saved in pos 5
+                // triad capture: after 2 rounds and oring in the 9th element, row triad 3 of this row saved in pos 5
                 row_triad_capture[0] = _mm256_or_si256(row_or7, row_9th);
                 // step j=2
                 // rotate (2 3 4 5 6 7 0 1) -> (3 4 5 6 7 0 1 2)
                 c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
                 // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
                 row_triad_capture[1] = row_or7 = _mm256_or_si256(c1_, row_or7);
-
-#if USE_ROW_HIDDEN_SEARCH
-                // continue the rotate/or routine for this row
-                for (unsigned char j = 3; j < 7; ++j) {
-                    // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
-                    // c1_ holds 2 lanes for two rows
-                    c1_ = _mm256_alignr_epi8(c1_, c1_, 2);
-                    row_or7 = _mm256_or_si256(c1_, row_or7);
-                }
-
-                row_or8 = _mm256_or_si256(c1, row_or7);
-                // test row_or8 to hold all the digits
-                if ( check_back ) {
-                    if ( !_mm256_testz_si256(mask1ff,_mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff))) {
-                        // the current grid has no solution, go back
-                        if ( verbose != VNone ) {
-                            __m256i missing = _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or8), mask1ff);
-                            unsigned int m = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_setzero_si256(),
-                                                                  missing));
-                            unsigned short digit = ((v16us)missing)[(m & 0xffff)?8:0];
-
-                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                if ( warnings != 0 ) {
-                                    solverData.printf("Line %d: stack 0, back track - row %d does not contain digit %d\n", line, irow+(m & 0xffff)?0:1, __tzcnt_u16(digit)+1);
-                                }
-                            } else if ( debug ) {
-                                solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, irow+((m & 0xffff)?1:0)); // XXX
-                            }
-                        }
-                        goto back;
-                    }
-                }
-            }
-            // hidden singles in row
-            __m256i row_mask = _mm256_andnot_si256(_mm256_or_si256(row_9th, row_or7), mask1ff);
-            {
-                // check row (8) candidates
-                unsigned short m1 = grid_state->unlocked.get_indexbits(i, 8) | (grid_state->unlocked.get_indexbits(i+9, 8)<<8);
-                __m256i a1 = _mm256_cmpgt_epi16(row_mask, _mm256_setzero_si256());
-
-                unsigned int mask1 = and_compress_masks<false>(a1, m1);
-                if (mask1) {
-                    int idx = __tzcnt_u32(mask1);
-                    int idx_ = idx + ((mask1 & 0xff)?0:1);
-                    e_i = i + idx_;
-                    e_digit = ((v16us)row_mask)[idx];
-                    if ( short_popcnt16(e_digit) == 1 ) {
-                        if ( verbose == VDebug ) {
-                            solverData.printf("hidden single (row)");
-                        }
-                        goto enter;
-                    }
-                    if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                        if ( warnings != 0 ) {
-                            solverData.printf("Line %d: stack 0, back track - %s cell %s does contain multiple hidden singles\n", line, mask1?"row":"box", cl2txt[e_i]);
-                        }
-                    } else if ( debug ) {
-                        solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[e_i]);
-                    }
-                    e_digit = 0;
-                    goto back;
-                }
-#endif
             }
             // deal with saved row_triad_capture:
             // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
@@ -3139,11 +3863,9 @@ hidden_search:
             row_triad_capture[0] = _mm256_shuffle_epi8(_mm256_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),shuff725to012);
             _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow]], _mm256_castsi256_si128(row_triad_capture[0]));
             _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[irow+1]], _mm256_extracti128_si256(row_triad_capture[0],1));
-
-#if USE_ROW_HIDDEN_SEARCH
-            row_9th_cand_vert[irow]     = ~((v16us)row_or8)[0] & the9thcand_row[0];
-            row_9th_cand_vert[irow+1]   = ~((v16us)row_or8)[8] & the9thcand_row[1];
-#endif
+            // the following 2 lines are only useful with mode_dgt
+            _mm_storeu_si64(&triad_info.row_triads_canonical[irow*3], _mm256_castsi256_si128(row_triad_capture[0]));
+            _mm_storeu_si64(&triad_info.row_triads_canonical[(irow+1)*3], _mm256_extracti128_si256(row_triad_capture[0],1));
         }   // for row Px
 
         // 9th row
@@ -3152,10 +3874,7 @@ hidden_search:
 
             unsigned short the9thcand_row = candidates[80];
 
-            __m128i row_or7 = _mm_setzero_si128();
-#if USE_ROW_HIDDEN_SEARCH
-            __m128i row_or8;
-#endif
+            __m128i row_or7;
             __m128i row_9th_elem = _mm_set1_epi16(the9thcand_row);
 
             __m128i row_triad_capture[2];
@@ -3166,7 +3885,7 @@ hidden_search:
                 // step j=0
                 // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
                 c_ = _mm_alignr_epi8(c_, c_, 2);
-                row_or7 = _mm_or_si128(c_, row_or7);
+                row_or7 = c_;
                 // step j=1
                 // rotate (1 2 3 4 5 6 7 0) -> (2 3 4 5 6 7 0 1)
                 c_ = _mm_alignr_epi8(c_, c_, 2);
@@ -3178,67 +3897,6 @@ hidden_search:
                 c_ = _mm_alignr_epi8(c_, c_, 2);
                 // triad capture: after 3 rounds 2 row triads 0 and 1 in pos 7 and 2
                 row_triad_capture[1] = row_or7 = _mm_or_si128(c_, row_or7);
-#if USE_ROW_HIDDEN_SEARCH
-                // continue the rotate/or routine for this row
-                for (unsigned char j = 3; j < 7; ++j) {
-                    // rotate (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
-                    c_ = _mm_alignr_epi8(c_, c_, 2);
-                    row_or7 = _mm_or_si128(c_, row_or7);
-                }
-
-                row_or8 = _mm_or_si128(c, row_or7);
-                // test row_or8 | row_9th_elem to hold all the digits
-                if ( check_back ) {
-                    if ( !_mm_testz_si128(_mm256_castsi256_si128(mask1ff),_mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff)))) {
-                        // the current grid has no solution, go back
-                        if ( verbose != VNone ) {
-                            __m128i missing = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or8), _mm256_castsi256_si128(mask1ff));
-                            unsigned short digit = ((v8us)missing)[0];
-                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                if ( warnings != 0 ) {
-                                    solverData.printf("Line %d: stack 0, back track - row %d misses digit %d\n", line, 8, __tzcnt_u16(digit)+1);
-                                }
-                            } else if ( debug ) {
-                                solverData.printf("back track - missing digit %d in row %d\n", __tzcnt_u16(digit)+1, 8);
-                            }
-                        }
-                        goto back;
-                    }
-                }
-            }
-
-            // hidden singles in row 9
-            __m128i row_mask = _mm_andnot_si128(_mm_or_si128(row_9th_elem, row_or7), _mm256_castsi256_si128(mask1ff));
-            {
-                // check row (8) candidates
-
-                __m128i a = _mm_cmpgt_epi16(row_mask, _mm_setzero_si128());
-                unsigned short mask = compress_epi16_boolean128<false>(a) & grid_state->unlocked.get_indexbits(72, 8);
-                if (mask) {
-                    int s_idx = __tzcnt_u32(mask);
-                    e_i = 72 + s_idx;
-                    e_digit = ((v8us)row_mask)[s_idx];
-                    // Check that the single is indeed a single
-                    if ( short_popcnt16(e_digit) == 1 ) {
-                        if ( verbose == VDebug ) {
-                            solverData.printf("hidden single (row)");
-                        }
-                        goto enter;
-                    } else {
-                        if ( verbose != VNone ) {
-                            if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                                if ( warnings != 0 ) {
-                                    solverData.printf("Line %d: stack 0, back track - row cell %s does contain multiple hidden singles\n", line, cl2txt[e_i]);
-                                }
-                            } else if ( debug ) {
-                                solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[e_i]);
-                            }
-                        }
-                        e_digit = 0;
-                        goto back;
-                    }
-                }
-#endif
             } // row
             // deal with saved row_triad_capture:
             // - captured triad 3 of this row saved in pos 5 of row_triad_capture[0]
@@ -3250,45 +3908,10 @@ hidden_search:
             // (or is written into the gap 10th slot).
             row_triad_capture[0] = _mm_shuffle_epi8(_mm_blend_epi16(row_triad_capture[1], row_triad_capture[0], 0x20),_mm256_castsi256_si128(shuff725to012));
             _mm_storeu_si64(&triad_info.row_triads[row_triads_lut[8]], row_triad_capture[0]);
-
-#if USE_ROW_HIDDEN_SEARCH
-            row_9th_cand_vert[8]     = ~((v8us)row_or8)[0] & the9thcand_row;
-#endif
+            // the following line is only useful with mode_dgt
+            _mm_storeu_si64(&triad_info.row_triads_canonical[8*3], row_triad_capture[0]);
         } // row R9
-#if USE_ROW_HIDDEN_SEARCH
-        // check saved row singleton candidates (9th column)
 
-        unsigned int mask = _mm256_movemask_epi8(_mm256_cmpgt_epi16((__m256i)row_9th_cand_vert, _mm256_setzero_si256())) & 0x3ffff;
-        while (mask) {
-            int s_idx = __tzcnt_u32(mask) >> 1;
-            unsigned char celli = s_idx*9+8;
-            unsigned short cand = row_9th_cand_vert[s_idx];
-            if ( ((bit128_t*)unlocked)->check_indexbit(celli) ) {
-                // check for a single.
-                // This is rare as it can only occur when a wrong guess was made.
-                // the current grid has no solution, go back
-                if ( check_back && cand & (cand-1) ) {
-                    if ( verbose != VNone ) {
-                        if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
-                            if ( warnings != 0 ) {
-                                solverData.printf("Line %d: stack 0, multiple hidden singles in row cell %s\n", line, cl2txt[celli]);
-                            }
-                        } else if ( debug ) {
-                            solverData.printf("back track - multiple hidden singles in row cell %s\n", cl2txt[celli]);
-                        }
-                    }
-                    goto back;
-                }
-                if ( verbose == VDebug ) {
-                    solverData.printf("hidden single (row)");
-                }
-                e_i = celli;
-                e_digit = cand;
-                goto enter;
-            }
-            mask &= ~(3<<(s_idx<<1));
-        }
-#endif
         // Store all column triads sequentially, paying attention to overlap.
         //
         // A3.1.c
@@ -3311,6 +3934,7 @@ hidden_search:
         __m256i hi1 = _mm256_and_si256 (_mm256_srli_epi16 (v1, 4), nibble_mask );
         __m256i cnt11 = _mm256_shuffle_epi8 (lookup, lo1);
         cnt11 = _mm256_add_epi8(_mm256_add_epi8 (cnt11, _mm256_shuffle_epi8 (lookup, hi1)), v9);
+        // the result of the popcnt
         __m256i res = _mm256_and_si256(_mm256_permute4x64_epi64(cnt11, 0xD8), mask27);
 
         // do this only if unlocked has been updated:
@@ -3336,15 +3960,15 @@ hidden_search:
         }
         while (m) {
             unsigned char tidx = tzcnt_and_mask(m);
+            unsigned char off  = tidx/10*3*9+tidx%10;
             unsigned short cands_triad = triad_info.col_triads[tidx];
             if ( verbose == VDebug ) {
                 char ret[32];
                 format_candidate_set(ret, cands_triad);
-                solverData.printf("triad set (col): %-9s %s\n", ret, cl2txt[tidx/10*3*9+tidx%10]);
+                solverData.printf("triad set (col): %-9s %s\n", ret, cl2txt[off]);
             }
             // mask off resolved triad:
             bittestandreset(grid_state->triads_unlocked[Col], tidx);
-            unsigned char off = tidx%10+tidx/10*27;
             grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
             grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
         }
@@ -3626,13 +4250,15 @@ hidden_search:
                     // 3. for columns, track resolved triads
                     unsigned char i_rel = tzcnt_and_mask(m);
                     unsigned char ltidx = i_rel + 9*i;  // logical triad index (within band, different layouts for row/col)
+                    ltidx = type? ltidx : row_triad_canonical_map[ltidx];
+
                     // compute bit offsets of the resolved triad
                     // and save the mask
                     if ( _popcnt32(((v16us)tmustnt[i])[i_rel]) == 6 ) {
                         if ( type == 0 ) {
-                            rslvd_row_combo_tpos[i_rel/3] |= bandbits_by_index[row_triad_canonical_map[ltidx]%9];
+                            rslvd_row_combo_tpos[i_rel/3] |= bandbits_by_index[ltidx%9];
                         } else {
-                            rslvd_col_combo_tpos |= 0x40201<<i_rel;
+                            rslvd_col_combo_tpos |= 0x40201<<(ltidx%9);
                         }
                         if ( verbose != VNone ) {
                             counters.triads_resolved++;
@@ -3642,7 +4268,7 @@ hidden_search:
                         char ret[32];
                         format_candidate_set(ret, ((v16us)to_remove_v)[i_rel]);
                         solverData.printf("remove %-5s from %s triad at %s\n", ret, type == 0? "row":"col",
-                               cl2txt[type==0?row_triad_canonical_map[ltidx]*3:col_canonical_triad_pos[ltidx]] );
+                              cl2txt[type==0?ltidx*3:col_canonical_triad_pos[ltidx]] );
                     }
                 }
                 if ( type == 1 ) {
@@ -3654,7 +4280,7 @@ hidden_search:
             }
             // finally, for rows only, track updated triad cells and resolved triads
             if ( type == 0 ) {
-                for ( unsigned char k=0; k<2; k++ ) {
+                for ( unsigned char k=0; k<3; k++ ) {
                     if ( row_combo_tpos[k] ) {
                         grid_state->updated.set_indexbits(row_combo_tpos[k], k*27, 27);
                     }
@@ -3715,7 +4341,7 @@ hidden_search:
                         solverData.printf("back track - found a bi-value universal grave.\n");
                     }
                     goto back;
-                } else {   // busted.  This is not a valid puzzle under standard rules.
+                } else {   // This is not a valid puzzle under standard rules.
                     if ( verbose == VDebug ) {
                         solverData.printf("Found a bi-value universal grave. This means at least two solutions exist.\n");
                     }
@@ -3759,7 +4385,7 @@ hidden_search:
                         counters.bug_plus1_count++;
                     }
                     if ( verbose == VDebug ) {
-                        solverData.printf("bi-value universal grave (BUG)+ 1: pivot:");
+                        solverData.printf("bi-value universal grave (BUG) +1: pivot:");
                     }
                     if ( rules == Regular ) {
                         e_i = target;
@@ -3779,8 +4405,329 @@ hidden_search:
         ;
     }
 
+#ifdef OPT_DGT
+
+/*
+ * Algorithm 4: Single Digit General Test (Ref: https://hodoku.sourceforge.net/en/tech_last.php#ts)
+ *
+ * Board states per digit
+ *
+ * A band of 3 boxes has (in the horizontal or vertical drection) exactly 6 possible
+ * placements (in terms of rows and boxes), with each placement 'somewhere' in its triad:
+ *
+ *  1  -  -   1 - -   - 1 -   - 1 -   - - 1   - - 1
+ *  -  1  -   - - 1   1 - -   - - 1   1 - -   - 1 -
+ *  -  -  1   - 1 -   - - 1   1 - -   - 1 -   1 - -
+ *
+ * We can take each 1/0 bit, and turn it into three bits for the possible positions in the triad.
+ *
+ * For the vertical band, the situation is exactly the same, imagine it mirrored
+ * on the top-left to bottom right diagonal.
+ *
+ * Back to the band:
+ * With 6 placements per band, the full board has 6x6x6 = 216 possible placements for
+ * for a digit in horizontal bands.
+ *
+ * Now overlay a given horizontal placement with a given vertical placement, expressed
+ * as full bit maps, and you have one precise and valid configuration for one digit.
+ *
+ * Therefore there are 216x216 = 46656 possible different placements (patterns).
+ *
+ * But it gets even better.  We can from the Sudoku map of candidates determine the
+ * variations of the 216 possible horizontal placements that might fit.
+ * That is a subset of X{216} bitmaps.
+ *
+ * And for the vertical case, we can do the same.  A subset of Y{216}.
+ *
+ * Then we iterate over both subsets to obtain X{216} x Y{216}, ie. the cross product
+ * of X and Y, that is the full set of all possible placements that can fit the given
+ * candidates.
+ *
+ * This is already very cool, since in the progress of a solution, X and Y shrink substantially
+ * over time, often to 24, 12, 8 or less.  We can choose when to strike! for a cross product of
+ * 144 or less possibilities.
+ *
+ * We then compare these 144 (or less) placement maps to check a few things:
+ * Is the placement map covered by the candidate/resolved bitmap for the digit?
+ * If not, discard that placement map.
+ * For all placement maps that fit, build their union bitmap.
+ * (if none fit, we know it's a backtrack situation)
+ * This union is then compared to the candidate bitmap and magically, all misfits
+ * in the candidate map are exposed as expandable.  So delete those.
+ *
+ * What is expected to be discarded in that manner? Every pattern that works on the digit
+ * bitmap only, i.e. fishes, finned and sashimi fishes, skyscrapers, two-string kites and
+ * cranes, empty rectangles, X-chains and sometimes simply fully resolving the placement
+ * pattern to that of the solution.
+ *
+ * So we put down the 216 horizontal and vertical placement maps and go find out
+ * for a given digit and its candidate bitmap, which maps apply.  Easy enough, but how
+ * EXACTLY does that work?  Another piece of magic is required, the lookup!
+ * If we start with giving the triads of a band a bit designation, we obtain nine bits.
+ * For these nine bits we can look up the required placements to cover it, as there are
+ * only nine bits of input for a set of 512 possible configurations.
+ * Most of these immediately reduce to a reduction of locked candidates, so that could
+ * ACTUALLY REPLACE the current triad processing for that purpose.
+ * (Note: this turns out to be just a bit slower than the current algorithm, which parallelizes
+ * the effort across all digits!)
+ *
+ * For example, the input of:
+ *   1 0 1                     1 0 0
+ *   0 1 1  can be reduced to: 0 0 1 
+ *   0 1 0                     0 1 0
+ * with the digit eliminated in the top right triad and the middle triad.
+ * The remaining input is already minimal, as it corresponds to exactly one possible config.
+ * More often, there will be something like:
+ *   1 0 0
+ *   0 1 1
+ *   0 1 1
+ * which corresponds to 2 possible placements (for each of the diagonals of the lower right
+ * quadrant of four triads:
+ *   1 0 0    1 0 0
+ *   0 1 0    0 0 1
+ *   0 0 1    0 1 0
+ * Rince and repeat for the next two bands for the full horizontal configurations.
+ * Rince and repeat for the vertical configuration.
+ * Last example:
+ * This Input
+ *   1 0 1
+ *   1 1 1
+ *   1 1 1
+ * is covered by the following four possible placements:
+ *   1 0 0    1 0 0    0 0 1     0 0 1
+ *   0 1 0    0 0 1    0 1 0 and 1 0 0
+ *   0 0 1    0 1 0    1 0 0     0 1 0
+ *
+ * This bitmap lookup serves to identify the applicable patterns.
+ *
+ * It is actually very easy to visually asses a Sudoku board with candidates for the
+ * possible placements and the combined complexity.
+ *
+ * The tables: h/v2/3bandplacement give us in combination all possible placements
+ * of 9 digits on the Sudoku Board that are valid in a Sudoku solution.
+ *
+ * The table bandredux for a given band and digit gives the information of which
+ * placement patterns are possible.
+ *
+ */
+
+    // This optimization limits the digit procession in two ways:
+    // allowing only one elimination per digit (for a total of 9)
+    // if the complexity cutoff is high, then disable the first constraint, as multiple
+    // eliminations become very likely.  modes d6, d7 and d8 are therefore increasingly costly.
+    if ( mode_dgt && !(dgt_tune_for_speed && (grid_state->unlocked.u32[3] == 0x1ff) ) ) {
+        /*
+         * Part 1
+         * process the triad information and prepare the bandplacements array.
+         */
+        
+        __m256i c1 = *(__m256i_u*)triad_info.row_triads_canonical;
+        __m256i c2 = *(__m256i_u*)(triad_info.row_triads_canonical+16);
+
+        // The first mask is for digit 9:
+        unsigned int m = _mm256_movemask_epi8(_mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_srli_epi16(c1,1),_mm256_srli_epi16(c2,1)), 0xD8));
+        __m256i cc = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_and_si256(c1, maskff), _mm256_and_si256(c2, maskff)), 0xD8);
+
+
+        for (unsigned short type=0; type < 2; type++) {
+            // for each digit d+1 (in order 9 to 1):
+            for (signed char d = 8; d >= 0; d--) {
+                // check three bands bi:
+                for ( unsigned bi=0; bi < 3; bi++, m >>= 9 ) {
+                    // save band config for later:
+                    solverData.bandplacements[d].u8[bi+type*4] = bandredux[m&0x1ff].config;
+                }
+                m = _mm256_movemask_epi8(cc);
+                cc = _mm256_slli_epi16(cc,1);
+            }
+            if ( type == 1 ) {
+                break;
+            }
+            c1 = *(__m256i_u*)triad_info.col_triads;
+            c2 = *(__m256i_u*)(triad_info.col_triads+16);
+
+            // since triad_info.col_triads is not in canonical order, the triad values
+            // need to be moved into the right slots:
+
+            __m256i cc_m = _mm256_packus_epi16(_mm256_srli_epi16(c1,1),_mm256_srli_epi16(c2,1));
+            __m256i tmp1 = _mm256_shuffle_epi8(cc_m, shuff_col_ordered1);
+            cc_m = _mm256_shuffle_epi8(cc_m, shuff_col_ordered2);
+            cc_m = _mm256_or_si256(tmp1,_mm256_permute2x128_si256(cc_m, cc_m, 1));
+            // digits 8-0
+            cc = _mm256_packus_epi16(_mm256_and_si256(c1, maskff), _mm256_and_si256(c2, maskff));
+            __m256i tmp2 = _mm256_shuffle_epi8(cc, shuff_col_ordered1);
+            cc = _mm256_shuffle_epi8(cc, shuff_col_ordered2);
+            cc = _mm256_or_si256(tmp2,_mm256_permute2x128_si256(cc, cc, 1));
+            // first mask for digit 9
+            m = _mm256_movemask_epi8(cc_m);
+        }
+
+        // Algorithm 4: Single Digit General Test
+        //
+        // Part2: The examination of the placement data:
+        bit128_t *candidate_bits_by_value = solverData.getCbbvs(candidates);
+
+        if ( grid_state->unlocked.u32[3] != 0x1ff ) {
+        // This round-robin approach saves around 2-3% of tests,
+        // getting a little faster to the next hit
+
+// ignore a warning "maybe-uninitialized" since next_dgt is initialized on declaration:
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+            unsigned int last_dgt = next_dgt+9;
+            unsigned int d;
+            for ( ; next_dgt<last_dgt; next_dgt++) {
+                d=index_table_dgt[next_dgt];
+#pragma GCC diagnostic pop
+                if ( dgt_tune_for_speed && grid_state->unlocked.check_indexbit<96>(d) ) {
+                    continue;
+                }
+
+                // digit bitmap
+                __m128i digit_bits = candidate_bits_by_value[d].m128;
+                __m128i pl;         // a single (valid) placement
+                __m128i pl_h, pl_v; // the horizontal and vertical parts being constructed for
+                                    // a full placement.
+                __m128i pl_h3;      // the 3 horizontal placement pieces united.
+                __m128i plsum {};   // the union of all valid placements
+                unsigned short plcnt = 0;  // a count of all the valid placements
+                BandPlacements *bandplacements = &solverData.bandplacements[d];
+                int complexity =   __builtin_popcount(bandplacements->u8[0])
+                                 * __builtin_popcount(bandplacements->u8[1])
+                                 * __builtin_popcount(bandplacements->u8[2])
+                                 * __builtin_popcount(bandplacements->u8[4])
+                                 * __builtin_popcount(bandplacements->u8[5])
+                                 * __builtin_popcount(bandplacements->u8[6]);
+                // evaluate complexity coutoffs:
+    
+                if ( complexity > dgt_complexity_cutoff || complexity <= 13 ) {
+                    continue;
+                }
+                grid_state->unlocked.set_indexbit<96>(d);
+
+                counters.single_digit_placement_checks++;
+                unsigned int h1 = bandplacements->u8[0];
+                unsigned int h2;
+                unsigned int h3;
+                unsigned int v1;
+                unsigned int v2;
+                unsigned int v3;
+                unsigned int h1pl;
+                unsigned int h2pl;
+                unsigned int h3pl;
+                unsigned int v1pl;
+                unsigned int v2pl;
+                unsigned int v3pl;
+                while (h1) {
+                    h1pl = tzcnt_and_mask(h1);
+                    h2 = bandplacements->u8[1];
+                    while (h2) {
+                        h2pl = tzcnt_and_mask(h2);
+                        pl_h = h2bandplacement[h1pl + h2pl*6];
+                        v1 = bandplacements->u8[4];
+                        while (v1) {
+                            v1pl = tzcnt_and_mask(v1);
+                            v2 = bandplacements->u8[5];
+                            while (v2) {
+                                v2pl = tzcnt_and_mask(v2);
+                                pl_v = v2bandplacement[v1pl + v2pl*6];
+                                pl = pl_h & pl_v;
+                                if ( _mm_testc_si128(digit_bits, pl) ) { // valid h/v combo
+                                    h3 = bandplacements->u8[2];
+                                    while (h3) {
+                                        h3pl = tzcnt_and_mask(h3);
+                                        pl_h3 = pl_h | h3bandplacement[h3pl];
+                                        v3 = bandplacements->u8[6];
+                                        while (v3) {
+                                            v3pl = tzcnt_and_mask(v3);
+                                            pl = pl_h3 & (pl_v | v3bandplacement[v3pl]);
+                                            if ( _mm_testc_si128( digit_bits, pl) ) { // valid h/v combo
+                                                plsum = plsum | pl;
+                                                plcnt++;
+                                            }
+                                        }                               
+                                    }
+                                }                            
+                            }               
+                        }               
+                    }
+                }
+                if ( !_mm_testz_si128( plsum, plsum) ) { // have a valid placement combination
+                    // determine extra candidates not required
+                    __m128i spares = ~plsum & digit_bits;
+                    if ( !_mm_testz_si128( spares, spares) ) {
+#if 0
+                        // determine whether all spares are unlocked (otherwise they conflict with locked candidates)
+                        if ( !_mm_testc_si128( grid_state->unlocked, spares) ) {
+                            if ( verbose == VDebug ) {
+                                solverData.printf("back track - placement of digit %d candidates is impossible.\n", d+1);
+                            }
+                            goto back;
+                        }
+#endif
+                        counters.single_digit_incompatibilities++;
+                        // and actually remove these candidates:
+                        if ( verbose == VDebug ) {
+                            solverData.printf("remove candidates for digit %d as they are inconsistent with a valid solution:\n\t", d+1);
+                            bit128_t s { .m128 = spares };
+                            while ( s ) {
+                                solverData.printf(" %s", cl2txt[tzcnt_and_mask(s)]);
+                            }
+                            solverData.printf("\n");
+                            if ( debug > 2 ) {
+                                bit128_t s { .m128 = spares };
+                                bit128_t dgts { .m128 = digit_bits };
+                                show_dgt_placement(dgts, s, solverData, "removed candidates");
+                                solverData.printf("\t* the candidates removed above most likely could represent resolution of any fish\n"
+                                                  "\t  or skyscraper, kite or crane\n\t  other possibilities also exist\n");
+                            }
+                        }
+                        bit128_t s { .m128 = spares };
+                        grid_state->mask_candidates(s, 1<<d);
+
+                        if ( plcnt == 1 ) {  // a single placement was identified!
+                            bit128_t dgts { .m128 = plsum & grid_state->unlocked.m128 };
+                            grid_state->mask_candidates<false>(dgts, 1<<d);
+                            if ( verbose == VDebug ) {
+                                bit128_t dgts { .m128 = plsum & grid_state->unlocked.m128 };
+                                while ( dgts.u128 ) {
+                                    solverData.printf("hidden single       %d at %s\n", d+1, cl2txt[tzcnt_and_mask(dgts)]);
+                                }
+                            }
+                            grid_state->unlocked.m128 = ~plsum & grid_state->unlocked.m128;
+                        }
+                        next_dgt = (d+1)%9;
+                        goto search;
+                    }
+                    if ( plcnt == 2 ) {
+                        // if we get a set of two placements of sufficient size,
+                        // this is a pretty good guess:
+                        bit128_t dgts { .m128 = plsum & grid_state->unlocked.m128 & ~spares};
+                        unsigned char score = dgts.popcount()/2;
+                        // a score of 3 for 3 cells resolved is a reasonable heuristic for a minimum,
+                        // as long as we still allow for an even better result.
+                        // the guess is strictly 50/50 here.
+                        if ( score >= 3 && score > solverData.guess_hint_score ) {
+                            solverData.guess_hint_score = score;
+                            solverData.guess_hint_index = tzcnt_and_mask(dgts);
+                            solverData.guess_hint_digit = 1<<d;
+                        }
+                    }
+                } else {
+                    // backtrack, no coverage for the digit placements
+                    if ( verbose == VDebug ) {
+                        solverData.printf("back track - placement of digit %d candidates is impossible.\n", d+1);
+                    }
+                    goto back;
+                }
+            }
+            next_dgt = d;
+        }
+    }
+#endif
+
 #ifdef OPT_NEWSETS
-// Algorithm 4 - Find naked sets
+// Algorithm 5 - Find naked sets
 // For each possible combination of candidates of size K, check for every section
 // whether there are exactly K cells that contain only this combination of candidates.
 // Back track when the number of found cells exceeds K.
@@ -3802,7 +4749,7 @@ hidden_search:
 //
 // This works for all section types, row, col and box.
 //
-// There are some mitgation techniques to keep unproductive section being tested or retested.
+// There are some mitigation techniques to keep unproductive sections being tested or retested.
 // For example, after one or two sets discovered, there is a much diminished propability
 // for finding another one. Also, the found set already might play a vital role in
 // the downstream resolution of the Sudoku.
@@ -3824,11 +4771,6 @@ hidden_search:
 // for performance as a chance to kill off bad guesses.
 //
     if ( mode_newsets ) {
-//        Kind type = Row;  // for now
-// XXX create a popcount of the board or just one row at a time
-// XXX should be in Data section
-// XXX should derive bivalues as well?
-// XXX result could be compressed to nibbles.
         // A cheap way to avoid unnecessary naked set searches
         grid_state->set23_found[Row].u128 |= ~grid_state->unlocked.u128;
         grid_state->set23_found[Row].u64[1] &= 0x1ffff;
@@ -3860,18 +4802,12 @@ hidden_search:
             pop[80] = short_popcnt16(candidates[80]);
         }
 
-//dump_board(candidates, "board");
         // iterate over rows
         for (unsigned char i = 0; i < 81; i += 18 ) {
             bit128_t to_change;
             unsigned char rowsix[2] = {i, (unsigned char)(i+(i==72?0:9))};
             unsigned char rows[2] = {(unsigned char)(i/9), (unsigned char)(i/9+(i==72?0:1))};
-#if 0
-            //XXX
-            if ( sctCnt[rows[0]] < 4 && sctCnt[rows[1]] < 4 ) {
-                continue;
-            }
-#endif
+
             if ( verbose != VNone ) {
                 counters.naked_sets_searched += i==72?1:2;
             }
@@ -3885,16 +4821,13 @@ hidden_search:
             // set the popcont-1:
             __m256i c_res = _mm256_set_m128i(_mm_unpacklo_epi8(*(__m128i_u*)(pop+rowsix[1]), _mm_setzero_si128()),
                                              _mm_unpacklo_epi8(*(__m128i_u*)(pop+rowsix[0]), _mm_setzero_si128()));
-//            __m256i c_intersect {};  // bits for each intersection between c_tst and c_try.
 
             // Adjust counts to come out "right"
             // plus 1 for cells that have N candidates for N liberties:
-//dbgprintf(1, "sctCnt[%d]=%d, sctCnt[%d]=%d\n", rows[0], sctCnt[rows[0]], rows[1], sctCnt[rows[1]]);
             c_res = _mm256_add_epi16(c_res, _mm256_and_si256(_mm256_cmpeq_epi16(c_res,
                                             _mm256_set_m128i(_mm_set1_epi16(sctCnt[rows[1]]),_mm_set1_epi16(sctCnt[rows[0]]))),ones));
             // minus 1 for "unlocked" cells:
             c_res = _mm256_sub_epi16(c_res, _mm256_add_epi16(_mm256_cmpeq_epi16(c_res,ones),ones));
-//dump_m256i_epi16(c_res, "popcnts - adjusted");
 
             for (unsigned char k = 0; k < 7; k++) {
                 // rotate left (0 1 2 3 4 5 6 7) -> (1 2 3 4 5 6 7 0)
@@ -3902,28 +4835,17 @@ hidden_search:
                 // the test: (add -1)
                 c_res =  _mm256_add_epi16(c_res,
                              _mm256_cmpeq_epi16( _mm256_andnot_si256(c_tst, c_try), _mm256_setzero_si256()));
-//dump_m256i_epi16(c_try, "c_try", 2);
-//dump_m256i_epi16(c_res, "iteration", 2);
-#if 0
-                c_intersect = _mm256_slli_epi16(
-                                  _mm256_or_si256(c_intersect,
-                                      _mm256_andnot_si256(_mm256_cmpeq_epi16(
-                                          _mm256_and_si256(c_tst, c_try), _mm256_setzero_si256()),ones)),1);
-#endif
             }
-//dump_m256i_epi16(c_intersect, "intersect", 2);
             __m256i the9thcand_row = _mm256_set_m128i(_mm_set1_epi16(candidates[rowsix[1]+8]),_mm_set1_epi16(candidates[rowsix[0]+8]));
             // perform the same tests with the the9thcand_row candidates:
             c_res =  _mm256_add_epi16(c_res, 
                          _mm256_cmpeq_epi16( _mm256_andnot_si256(c_tst, the9thcand_row), _mm256_setzero_si256()));
-//dump_m256i_epi16(c_res, "popcnts nineth",2);
 
             // this gives sixteen results, plus two for the nineth row candidates.
 
             // check whether any set is too large:
             if ( !_mm256_testz_si256(true_epi16, _mm256_cmpgt_epi16(_mm256_setzero_si256(), c_res)) ) {
                 // backtrack
-//dump_m256i(c_res, "c_res - minus one - backtrack");
                 unsigned short res = compress_epi16_boolean(_mm256_cmpgt_epi16(_mm256_setzero_si256(), c_res));
                 unsigned char off = __tzcnt_u32(res);
                 unsigned char row = rows[off<8?0:1];
@@ -3942,27 +4864,13 @@ hidden_search:
                 // no need to update grid_state
                 goto back;
             }
-#if 0
-            c_intersect = _mm256_or_si256(c_intersect,
-                              _mm256_andnot_si256(_mm256_cmpeq_epi16(
-                                  _mm256_and_si256(c_tst, the9thcand_row), _mm256_setzero_si256()),ones));
-            if ( !_mm256_testz_si256(c_intersect, _mm256_cmpeq_epi16(c_res, _mm256_setzero_si256()))) {
-#else
             if ( !_mm256_testz_si256(ones, _mm256_cmpeq_epi16(c_res, _mm256_setzero_si256()))) {
-#endif
+
                 // a bit set for either of the sixteen cells
                 unsigned int res = compress_epi16_boolean(_mm256_cmpeq_epi16(c_res, _mm256_setzero_si256()));
                 res &= ~(  grid_state->set23_found[Row].get_indexbits(i,8)
                          | grid_state->set23_found[Row].get_indexbits(i+9,8)<<8);
-#if 0
-                // XXX
-                if ( sctCnt[rows[0]] < 4 ) {
-                    res &= ~(0xff<<8);
-                }
-                if ( sctCnt[rows[1]] < 4 ) {
-                    res &= ~0xff;
-                }
-#endif
+
                 while ( res ) {
                     unsigned char off = tzcnt_and_mask(res);
                     unsigned char row = rows[off<8?0:1];
@@ -3978,12 +4886,10 @@ hidden_search:
                     unsigned short m_clean = compress_epi16_boolean128(_mm_cmpgt_epi16(
                                            _mm_and_si128(_mm_set1_epi16(candidates[cl]), rowv), _mm_setzero_si128()))
                                        | ((candidates[cl] & candidates[row*9+8])?0x100:0);
-//dbgprintf(1, "m_clean 1=%x\n", m_clean);
                     m_clean &= ~m;
 
                     unsigned int m_neg = 0x1ff & ~(m | grid_state->set23_found[Row].get_indexbits(row*9,9));
 
-//dbgprintf(1, "set: row=%d %s mask=%x, m_neg=%x, m_clean=%x\n", row, cl2txt[cl], m, m_neg, m_clean);
                     to_change.u128 = 0;
                     to_change.set_indexbits(m_clean, row*9, 9);
                     unsigned char cnt = _popcnt32(candidates[cl]);
@@ -3991,34 +4897,17 @@ hidden_search:
                     if ( s <= 3 + cnt ) {
                         // could include locked slots
                         grid_state->set23_found[Row].set_indexbits(m_neg,row*9,9);
-                        // adjust the count, maybe required lateron
-                        // XXX sectionSetsUnlockedCnt[Row][row] -= _popcnt32(m_neg);
                     }
                     if ( cnt <= 3 ) {
                         // unsigned int row_box_intersection = 7<<(box_start[cl]%9);
                         grid_state->set23_found[Row].set_indexbits(m,row*9,9);
                         // adjust the count - required if finding multiple sets in row
                         sctCnt[row] -= cnt;
-#if 0
-                        // update box, if set within triad
-                        if ( (m&row_box_intersection) == m ) {
-                            // grid_state->set23_found[Box].set_indexbits(m&0x1ff,row*9,9);
-                            // int bi_now = sctCntBox[box_index[cl]];
-                            // if ( bi_now >= cnt ) {
-                            //     sctCntBox[box_index[cl]] = bi_now - cnt;
-                            // }
-                            add_indices<Box>(&to_change, cl);
-                        }
-#endif
                     }
                     if ( m_clean == 0 ) {
                         res &= ~(m&0xff);
                         continue;
                     }
-//dump_bits(to_change, "to_change");
-//                    if ( cnt==4 || sctCnt[row]==4+cnt ) {
-//                        grid_state->flags |= (1<<row);
-//                    }
                     if ( to_change.u128 ) {
                         if ( verbose == VDebug ) {
                             char ret[32];
@@ -4026,9 +4915,6 @@ hidden_search:
                                 format_candidate_set(ret, candidates[cl]);
                                 solverData.printf("naked  %s (row): %-7s %s\n", cnt==2?"pair":"set ", ret, cl2txt[cl]);
                             } else {
-//                                if (sctCnt[row] > 3+cnt) {
-//                                    m_neg = 0x1ff & ~(m | grid_state->set23_found[Row].get_indexbits(row*9,9));
-//                                }
                                 unsigned char k = 0xff;
                                 unsigned short complement = 0;
                                 while (m_neg) {
@@ -4070,27 +4956,17 @@ hidden_search:
                             goto search;
                         }
                     }
-//dump_board(candidates, "board");
                     res &= ~(m&0xff);
-//dbgprintf(1,"\n");
-//dbgprintf(1,"Line %d: set reported, but no changes made!\n", line);
                 }
             }
             int cnt1 = _popcnt32(candidates[rowsix[0]+8]);
             int cnt2 = _popcnt32(candidates[rowsix[1]+8]);
-//dbgprintf(1, "rowsix[0]+8=%d, rowsix[1]+8=%d\n", rowsix[0]+8, rowsix[1]+8);
-//dbgprintf(1, "cnt1=%d, cnt2=%d\n", cnt1, cnt2);
-//dump_bits(grid_state->set23_found[Row],"grid_state->set23_found[Row]");
             if ( cnt1 == sctCnt[rows[0]] || cnt1 == 1 || grid_state->set23_found[Row].check_indexbit(rowsix[0]+8) ) {
-//dbgprintf(1, "grid_state->set23_found[Row].check_indexbit(rowsix[0])=%d", grid_state->set23_found[Row].check_indexbit(rowsix[0]));
                 cnt1 = 0;
             }
             if ( cnt2 == sctCnt[rows[1]] || cnt2 == 1 || grid_state->set23_found[Row].check_indexbit(rowsix[1]+8) ) {
-//dbgprintf(1, "grid_state->set23_found[Row].check_indexbit(rowsix[1])=%d", grid_state->set23_found[Row].check_indexbit(rowsix[1]));
                 cnt2 = 0;
             }
-
-//dbgprintf(1, "cnt1=%d, cnt2=%d\n", cnt1, cnt2);
 
             if ( cnt1 || cnt2 ) {
                 // perform the reverse test with the the9thcand_row candidates,
@@ -4215,7 +5091,7 @@ hidden_search:
 #endif
 #ifdef OPT_SETS
 
-// Algorithm 4 - Find naked sets
+// Algorithm 5 - Find naked sets
 // For each possible combination of candidates of size K, check for every section
 // whether there are exactly K cells that contain only this combination of candidates.
 // Back track when the number of found cells exceeds K.
@@ -4267,7 +5143,7 @@ hidden_search:
         bit128_t to_visit_n;          // tracks all the cells to visit
         bit128_t to_visit_again {};   // track those cells that have been updated
 
-        to_visit_n.u128 = grid_state->updated.u128 & grid_state->unlocked.u128;
+        to_visit_n.u128 = grid_state->updated.u128 & grid_state->unlocked.u128 & mask_81bit;
 
         // A cheap way to avoid unnecessary naked set searches
         grid_state->set23_found[Row].u128 |= ~grid_state->unlocked.u128;
@@ -4567,7 +5443,9 @@ hidden_search:
 
                 // If any cell's candidates got updated, go back and try all that other stuff again
                 if (found) {
-                    grid_state->updated.u128 = to_visit_n.u128 | tv.u128 | to_visit_again.u128;
+                    grid_state->updated.u64[0] = 0;
+                    grid_state->updated.u32[2] = 0;
+                    grid_state->updated.u128 |= to_visit_n.u128 | tv.u128 | to_visit_again.u128;
                     goto search;
                 }
             } else if ( cnt == 1 ) {
@@ -4585,7 +5463,9 @@ hidden_search:
         } // while
       }
 
-      grid_state->updated.u128 = to_visit_again.u128;
+      grid_state->updated.u64[0] = 0;
+      grid_state->updated.u32[2] = 0;
+      grid_state->updated.u128 |=  to_visit_again.u128;
     }
 #endif
 
@@ -4608,7 +5488,7 @@ hidden_search:
     // Given a sudoku board populated with candidates, the task is then to find such grids
     // such that they correspond to the solution of the Sudoku problem.
     //
-    // The conditons for such a grid based on the candidate locations are very simply:
+    // The conditions for such a grid based on the candidate locations are very simply:
     // find N rows or columns for which all candidates are within N columns / rows.
     // (there is no guarantee to find any, but if found, it is a valid grid).
     // Having identified such a valid grid in terms of rows, any extra candidates in the columns
@@ -5352,7 +6232,7 @@ done2:
     // Unique (Avoidable) Rectangles
     //
     // The theory:
-    // For each (a) retangular four cells, (b) lying in two boxes (i.e. two cells in each box)
+    // For each (a) rectangular four cells, (b) lying in two boxes (i.e. two cells in each box)
     // and (c) of which none is set with a preset value:
     //   Resolving these cells such that both pairs of diagonally opposite corners have
     //   the same value _always_ and _automatically_ will lead to at least _2_ different
@@ -6468,8 +7348,9 @@ using namespace Schoku;
         printf("schoku version: %s\n", version_string);
         printf(R"(Synopsis:
 schoku [options] [puzzles] [solutions]
-	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'.
-	 [solutions] names the output file with solutions. Default is 'solutions.txt'.
+	 [puzzles] names the input file with puzzles. Default is 'puzzles.txt'/'puzzles.px'.
+	 [solutions] names the output file with solutions. Default is 'solutions.txt'/solutions.px'.
+     The extension ".px" is used in conjunction with the -p (pencilmarks) option.
 
 Command line options:
     -c  check for back tracking even when no guess was made (e.g. if puzzles might have no solution)
@@ -6477,25 +7358,66 @@ Command line options:
         add a 2 or even 3 for even more detail.
     -h  help information (this text)
     -l# solve a single line from the puzzle.
-    -m[FSNU]* execution modes (fishes, sets/new sets, unique rectangles), lower or upper case
+    -m[B#D#SU] execution modes (bivalues, digit_placement, sets, unique rectangles), lower or upper case.
+        Where indicated, a numeric specifier '#' can follow the mode.
+        B# increasing values increases the set of searches executed.
+           1 hidden pairs (this is the default)
+           2 naked pairs (and all the above)
+           3 Y-Wing (and all the above)
+           4 W-Wing (and all the above)
+    -m[D#] execution mode digit_placement, lower or upper case.
+        D# the complexity threshold and speed tuning is set according to a lookup table.
+           The possible values of '#' are:
+               1  (72 + tuned for speed)
+               2  (96 + speed)
+               3 (144 + speed)
+               4 (144)
+               5 (192)
+               6 (288)
+               7 (384)
+               8 (864)
+               9 (unlimited)
+           Higher values (complexity threshold in braces) deliver more hits
+           while increasing the execution time.
     -r[ROM] puzzle rules (lower or upper case):
         R  for regular puzzles (unique solution exists)
            not suitable for puzzles that have multiple solutions
         O  find just one solution
            this will find the first of multiple solutions and stop looking
         M  determine whether multiple solutions exist beyond the first found
+    -p  pencilmarks input.
+        Schoku can read pencilmarks in two formats:
+        B  Binary, ie. the 81 unsigned short values for each board.
+           Each cell's candidates are represented as the nine lowest bits of the
+           unsigned short value.
+        P  PX format (fixed length) for input and output.
+          The first two characters are "PX", followed by 81 three byte hexadecimal
+          characters (0-9A-I), which when read as little-endian unsigned short,
+          represent the cell's candidates.  A newline completes the human-readable
+          board representation.
+        When -p is specified, board output is written in PX format.
+        Input is expected to be either in binary or PX format (detected automatically).
+        Other pencilmark formats can be converted to the native formats using the
+        provided script pencilmarksconverter.pl.
     -t# set the number of threads
     -v  verify the solution
     -w  display warnings (mostly unexpected solving details for regular puzzles)
     -x  provide some statistics
     -y  provide speed statistics only
-    -#1 change base for row and column reporting from 0 to 1
+    -#  by default, rows and columns are counted from 1
+        -#0 change base for row and column reporting from 1 to 0
+        -#A change base for row reporting to 'A' and column 1, e.g. cell[0,0] as A1
+        -#r change to r_c_ format for row and column reporting, e.g. cell[0,0] as r1c1
 
     fishes details can be shown as a 9x9 grid with '-d3' where 
-       'o' represents fish positions as 'o'
+       'o' represents fish positions
        '@' represents fin(s) if present
        'X' shows any candidates to eliminate
        '.' shows other candidates containing the same digit
+
+    digit placement details can be shown as a 9x9 grid with '-d3' where 
+       'o' represents valid positions
+       'X' shows any candidates to eliminate
 
 Environment:
     SCHOKU_GUESS_REPORT if set to "1", produces a list of all puzzles that required a guess
@@ -6533,14 +7455,40 @@ using namespace Schoku;
        }
     }
 
+    int countpound = 0; // rect multiple -# opts
+
+#ifdef OPT_DGT
+    const unsigned short complexity_cutoff_table[] = {
+                          144, /* default */
+                           72, 96, 144, 144, 192, 288, 384, 864, 0xffff
+                        };
+#endif
     if ( argc > 0 ) {
         argc--;
         argv++;
     }
 
-    char opts[80] = { 0 };
+	std::chrono::time_point<std::chrono::steady_clock> starttime;
+
+    size_t outnpuzzles = 0;
+	size_t npuzzles    = 0;
+    size_t outnbytes   = 0;
+    char *line = NULL;
+    unsigned short *board;
+
+
+    char opts[1024] = { 0 };
+    size_t used_opts = 0;
     for (int i = 0; i < argc; i++) {
-        sprintf(opts+strlen(opts), "%s ", argv[i]);
+        int n = snprintf(opts + used_opts, sizeof(opts) - used_opts, "%s ", argv[i]);
+        if (n < 0) {
+            break;
+        }
+        used_opts += (size_t)n;
+        if (used_opts >= sizeof(opts) - 1) {
+            opts[sizeof(opts) - 1] = 0;
+            break;
+        }
     }
 
     while ( argc && argv[0][0] == '-' ) {
@@ -6566,7 +7514,7 @@ using namespace Schoku;
              sscanf(argv[0]+2, "%d", &line_to_solve);
              break;
         case 'm':
-             for ( unsigned char p=2; argv[0][p] && p<6; p++) {
+             for ( unsigned char p=2; argv[0][p]; p++) {
                  switch (toupper(argv[0][p])) {
 #ifdef OPT_NEWSETS
                 case 'N':        // see OPT_NEWSETS
@@ -6588,15 +7536,57 @@ using namespace Schoku;
                     mode_fish = true;
                     break;
 #endif
+#ifdef OPT_DGT
+                case 'D':        // see OPT_DGT
+                    {
+                        unsigned int nitems = 0;
+                        unsigned int lngth = 0;
+
+                        mode_dgt = true;
+                        if ( argv[0][p+1] && isdigit(argv[0][p+1]) ) {
+                            unsigned int complexity_cutoff_index = 0;
+                            nitems = sscanf(&argv[0][p+1], "%d%n", &complexity_cutoff_index, &lngth);
+                            if ( nitems == 1 ) {
+                                p += lngth;
+                                if ( complexity_cutoff_index > 0 && complexity_cutoff_index < sizeof(complexity_cutoff_table)/sizeof(unsigned short) ) {
+                                    dgt_complexity_cutoff = complexity_cutoff_table[complexity_cutoff_index];
+                                    if ( complexity_cutoff_index > 3 ) {
+                                        dgt_tune_for_speed = false;
+                                    }
+                                }
+                                if ( debug != 0 || warnings != 0 ) {
+                                    printf("complexity threshold set to %d\n", dgt_complexity_cutoff);
+                                    printf("tune for speed %d\n", dgt_tune_for_speed);
+                                }
+                            }
+                        }
+                        break;
+                    }
+#endif
                 default:
                     printf("invalid mode %c\n", argv[0][p]);
                 }
             }
             break;
+        case 'p':    // pencilmarks
+            // Schoku can read pencilmarks in two formats:
+            // - Binary, ie. the 81 unsigned short for each board.
+            //   Each cell's candidates are represented as the nine lowest bits of the
+            //   unsigned short value.
+            // - PX format (fixed length) for input and output.
+            //   The first two characters are "PX", followed by 81 three byte hexadecimal
+            //   characters (0-9A-I), which when read as little-endian unsigned short,
+            //   represent the cell's candidates.  A newline completes the human-readable
+            //   board representation.
+            // When -p is specified, board output is written in PX format as well.
+            // Other pencilmarks can be converted to the native formats using the provided
+            // script pencilmarksconverter.pl 
+                do_pencilmarks = 1;
+            break;
         case 'r':    // rules
             if ( argv[0][2] ) {
                 switch (toupper(argv[0][2])) {
-                case 'R':        // defaul rules (fastest):
+                case 'R':        // default rules (fastest):
                                  // assume regular puzzle with a unique solution
                                  // not suitable for puzzles with multiple solutions
                     rules = Regular;
@@ -6634,13 +7624,38 @@ using namespace Schoku;
              reporttimings=1;
              break;
         case '#':    // row/col numbering base
-             if ( argv[0][2] && isdigit(argv[0][2]) ) {
-                 int displaybase = 0;
-                 sscanf(&argv[0][2], "%d", &displaybase);
-                 if ( displaybase == 1 ) {
-                     for ( int i=0; i<81; i++ ) {
-                        cl2txt[i][1]++;
-                        cl2txt[i][3]++;
+             {
+                 if ( countpound == 0 ) {
+                     countpound++;
+                     int displaybase = 0;
+                     if ( argv[0][2] && isdigit(argv[0][2])
+                          && ( argv[0][2] == '0' || argv[0][2] == '1' ) ) {
+                         sscanf(&argv[0][2], "%1d", &displaybase);
+                         for ( int i=0; i<81; i++ ) {
+                             cl2txt[i][1] += displaybase-1;
+                             cl2txt[i][3] += displaybase-1;
+                         }
+                         if ( debug ) {
+                             printf("cell at [0,0] is displayed as %s etc.\n", cl2txt[0]);
+                         }
+                     } else if ( argv[0][2] && argv[0][2]=='A' ) {
+                         for ( int i=0; i<81; i++ ) {
+                             cl2txt[i][0] = cl2txt[i][1] + 'A'-'1';       // rows carry letters
+                             cl2txt[i][1] = cl2txt[i][3];   // cols carry digits
+                             cl2txt[i][2] = 0;
+                         }
+                         if ( debug ) {
+                             printf("cell at [0,0] is displayed as %s etc.\n", cl2txt[0]);
+                         }
+                     } else if ( argv[0][2] && argv[0][2]=='r' ) {
+                         for ( int i=0; i<81; i++ ) {
+                             cl2txt[i][0] = 'r';
+                             cl2txt[i][2] = 'c';
+                             cl2txt[i][4] = 0;
+                         }
+                         if ( debug ) {
+                             printf("cell at [0,0] is displayed as %s etc.\n", cl2txt[0]);
+                         }
                      }
                  }
              }
@@ -6662,20 +7677,20 @@ using namespace Schoku;
 
     assert((sizeof(GridState) & 0x3f) == 0);
 
-   // sort out the CPU and OMP settings
+    // sort out the CPU and OMP settings
 
-   if ( !__builtin_cpu_supports("avx2") ) {
+    if ( !__builtin_cpu_supports("avx2") ) {
         fprintf(stderr, "This program requires a CPU with the AVX2 instruction set.\n");
         exit(0);
-    }
-    // lacking BMI support? unlikely!
-    if ( !__builtin_cpu_supports("bmi") ) {
-        fprintf(stderr, "This program requires a CPU with the ABM and BMI instructions (such as blsi/tzcnt/popcnt/lzcnt)\n");
-        exit(0);
-    }
+     }
+     // lacking BMI support? unlikely!
+     if ( !__builtin_cpu_supports("bmi") ) {
+         fprintf(stderr, "This program requires a CPU with the ABM and BMI instructions (such as blsi/tzcnt/popcnt/lzcnt)\n");
+         exit(0);
+     }
 
-    bmi2_support = __builtin_cpu_supports("bmi2");
-    pext_support = bmi2_support && !__builtin_cpu_is("znver2");
+     bmi2_support = __builtin_cpu_supports("bmi2");
+     pext_support = bmi2_support && !__builtin_cpu_is("znver2");
 
     if ( debug ) {
          printf("BMI2 instructions %s %s\n",
@@ -6683,91 +7698,129 @@ using namespace Schoku;
                pext_support? "and enabled" : __builtin_cpu_is("znver2")? "but use of pdep/pext instructions disabled":"");
     }
 
-	auto starttime = std::chrono::steady_clock::now();
+    starttime = std::chrono::steady_clock::now();
 
-	const char *ifn = argc > 0? argv[0] : "puzzles.txt";
-	int fdin = open(ifn, O_RDONLY);
-	if ( fdin == -1 ) {
-		if (errno ) {
-			fprintf(stderr, "Error: Failed to open file %s: %s\n", ifn, strerror(errno));
-			exit(0);
-		}
-	}
+    if ( do_pencilmarks ) {
+        // start solver
+        board = (unsigned short *)line; // overwriting input as we go
+        do_pencilmarks = true;
+        const char *zeros = "000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        char gridout[82];
+        Status status;
+
+        GridState *stack = 0;
+        // force alignment the 'old-fashioned' way
+        // stack = (GridState*)malloc(sizeof(GridState)*GRIDSTATE_MAX);
+        stack = (GridState*) (~0x3fll & ((unsigned long long) malloc(sizeof(GridState)*GRIDSTATE_MAX+0x40)+0x40));
+        stack->stackpointer=0; 
+
+        for ( unsigned int i=0; i<npuzzles; i++) {
+            if ( debug != 0) {
+                stack->initialize<VDebug>(board, global_counters);
+                status = solve<VDebug>((char *)zeros, gridout, stack, outnpuzzles++, global_counters);
+            } else if ( reportstats !=0) {
+                stack->initialize<VStats>(board, global_counters);
+                status = solve<VStats>((char *)zeros, gridout, stack,  outnpuzzles++, global_counters);
+            } else {
+                stack->initialize<VNone>(board, global_counters);
+                status = solve<VNone>((char *)zeros, gridout, stack,  outnpuzzles++, global_counters);
+            }
+printf("%.81s\n", gridout);
+printf("Status: solved(%d), unique(%d), verified(%d), guess(%d), used_assumed_uniqueness(%d)\n",
+        status.solved, status.unique, status.verified, status.guess, status.used_assumed_uniqueness);
+            board += 81;
+        }
+
+        goto present_stats;
+    }
+
+  {
+
+    const char *ifn = argc > 0? argv[0] : "puzzles.txt";
+    int fdin = open(ifn, O_RDONLY);
+    if ( fdin == -1 ) {
+        if (errno ) {
+            fprintf(stderr, "Error: Failed to open file %s: %s\n", ifn, strerror(errno));
+            exit(0);
+        }
+    }
 
     // get size of file
-	struct stat sb;
-	fstat(fdin, &sb);
+    struct stat sb;
+    fstat(fdin, &sb);
     size_t fsize = sb.st_size;
 
-	// map the input file
+    // map the input file
     signed char *string = (signed char *)mmap((void*)0, fsize, PROT_READ, MAP_PRIVATE, fdin, 0);
-	if ( string == MAP_FAILED ) {
-		if (errno ) {
-			fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
-			exit(0);
-		}
-	}
-	close(fdin);
+    if ( string == MAP_FAILED ) {
+        if (errno ) {
+            fprintf(stderr, "Error: mmap of input file %s: %s\n", ifn, strerror(errno));
+            exit(0);
+        }
+    }
+    close(fdin);
 
-	// skip lines, until hitting a puzzle.
+    // skip lines, until hitting a puzzle.
     size_t pre = 0;
     while ( !(isdigit((int)string[pre]) || string[pre] == '.') || !(string[pre+81] == 10 || (string[pre+81] == 13 && (string[pre+82] == 10))) ) {
-	    while (string[pre] != 10) {
-    	    ++pre;
-    	}
-    	++pre;
-	}
+        while (string[pre] != 10) {
+            ++pre;
+        }
+        ++pre;
+    }
     if ( string[pre+81] == 13 ) {
         fprintf(stderr, "Error: input file line ending in CR/LF\n");
-		exit(0);
+        exit(0);
     }
 
     size_t post = 1;
-	if ( string[fsize-1] != 10 )
-		post = 0;
+    if ( string[fsize-1] != 10 )
+        post = 0;
 
-	// get and check the number of puzzles
-	size_t npuzzles = (fsize - pre + (1-post))/82;
+    // get and check the number of puzzles
+	npuzzles    = (fsize - pre + (1-post))/82;
+    outnpuzzles = line_to_solve ? 1 : npuzzles;
+    outnbytes   = outnpuzzles * 164;
+
     if ( line_to_solve < 0 || npuzzles < (unsigned long)line_to_solve ) {
-		fprintf(stderr, "Ignoring the given line number\nthe input file %s contains %ld puzzles, the given line number %d is not between 1 and %ld\n", ifn, npuzzles, line_to_solve, npuzzles);
+        fprintf(stderr, "Ignoring the given line number\nthe input file %s contains %ld puzzles, the given line number %d is not between 1 and %ld\n", ifn, npuzzles, line_to_solve, npuzzles);
         line_to_solve = 0;
     }
-    size_t outnpuzzles = line_to_solve ? 1 : npuzzles;
 
-	if ( (fsize -pre -post + 1) % 82 ) {
-		fprintf(stderr, "found %ld puzzles with %ld(start)+%ld(end) extra characters\n", (fsize - pre - post + 1)/82, pre, post);
-	}
+    if ( (fsize -pre -post + 1) % 82 ) {
+        fprintf(stderr, "found %ld puzzles with %ld(start)+%ld(end) extra characters\n", (fsize - pre - post + 1)/82, pre, post);
+    }
 
-	const char *ofn = argc > 1? argv[1] : "solutions.txt";
-	int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
-	if ( fdout == -1 ) {
-		if (errno ) {
-			fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
-			exit(0);
-		}
-	}
-    if ( ftruncate(fdout, (size_t)outnpuzzles*164) == -1 ) {
-		if (errno ) {
-			fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
-		}
-		exit(0);
-	}
+    const char *ofn = argc > 1? argv[1] : "solutions.txt";
+    int fdout = open(ofn, O_RDWR|O_CREAT, 0775);
+    if ( fdout == -1 ) {
+        if (errno ) {
+            fprintf(stderr, "Error: opening output file %s: %s\n", ofn, strerror(errno));
+            exit(0);
+        }
+    }
+    if ( ftruncate(fdout, (size_t)outnbytes) == -1 ) {
+        if (errno ) {
+            fprintf(stderr, "Error: setting size (ftruncate) on output file %s: %s\n", ofn, strerror(errno));
+        }
+        exit(0);
+    }
 
-	// map the output file
-    output = (signed char *)mmap((void*)0, outnpuzzles*164, PROT_WRITE, MAP_SHARED, fdout, 0);
-	if ( output == MAP_FAILED ) {
-		if (errno ) {
-			printf("Error mmap of output file %s: %s\n", ofn, strerror(errno));
-			exit(0);
-		}
-	}
-	close(fdout);
+    // map the output file
+    output = (signed char *)mmap((void*)0, outnbytes, PROT_WRITE, MAP_SHARED, fdout, 0);
+    if ( output == MAP_FAILED ) {
+        if (errno ) {
+            printf("Error mmap of output file %s: %s\n", ofn, strerror(errno));
+            exit(0);
+        }
+    }
+    close(fdout);
 
     // solve all sudokus and prepare output file
     size_t imax = npuzzles*82;
 
     signed char *string_pre = string+pre;
-	GridState *stack = 0;
+    GridState *stack = 0;
     MemStream *memstream = 0;
     SequencingBuffer<MemStream *, unsigned int, 24> seqBuf;
 
@@ -6810,7 +7863,8 @@ using namespace Schoku;
         // reduction(...) allows to aggregate results from all threads using a single declaration of the aggregate
         // declare reduction defines a reduction constructs (name, data type, operation)
 
-#pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in)
+#pragma omp declare reduction (counters_reduction : Counters : omp_out += omp_in) \
+            initializer(omp_priv = Counters())
 
 #pragma omp parallel reduction(counters_reduction:global_counters) firstprivate(stack, memstream) proc_bind(close) shared(string_pre, output, npuzzles, imax, debug, reportstats, numthreads)
         {
@@ -6874,18 +7928,21 @@ using namespace Schoku;
         } // omp parallel
     } // if
 
-	int err = munmap(string, fsize);
-	if ( err == -1 ) {
-		if (errno ) {
-			fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
-		}
-	}
-	err = munmap(output, (size_t)outnpuzzles*164);
-	if ( err == -1 ) {
-		if (errno ) {
-			fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
-		}
-	}
+    int err = munmap(string, fsize);
+    if ( err == -1 ) {
+        if (errno ) {
+            fprintf(stderr, "Error: munmap file %s: %s\n", ifn, strerror(errno));
+        }
+    }
+	err = munmap(output, (size_t)outnbytes);
+    if ( err == -1 ) {
+        if (errno ) {
+            fprintf(stderr, "Error: munmap file %s: %s\n", ofn, strerror(errno));
+        }
+    }
+  }
+
+present_stats:
 
     if ( reportstats) {
         long long duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration(std::chrono::steady_clock::now() - starttime)).count();
@@ -6893,7 +7950,7 @@ using namespace Schoku;
         printf("%10ld  %6.1f/puzzle  puzzles entered and presets\n", npuzzles, (double)global_counters.preset_count/outnpuzzles);
         printf("%10ld  %.0lf/s  puzzles solved\n", global_counters.solved_count, (double)global_counters.solved_count/((double)duration/1000000000LL));
         if ( duration/outnpuzzles > 1000 ) {
-            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/(double)1000000, (double)duration/(outnpuzzles*1000LL));
+            printf("%8.1lfms  %6.2lf\u00b5s/puzzle  solving time\n", (double)duration/1000000, (double)duration/(outnpuzzles*1000LL));
         } else {
             printf("%8.1lfms  %4dns/puzzle  solving time\n", (double)duration/1000000, (int)((double)duration/outnpuzzles));
         }
@@ -6917,6 +7974,12 @@ using namespace Schoku;
         if ( mode_sets || mode_newsets ) {
             printf("%10lld  %6.2f/puzzle  naked sets found\n", global_counters.naked_sets_found, (double)global_counters.naked_sets_found/global_counters.solved_count);
             printf("%10lld  %6.2f/puzzle  naked sets searched\n", global_counters.naked_sets_searched, (double)global_counters.naked_sets_searched/global_counters.solved_count);
+        }
+#endif
+#ifdef OPT_DGT
+        if ( mode_dgt ) {
+            printf("%10lld  %6.2f/puzzle  single digit placement compatibility tests\n", global_counters.single_digit_placement_checks, (double)global_counters.single_digit_placement_checks/global_counters.solved_count);
+            printf("%10lld  %6.2f/puzzle  single digit placement incompatibilities found\n", global_counters.single_digit_incompatibilities, (double)global_counters.single_digit_incompatibilities/global_counters.solved_count);
         }
 #endif
 #ifdef OPT_FSH
