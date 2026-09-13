@@ -9,15 +9,16 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options
-DFLAGS := -DNDEBUG -DOPT_BIVALS
-#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_FSH -DOPT_SETS -DOPT_UQR
+DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_DGT
+#DFLAGS := -DNDEBUG -DOPT_BIVALS -DOPT_DGT -DOPT_SETS -DOPT_UQR
 # OPT_BIVALS
 #     opportunistic bi-values processing (naked pairs and triples, Y-wings)
 #     on by default, when compiled.
 # OPT_SETS
 #     resolves naked sets (complementary sets are labeled hidden sets)
-# OPT_FSH
-#     resolves fishes (X-wing, sword fish and jellyfish)
+# OPT_DGT
+#     digit-based templates reduce guesses significantly for hard puzzles
+#     at relative high speed
 # OPT_UQR
 #     resolves (avoidable) unique rectangles
 
