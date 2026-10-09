@@ -14,7 +14,7 @@ CXX := g++
 TARGET_ARCH := -mavx2 -mbmi -mbmi2 -mlzcnt
 
 # preprocessor options (OPT_TRIAD_RES is slower)
-DFLAGS := -DNDEBUG
+DFLAGS := -DNDEBUG -DOPT_DGT
 
 # optimization options 
 # Note: these are easily overridden on the command line, for example: make OFLAGS=-O2

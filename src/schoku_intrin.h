@@ -1,11 +1,14 @@
 /*
     Schoku intrinsics
 
-    creates the following intrinsics for x86_64 GNU:
-    - bittestandreset, bittestandreset64 (btr instruction)
-    - bittestandset, bittestandset64 (bts instruction)
-    - bittest, bittest64 (bt instruction)
-    - short_popcnt16 (16-bit popcnt)
+    creates the following intrinsics for x86_64 GNUC:
+    - _btr_u32/64, (bittestandreset) btr instruction
+    - _bts_u32/64, (bittestandset) bts instruction
+    - _bt_u32/64, (bittest) bt instruction
+    - _btc_u32/64, (bittestandcomplement) btc instruction
+    - _popcnt_u16, 16-bit popcnt
+    - _tzcnt_u16
+    - _lzcnt_u16
 
     all in the Schoku namespace
 
@@ -42,36 +45,54 @@ Parameters: (FunctionName, DataType, Statement, OffsetConstraint)
 }
 
 inline __attribute__((always_inline))
-__buildbitopplus(bittestandreset, unsigned int, "btr", "I", "l")
+__buildbitopplus(_btr_u32, unsigned int, "btr", "I", "l")
 inline __attribute__((always_inline))
-__buildbitopplus(bittestandreset64, unsigned long long, "btr", "J", "q")
+__buildbitopplus(_btr_u64, unsigned long long, "btr", "J", "q")
 
 inline __attribute__((always_inline))
-__buildbitopplus(bittestandset, unsigned int, "bts", "I", "l")
+__buildbitopplus(_bts_u32, unsigned int, "bts", "I", "l")
 inline __attribute__((always_inline))
-__buildbitopplus(bittestandset64, unsigned long long, "bts", "J", "q")
+__buildbitopplus(_bts_u64, unsigned long long, "bts", "J", "q")
 
 inline __attribute__((always_inline))
-__buildbitopplus(bittest, unsigned int, "bt", "I", "l")
+__buildbitopplus(_bt_u32, unsigned int, "bt", "I", "l")
 inline __attribute__((always_inline))
-__buildbitopplus(bittest, unsigned long long, "bt", "J", "q")
+__buildbitopplus(_bt_u64, unsigned long long, "bt", "J", "q")
+
+inline __attribute__((always_inline))
+__buildbitopplus(_btc_u32, unsigned int, "btc", "I", "l")
+inline __attribute__((always_inline))
+__buildbitopplus(_btc_u64, unsigned long long, "btc", "J", "q")
+
 
 /*
-   bittestandcomplement can be easily added.
-   Also atomic versions can easily be added using the lock prefix.
-*/
-
+   As an aside:
+   An atomic version can easily be added using the lock prefix like this:
+#define __buildatomicbitopplus(x, y, z, a, b) bool x(y *Base, int Offset) \
+{ \
+    bool was_set; \
+    __asm__ volatile(z "{" b "\t%[Offset],(%[Base]) | (%[Base]),%[Offset]}" \
+        : "=@ccc" (was_set), [Base] "+mr" (Base) \
+        : [Offset] a "ri" (Offset) \
+        : "cc"); \
+    return was_set; \
 }
+
+// For example:
+inline __attribute__((always_inline))
+__buildatomicbitopplus(_atomic_btc_u32, unsigned int, "lock btc", "I", "l")
+
+*/
 
 /*
  * int __builtin_popcnt(x)
  * will accept a short x, but will also always add an expand instruction
  * to return an integer. (at least that's what the assembly output says).
  * 
- * This variant does not generate an extraneous MOVZX instruction.
+ * This variant does not generate an extraneous MOVZX instruction
  */
 inline __attribute__((always_inline))
-unsigned short short_popcnt16(unsigned short inp)
+unsigned short _popcnt_u16(unsigned short inp)
 {
     unsigned short ret;
     __asm__ volatile( "popcntw\t {%w[inp], %[ret]|%[ret], %w[inp]}"
@@ -79,6 +100,13 @@ unsigned short short_popcnt16(unsigned short inp)
         : [inp] "rm" (inp)
         : "cc");
     return ret;
+}
+
+// provide some x86_64 instruction intrinsics to a) have a single leading '_' and b) use a _uXX suffix for the operand width
+// instead of calling the deviating available form directly
+inline unsigned short        _tzcnt_u16(unsigned short x)        { return __tzcnt_u16(x); }
+inline unsigned short        _lzcnt_u16(unsigned short x)        { return __lzcnt16(x); }
+
 }
 
 #endif
