@@ -853,21 +853,21 @@ union bit128_t {
         if ( off ) {
             idx += off;
         }
-        // slightly faster than bittest
+        // slightly faster than _bt_u32
         return this->u32[idx>>5] & (1<<(idx & 0x1f));
-        // return bittest(this->u32[idx>>5], idx & 0x1f);
+        // return _bt_u32(this->u32[idx>>5], idx & 0x1f);
     }
     template<unsigned int off=0>
     inline void set_indexbit(unsigned int idx) {
         if ( off ) {
             idx += off;
         }
-        // slightly faster than bittestandset
+        // slightly faster than _bts_u32
         this->u32[idx>>5] |= 1<<(idx & 0x1f);
-        // bittestandset(this->u32[idx>>5], idx & 0x1f);
+        // _bts_u32(this->u32[idx>>5], idx & 0x1f);
     }
     inline void unset_indexbit(unsigned int idx) {
-        bittestandreset(this->u32[idx>>5], idx & 0x1f);
+        _btr_u32(this->u32[idx>>5], idx & 0x1f);
     }
     inline void set_indexbits(unsigned long long mask, unsigned int pos, unsigned int bitcount) {
         mask &= (unsigned long long)((1LL<<bitcount)-1);  // since the bit count is specific, enforce it
@@ -2063,13 +2063,13 @@ public:
 //          // for the given digit, the count N for the tentative hidden set is: cnt.
 //          // take each digit set and compare to all other digits.
 //          //
-//          unsigned char cnt = short_popcnt16(cbbp_v.v16[ds]);
+//          unsigned char cnt =_popcnt_u16(cbbp_v.v16[ds]);
 //          if ( cnt <= 4 && cnt > 1) {
 //              __m256i dsv = _mm256_and_si256(_mm256_set1_epi16(cbbp_v.v16[ds]),mask9);
 //              // set of rows that are a subset of dsv
 //              __m256i issub_v = _mm256_cmpeq_epi16(dsv, _mm256_or_si256(dsv, cbbp_v.m256));
 //              unsigned short subs = 0x1ff & compress_epi16_boolean(issub_v);
-//              if ( short_popcnt16(subs) == cnt ) { // then issub_v / subs indicate the digits of the hidden subset
+//              if (_popcnt_u16(subs) == cnt ) { // then issub_v / subs indicate the digits of the hidden subset
 //                                               // while cbbp_v.v16[ds] gives the indicess within the row
 //                  // the cleanup is very simple...
 //...
@@ -2138,7 +2138,7 @@ public:
                                      _mm256_cmpgt_epi16(c,_mm256_setzero_si256()),
                                      _mm256_cmpeq_epi16(lsb,c)));
     
-            bivalues.u16[5] = (short_popcnt16(candidates[80]) == 2)?1:0;
+            bivalues.u16[5] = (_popcnt_u16(candidates[80]) == 2)?1:0;
             // bivalues is now set for subsequent steps
             bivaluesValid = true;
         }
@@ -2222,7 +2222,7 @@ public:
         // --> [0,0], [0,3], [0,6] - [3,1], [3,4], [3,7]
         tmp_row = _mm256_set_m128i(band3, band1);
         tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+8),(__m128i*)(inp+8));
-        boxes_as_cols[0] = _mm256_set_m128i(band3,_mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        boxes_as_cols[0] = _mm256_set_m128i(band3,_mm_blend_epi16(band1, _mm_bslli_si128(band2,2), 0x92));
         
         //     [0,1], [0,4], [0,7] - [3,1], [3,4], [3,7]
         // --> [1,0], [1,3], [1,6] - [4,1], [4,4], [4,7] (update to destination rows)
@@ -2240,7 +2240,7 @@ public:
         // --> [3,0], [3,3], [3,6] - [3,1], [3,4], [3,7] (update to destination rows)
         tmp_row = _mm256_set_m128i(band3, band1);
         tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+9+8),(__m128i*)(inp+9+8));
-        boxes_as_cols[3] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        boxes_as_cols[3] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_bslli_si128(band2,2), 0x92));
         //     [1,1], [1,4], [1,7] - [4,1], [4,4], [4,7]
         // --> [4,0], [4,3], [4,6] - [4,1], [4,4], [4,7]
         boxes_as_cols[4] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
@@ -2257,7 +2257,7 @@ public:
         // --> [6,2], [6,5], +[6,8] - [6,1], [6,4],  [6,7] (update to destination rows)
         tmp_row = _mm256_set_m128i(band3, band1);
         tmp_align = _mm256_loadu2_m128i((__m128i*)(inp+54+18+8),(__m128i*)(inp+18+8));
-        boxes_as_cols[6] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_slli_si128(band2,2), 0x92));
+        boxes_as_cols[6] = _mm256_set_m128i(band3, _mm_blend_epi16(band1, _mm_bslli_si128(band2,2), 0x92));
         //     [2,1], [2,4],  [2,7] - [5,1], [5,4], [5,7]
         // --> [7,2], [7,5], +[8,8] - [7,1], [7,4], [7,7] (update to destination rows)
         boxes_as_cols[7] = _mm256_blend_epi16(_mm256_srli_si256(tmp_row,2), _mm256_zextsi128_si256(band2), 0x92);
@@ -2572,15 +2572,15 @@ inline __attribute__((always_inline)) void enter_digit( unsigned short digit, un
         fprintf(outfile, " %x at %s\n", _tzcnt_u32(digit)+1, cl2txt[i]);
     }
 #ifndef NDEBUG
-    if ( short_popcnt16(digit) != 1 && warnings != 0 ) {
+    if ( _popcnt_u16(digit) != 1 && warnings != 0 ) {
         fprintf(outfile, "error in enter_digit: %x\n", digit);
     }
 #endif
 
     if (i < 64) {
-        bittestandreset64(unlocked.u64[0], i);
+        _btr_u64(unlocked.u64[0], i);
     } else {
-        bittestandreset64(unlocked.u64[1], i-64);
+        _btr_u64(unlocked.u64[1], i-64);
     }
 
     candidates[i] = digit;
@@ -2717,7 +2717,7 @@ inline GridState* make_guess(SolverData *solverData) {
         while (totest) {
             int ti = tzcnt_and_mask(totest);
             int can_ti = ti-ti/10;   // 'canonical' triad index
-            if ( short_popcnt16 (wo_musts[ti]) == 2 ) {
+            if ( _popcnt_u16 (wo_musts[ti]) == 2 ) {
                 // get and check the unlocked indexbits for the triad
                 unsigned int b;
                 if ( type == 0 ) {
@@ -2743,7 +2743,7 @@ inline GridState* make_guess(SolverData *solverData) {
     return make_guess<verbose>(*solverData);
 found:
     // update the current and the new grid_state with their respective candidate to delete
-    unsigned short select_cand = 0x8000 >> __lzcnt16(*wo_musts);
+    unsigned short select_cand = 0x8000 >> _lzcnt_u16(*wo_musts);
 
     // Create a copy of the state of the grid to make back tracking possible
     GridState* new_grid_state = this+1;
@@ -2884,7 +2884,7 @@ inline GridState* make_guess(SolverData &solverData) {
         if ( best_digit == 0 ) {
             best_digit = candidates[guess_index];
         }
-        digit = 0x8000 >> __lzcnt16(best_digit); 
+        digit = 0x8000 >> _lzcnt_u16(best_digit); 
         return make_guess<verbose>(guess_index, digit, counters, outfile);
     }
 
@@ -2921,7 +2921,7 @@ inline GridState* make_guess(SolverData &solverData) {
                 unsigned char pos1, pos2;
                 unsigned short dgt;
                 while ( dgtit ) {
-                    dgt  = __blsi_u32(dgtit);
+                    dgt  = _blsi_u32(dgtit);
                     dgti = tzcnt_and_mask(dgtit);
                     score = 0;
                     unsigned int mskpos = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_and_si256(box,_mm256_set1_epi16(dgt)), _mm256_setzero_si256())) & 0x3f3f3f;
@@ -2929,7 +2929,7 @@ inline GridState* make_guess(SolverData &solverData) {
                     unsigned char lpos1 = _tzcnt_u32(mskpos)>>1;
                     pos1 = group4x3offsets[lpos1];
                     lpos1 = lpos1 - lpos1/4;
-                    pos2 = group4x3offsets[(62-__lzcnt64(mskpos))>>1];
+                    pos2 = group4x3offsets[(62-_lzcnt_u64(mskpos))>>1];
                     // check for hidden pair
                     if ( mskByStart[lpos1] == mskpos ) {
                         // this is a hidden pair, simply guess dgti in pos1
@@ -2954,11 +2954,11 @@ inline GridState* make_guess(SolverData &solverData) {
                         score++;
                     }
                     score_index = box_start_by_boxindex[boxi];
-                    if ( short_popcnt16(candidates[score_index+pos1]) <= 3 ) {
+                    if ( _popcnt_u16(candidates[score_index+pos1]) <= 3 ) {
                         score++;
                         score_index += pos2;
                     } else {
-                        if ( short_popcnt16(candidates[score_index+pos2]) <= 3 ) {
+                        if ( _popcnt_u16(candidates[score_index+pos2]) <= 3 ) {
                             score++;
                         }
                         score_index += pos1;
@@ -3001,7 +3001,7 @@ inline GridState* make_guess(SolverData &solverData) {
     unsigned long long to_visit = unlocked.u64[0];
     while ( best_cnt > 3 && to_visit != 0 ) {
         i_rel = tzcnt_and_mask(to_visit);
-        cnt = short_popcnt16(candidates[i_rel]);
+        cnt = _popcnt_u16(candidates[i_rel]);
         if (cnt < best_cnt) {
             best_cnt = cnt;
             guess_index = i_rel;
@@ -3011,7 +3011,7 @@ inline GridState* make_guess(SolverData &solverData) {
     to_visit = unlocked.u64[1];
     while ( best_cnt > 3 && to_visit != 0 ) {
         i_rel = tzcnt_and_mask(to_visit) + 64;
-        cnt = short_popcnt16(candidates[i_rel]);
+        cnt = _popcnt_u16(candidates[i_rel]);
         if (cnt < best_cnt) {
             best_cnt = cnt;
             guess_index = i_rel;
@@ -3019,7 +3019,7 @@ inline GridState* make_guess(SolverData &solverData) {
     }
     // Find the first candidate in this cell (lsb set)
     // Note: using tzcnt would be equally valid; this pick is historical
-    digit = 0x8000 >> __lzcnt16(candidates[guess_index]);
+    digit = 0x8000 >> _lzcnt_u16(candidates[guess_index]);
     return make_guess<verbose>(guess_index, digit, counters, outfile);
 }
 
@@ -3311,7 +3311,7 @@ enter:
             solverData.printf(" %x at %s\n", _tzcnt_u32(e_digit)+1, cl2txt[e_i]);
         }
 #ifndef NDEBUG
-        if ( short_popcnt16(e_digit) != 1 ) {
+        if ( _popcnt_u16(e_digit) != 1 ) {
             if ( warnings != 0 ) {
                 solverData.printf("error in e_digit: %x\n", e_digit);
             }
@@ -3319,9 +3319,9 @@ enter:
 #endif
 
         if (e_i < 64) {
-            bittestandreset64(unlocked[0], e_i);
+            _btr_u64(unlocked[0], e_i);
         } else {
-            bittestandreset64(unlocked[1], e_i-64);
+            _btr_u64(unlocked[1], e_i-64);
         }
 
         candidates[e_i] = e_digit;
@@ -3385,7 +3385,7 @@ enter:
                     goto back;
                 }
             }
-            if ( short_popcnt16(candidates[80]) == 1) {
+            if ( _popcnt_u16(candidates[80]) == 1) {
                 // Enter the digit and update candidates
                 if ( verbose == VDebug ) {
                     solverData.printf("naked  single      ");
@@ -3707,14 +3707,14 @@ hidden_search:
                 if ( verbose != VNone ) {
                     __m256i missing = _mm256_andnot_si256(_mm256_or_si256(column_cand_or, *(__m256i*) &candidates[0]), mask9x1ff);
                     unsigned int m  = _mm256_movemask_epi8(_mm256_cmpgt_epi16(missing, _mm256_setzero_si256()));
-                    int idx = __tzcnt_u32(m)>>1;
+                    int idx = _tzcnt_u32(m)>>1;
                     unsigned short digit = ((v16us)missing)[idx];
                     if ( grid_state->stackpointer == 0 && unique_check_mode == 0 ) {
                         if ( warnings != 0 ) {
-                            solverData.printf("Line %d: stack 0, back track - column %d misses digit %d\n", line, idx, __tzcnt_u16(digit)+1);
+                            solverData.printf("Line %d: stack 0, back track - column %d misses digit %d\n", line, idx, _tzcnt_u16(digit)+1);
                         }
                     } else if ( debug ) {
-                        solverData.printf("back track - missing digit %d in column %d\n", __tzcnt_u16(digit)+1, idx);
+                        solverData.printf("back track - missing digit %d in column %d\n", _tzcnt_u16(digit)+1, idx);
                     }
                 }
                 goto back;
@@ -3732,7 +3732,7 @@ hidden_search:
                 __m256i a = _mm256_cmpgt_epi16(mask9x1ff, column_cand_or);
                 unsigned int mask = and_compress_masks<false>(a, m & 0x1ff);
                 if ( mask) {
-                    int idx = __tzcnt_u32(mask);
+                    int idx = _tzcnt_u32(mask);
                     e_i = j+idx;
                     e_digit = ((v16us)_mm256_andnot_si256(column_cand_or, mask9x1ff))[idx];
                     if ( check_back && (e_digit & (e_digit-1)) ) {
@@ -3918,7 +3918,7 @@ hidden_search:
                 solverData.printf("triad set (col): %-9s %s\n", ret, cl2txt[off]);
             }
             // mask off resolved triad:
-            bittestandreset(grid_state->triads_unlocked[Col], tidx);
+            _btr_u32(grid_state->triads_unlocked[Col], tidx);
             grid_state->set23_found[Col].set_indexbits(0x40201,off,19);
             grid_state->set23_found[Box].set_indexbits(0x40201,off,19);
         }
@@ -3953,7 +3953,7 @@ hidden_search:
             unsigned char off  = row_triad_index_to_offset[tidx];
 
             if ( !tr.check_indexbit(off)) {  // locked
-                bittestandreset(grid_state->triads_unlocked[Row], tidx);
+                _btr_u32(grid_state->triads_unlocked[Row], tidx);
                 continue;
             }
 
@@ -4306,11 +4306,11 @@ hidden_search:
                     m = gt2.u64[1];
                     target = 64;
                 }
-                target += __tzcnt_u64(m);
+                target += _tzcnt_u64(m);
             } else {
                 goto no_bug;
             }
-            if ( short_popcnt16(candidates[target]) == 3 ) {
+            if ( _popcnt_u16(candidates[target]) == 3 ) {
                 unsigned char row = row_index[target];
                 unsigned short cand3 = candidates[target];
                 unsigned short digit = 0;
@@ -4318,7 +4318,7 @@ hidden_search:
                 __m256i maskv = expand_bitvector(mask);
                 __m256i c = _mm256_and_si256(_mm256_load_si256((__m256i*) &candidates[row*9]), maskv);
                 while (cand3) {
-                    unsigned short canddigit = __blsi_u32(cand3);
+                    unsigned short canddigit = _blsi_u32(cand3);
                     // count cells with this candidate digit:
                     __m256i tmp = _mm256_and_si256(_mm256_set1_epi16(canddigit), c);
                     // as a boolean
@@ -4755,7 +4755,7 @@ hidden_search:
 
         while (tv.u128) {
             unsigned char i = tzcnt_and_mask(tv);
-            unsigned short cnt = short_popcnt16(candidates[i]);
+            unsigned short cnt = _popcnt_u16(candidates[i]);
 
             if (cnt <= MAX_SET && cnt > 1) {
                 // Note: this algorithm will never detect a naked set of the shape:
@@ -4827,7 +4827,7 @@ hidden_search:
                             if ( delta <= 3 ) {
                                 // could include locked slots
                                 m_neg = 0x1ff & ~(m | grid_state->set23_found[Row].get_indexbits(ri*9,9));
-                                int bi_neg = box_index[ri*9+__tzcnt_u32(m_neg)];
+                                int bi_neg = box_index[ri*9+_tzcnt_u32(m_neg)];
                                 unsigned int row_box_intersection = 7<<(bi_neg%3*3);
                                 grid_state->set23_found[Row].set_indexbits(m_neg,ri*9,9);
                                 // adjust the count, maybe required lateron
@@ -4869,7 +4869,7 @@ hidden_search:
                                     }
                                     complement &= ~candidates[i];
                                     format_candidate_set(ret, complement);
-                                    solverData.printf("%s %s (row): %-7s %s\n", complement?"hidden":"naked ", short_popcnt16(complement)==2?"pair":"set ", ret, cl2txt[ri*9+k%9]);
+                                    solverData.printf("%s %s (row): %-7s %s\n", complement?"hidden":"naked ", _popcnt_u16(complement)==2?"pair":"set ", ret, cl2txt[ri*9+k%9]);
                                 }
                             }
                         }
@@ -4990,7 +4990,7 @@ hidden_search:
                                     complement &= ~candidates[i];
                                     if ( complement != 0 && set23_cond2 ) {
                                         format_candidate_set(ret, complement);
-                                        solverData.printf("%s %s (%s): %-7s %s\n", naked_anyway?"naked ":"hidden", short_popcnt16(complement)==2?"pair":"set ", js[j], ret, cl2txt[k]);
+                                        solverData.printf("%s %s (%s): %-7s %s\n", naked_anyway?"naked ":"hidden", _popcnt_u16(complement)==2?"pair":"set ", js[j], ret, cl2txt[k]);
                                     } else {
                                         format_candidate_set(ret, candidates[i]);
                                         solverData.printf("naked  %s (%s): %-7s %s\n", cnt==2?"pair":"set ", js[j], ret, cl2txt[i]);
@@ -5189,7 +5189,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
         __m128i max_v = _mm256_castsi256_si128(_mm256_or_si256(cbbv_v.m256, _mm256_bsrli_epi128(cbbv_v.m256,8)));
         max_v = _mm_or_si128(max_v, _mm_bsrli_si128(max_v,4));
         max_v = _mm_or_si128(max_v, _mm_bsrli_si128(max_v,2));
-        unsigned char max_all = short_popcnt16(_mm_extract_epi16(max_v, 0) | hi>>8);
+        unsigned char max_all = _popcnt_u16(_mm_extract_epi16(max_v, 0) | hi>>8);
         unsigned char max = max_all > 7 ? 7 : max_all;
         bit128_t dgt_bits = { .u128 = candidate_bits_by_value[dgt].u128 & grid_state->unlocked.u128 };
         unsigned char celli;
@@ -5207,7 +5207,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
             // for the given digit, the count in a given row is N (cnt).
             // take each row of bits and compare to all other rows.
             //
-            unsigned char cnt = short_popcnt16(base_x);
+            unsigned char cnt = _popcnt_u16(base_x);
 
             if ( cnt+2 <= max && cnt > 1) {  // maximum cnt is 5 ('squirmbag').
                 if ( cnt == 2 ) {
@@ -5263,7 +5263,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     clean_bits.u128 &= grid_state->unlocked.u128 & candidate_bits_by_value[dgt].u128;
                     if ( clean_bits ) {
                         if ( verbose == VDebug ) {
-                            celli  = __tzcnt_u16(subs_prp_x)*9 + __tzcnt_u16(base_x);
+                            celli  = _tzcnt_u16(subs_prp_x)*9 + _tzcnt_u16(base_x);
                             celli2 = (15-__lzcnt16(subs_prp_x))*9 + (15-__lzcnt16(base_x));
                             if ( debug > 2 ) {
                                 show_fish(cbbv_v, base_x, nsubs == cnt ? subs_prp_x:hassubs_prp_x, clean_bits, dgt_bits, solverData, "row fish");
@@ -5367,8 +5367,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                     if ( skyscraper && finsubcnt == 2 ) {   // Case 2 A
                         unsigned short rooffin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
                         if ( rooffin_subs_prp[0]/3 == rooffin_subs_prp[1]/3 ) {     // Case 2 C
-                            unsigned short rooffin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_v.v16[rooffin_subs_prp[0]] & base_x),
-                                                                       __tzcnt_u16(cbbv_v.v16[rooffin_subs_prp[1]] & base_x) };
+                            unsigned short rooffin_subs_pos_prl[2] = { _tzcnt_u16(cbbv_v.v16[rooffin_subs_prp[0]] & base_x),
+                                                                       _tzcnt_u16(cbbv_v.v16[rooffin_subs_prp[1]] & base_x) };
 
                             if (    rooffin_subs_pos_prl[0] != rooffin_subs_pos_prl[1]                // Case 2 B
                                  && _popcnt32(cbbv_v.v16[rooffin_subs_prp[0]] & base_x) == 1
@@ -5401,15 +5401,15 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                     }
                                     if ( verbose == VDebug ) {
                                         if ( skyscraper ) {
-                                            unsigned char cellif  = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
-                                            unsigned char cellif2 = __tzcnt_u16(subsx)*9 + (15-__lzcnt16(base_x));
+                                            unsigned char cellif  = _tzcnt_u16(subsx)*9 + _tzcnt_u16(base_x);
+                                            unsigned char cellif2 = _tzcnt_u16(subsx)*9 + (15-__lzcnt16(base_x));
                                             if ( debug > 2 ) {
                                                 show_skyscraper(cellif, cellif2, fincells[0], fincells[1], clean_bits, dgt_bits, solverData, "skyscraper (row)");
                                             }
                                             solverData.printf("skyscraper (row floor) digit %d floor at %s-%s roof at %s/%s\n   remove %d at ", dgt+1, cl2txt[cellif], cl2txt[cellif2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
                                         } else {
                                             subsx = subs_prp_x | (1<<rooffin_subs_prp[0]) | (1<<rooffin_subs_prp[1]);
-                                            celli  = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
+                                            celli  = _tzcnt_u16(subsx)*9 + _tzcnt_u16(base_x);
                                             celli2 = (15-__lzcnt16(subsx))*9 + (15-__lzcnt16(base_x));
                                             if ( debug > 2 ) {
                                                 show_fish(cbbv_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, solverData, "roofed row fish");
@@ -5418,7 +5418,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                         }
                                     }
                                 } else if ( solverData.guess_hint_digit == 0 && !clean_bits && cnt == 2 ) {
-                                    if ( short_popcnt16(candidates[fincells[0]]) == 2 ) {
+                                    if ( _popcnt_u16(candidates[fincells[0]]) == 2 ) {
                                         solverData.guess_hint_digit = 1<<dgt;
                                         solverData.guess_hint_index = fincells[0];
                                     }
@@ -5458,7 +5458,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                             unsigned short finln_prl_x = cbbv_v.v16[fin_sub];
                             unsigned short fins = finln_prl_x & ~base_x;
 
-                            unsigned short box_bits = bandbits_by_index[__tzcnt_u16(fins)/3];  // the box to compare with
+                            unsigned short box_bits = bandbits_by_index[_tzcnt_u16(fins)/3];  // the box to compare with
                             // grid point in box? fins in box?    
                             // In this first case the fin cell view is intersected with
                             // a grid point view box.
@@ -5475,7 +5475,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
 
                             sashimi = !(finln_prl_x & base_x & box_bits);
 
-                            skyscraper = sashimi && alt_base_x==0 && cnt == 2 && short_popcnt16(fins) == 1;
+                            skyscraper = sashimi && alt_base_x==0 && cnt == 2 && _popcnt_u16(fins) == 1;
 
                             // roof coordinates for skyscraper:
                             unsigned char cellir {};
@@ -5494,8 +5494,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 // the skyscraper base_x is a good guess to keep for later:
                                 if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && cnt == 2 ) {
                                     solverData.guess_hint_digit = 1<<dgt;
-                                    solverData.guess_hint_index = t*9 + __tzcnt_u16(base_x & ~box_bits);
-                                    if ( short_popcnt16(solverData.guess_hint_index) != 2 ) {
+                                    solverData.guess_hint_index = t*9 + _tzcnt_u16(base_x & ~box_bits);
+                                    if (_popcnt_u16(solverData.guess_hint_index) != 2 ) {
                                         solverData.guess_hint_digit = 0;
                                     }
                                 }
@@ -5510,8 +5510,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                             // skyscraper is not singled out in statistics
                             if ( skyscraper ) {
                                 // row:
-                                cellir = t*9 + __tzcnt_u16(box_bits & base_x);
-                                cellir2 = fin_sub*9 + __tzcnt_u16(fins);
+                                cellir = t*9 + _tzcnt_u16(box_bits & base_x);
+                                cellir2 = fin_sub*9 + _tzcnt_u16(fins);
                                 clean_bits.u128 =   *cast2cu128(big_index_lut[cellir][All])
                                                   & *cast2cu128(big_index_lut[cellir2][All]);
                                 // deal with skyscraper analogous to Case 2 addendum
@@ -5525,7 +5525,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                     if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(cellir/27*27 + cellir%9, 19) & 0x40201) == 1
                                          && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(cellir2/27*27 + cellir2%9, 19) & 0x40201) == 1) {
                                         // the roof candidates must not have 'siblings' in their respective boxes
-                                        bit128_t base_column = { .u128= *cast2cu128(big_index_lut[__tzcnt_u16(base_x & ~box_bits)][Col]) & dgt_bits.u128 };
+                                        bit128_t base_column = { .u128= *cast2cu128(big_index_lut[_tzcnt_u16(base_x & ~box_bits)][Col]) & dgt_bits.u128 };
                                         if ( base_column.popcount() == 2 ) { // the skyscraper's floor is strongly linked
                                             unsigned char cellir3rd2 = _tzcnt_u32(7^((1<<(cellir%3))^(1<<(cellir2%3))));
                                             unsigned char cellir3rd = _tzcnt_u32(7^cellirxor);
@@ -5549,8 +5549,8 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                 }
                                 if ( verbose == VDebug ) {
                                     if ( skyscraper ) {
-                                        celli = t*9 + __tzcnt_u16(base_x&~box_bits);
-                                        celli2 = fin_sub*9 + __tzcnt_u16(base_x&~box_bits);
+                                        celli = t*9 + _tzcnt_u16(base_x&~box_bits);
+                                        celli2 = fin_sub*9 + _tzcnt_u16(base_x&~box_bits);
                                         if ( debug > 2 ) {
                                             show_skyscraper(celli, celli2, cellir, cellir2, clean_bits, dgt_bits, solverData, "skyscraper (col)");
                                         }
@@ -5559,9 +5559,9 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                                         if ( debug > 2 ) {
                                             show_fish(cbbv_v, base_x, subsx, clean_bits, dgt_bits, solverData, "finned row fish");
                                         }
-                                        celli = __tzcnt_u16(subsx)*9 + __tzcnt_u16(base_x);
+                                        celli = _tzcnt_u16(subsx)*9 + _tzcnt_u16(base_x);
                                         celli2 = (15-__lzcnt16(subsx))*9 + (15-__lzcnt16(base_x));
-                                        solverData.printf("finned%s %s (rows) digit %d at cells %s - %s\nFin at %s - remove %d at ", sashimi?"/sashimi":"", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fin_sub*9+__tzcnt_u16(fins&~base_x)], dgt+1);
+                                        solverData.printf("finned%s %s (rows) digit %d at cells %s - %s\nFin at %s - remove %d at ", sashimi?"/sashimi":"", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fin_sub*9+_tzcnt_u16(fins&~base_x)], dgt+1);
                                     }
                                 }
                                 break;
@@ -5608,7 +5608,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
             } // if
             // scan for two bi-values forming a triple...
             // just take a single guess with this - it will also catch fin/sashimi
-            unsigned int pair_cnt = short_popcnt16(pair_locs);
+            unsigned int pair_cnt = _popcnt_u16(pair_locs);
             if ( t == 8 && pair_cnt >= 3 ) {
                 unsigned char pos[9];
                 for ( int i=pair_cnt-1; pair_locs; i-- ) {
@@ -5617,7 +5617,7 @@ dump_m256i_grid(_mm256_and_si256(_mm256_setr_epi16(lo, lo>>9, lo>>18, lo>>27, lo
                 unsigned short res = 0;
                 for ( unsigned int i=0; i<pair_cnt-1; i++) {
                     for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
-                        if ( ( short_popcnt16(res = cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]])) == 3 ) {
+                        if ( ( _popcnt_u16(res = cbbv_v.v16[pos[i]] | cbbv_v.v16[pos[k]])) == 3 ) {
                             alt_base_x = res;
                             goto done;
                         }
@@ -5657,7 +5657,7 @@ done:
             // for the given digit, the count in a given col is N (cnt).
             // take each col of bits and compare to all other cols.
             //
-            unsigned char cnt = short_popcnt16(base_x);
+            unsigned char cnt =_popcnt_u16(base_x);
 
             if ( cnt+2 <= max && cnt > 1) {  // maximum cnt is 5 ('squirmbag').
                 if ( cnt == 2 ) {
@@ -5715,7 +5715,7 @@ done:
                     clean_bits.u128 &= dgt_bits.u128;
                     if ( clean_bits.u128 ) {
                         if ( verbose == VDebug ) {
-                            celli = __tzcnt_u16(subs_prp_x) + __tzcnt_u16(base_x)*9;
+                            celli = _tzcnt_u16(subs_prp_x) + _tzcnt_u16(base_x)*9;
                             celli2 = (15-__lzcnt16(subs_prp_x)) + (15-__lzcnt16(base_x))*9;
                             if ( debug > 2 ) {
                                 show_fish<true>(cbbv_col_v, base_x, nsubs == cnt ? subs_prp_x:hassubs_prp_x, clean_bits, dgt_bits, solverData, "col fish");
@@ -5742,8 +5742,8 @@ done:
                     if ( skyscraper && finsubcnt == 2 ) {   // Case 2 A
                         unsigned short rooffin_subs_prp[2] = { (unsigned short)_tzcnt_u32(finsubs_prp_x), (unsigned short)(31-__lzcnt32(finsubs_prp_x)) };
                         if ( rooffin_subs_prp[0]/3 == rooffin_subs_prp[1]/3 ) {    // Case 2 C
-                            unsigned short rooffin_subs_pos_prl[2] = { __tzcnt_u16(cbbv_col_v.v16[rooffin_subs_prp[0]] & base_x),
-                                                                    __tzcnt_u16(cbbv_col_v.v16[rooffin_subs_prp[1]] & base_x) };
+                            unsigned short rooffin_subs_pos_prl[2] = { _tzcnt_u16(cbbv_col_v.v16[rooffin_subs_prp[0]] & base_x),
+                                                                    _tzcnt_u16(cbbv_col_v.v16[rooffin_subs_prp[1]] & base_x) };
                             if (    rooffin_subs_pos_prl[0] != rooffin_subs_pos_prl[1]                // Case 2 B
                                  && _popcnt32(cbbv_col_v.v16[rooffin_subs_prp[0]] & base_x) == 1
                                  && _popcnt32(cbbv_col_v.v16[rooffin_subs_prp[1]] & base_x) == 1 ) {
@@ -5775,14 +5775,14 @@ done:
                                     if ( verbose == VDebug ) {
                                         if ( skyscraper ) {
                                             subsx = subs_prp_x | (1<<rooffin_subs_prp[0]) | (1<<rooffin_subs_prp[1]);
-                                            unsigned char cellif = __tzcnt_u16(subs_prp_x) + __tzcnt_u16(base_x)*9;
-                                            unsigned char cellif2 = __tzcnt_u16(subs_prp_x) + (15-__lzcnt16(base_x))*9;
+                                            unsigned char cellif = _tzcnt_u16(subs_prp_x) + _tzcnt_u16(base_x)*9;
+                                            unsigned char cellif2 = _tzcnt_u16(subs_prp_x) + (15-__lzcnt16(base_x))*9;
                                             if ( debug > 2 ) {
                                                 show_skyscraper(cellif, cellif2, fincells[0], fincells[1], clean_bits, dgt_bits, solverData, "skyscraper (col)");
                                             }
                                             solverData.printf("skyscraper (col floor) digit %d floor at %s-%s roof at %s/%s\n   remove %d at ", dgt+1, cl2txt[cellif], cl2txt[cellif2], cl2txt[fincells[0]], cl2txt[fincells[1]], dgt+1);
                                         } else {
-                                            celli = __tzcnt_u16(subsx) + __tzcnt_u16(base_x)*9;
+                                            celli = _tzcnt_u16(subsx) + _tzcnt_u16(base_x)*9;
                                             celli2 = (15-__lzcnt16(subsx)) + (15-__lzcnt16(base_x))*9;
                                             if ( debug > 2 ) {
                                                show_fish<true>(cbbv_col_v, subs_prp_x, 2, fincells, clean_bits, dgt_bits, solverData, "roofed col fish");
@@ -5791,7 +5791,7 @@ done:
                                         }
                                     }
                                 } else {
-                                    if ( short_popcnt16(candidates[fincells[0]]) == 2 ) {
+                                    if (_popcnt_u16(candidates[fincells[0]]) == 2 ) {
                                         solverData.guess_hint_digit = 1<<dgt;
                                         solverData.guess_hint_index = fincells[0];
                                     }
@@ -5830,14 +5830,14 @@ done:
                             unsigned char fin_sub = tzcnt_and_mask(finsubs_prp_x);
                             unsigned short finln_prl_x = cbbv_col_v.v16[fin_sub];
                             unsigned short fins = finln_prl_x & ~base_x;
-                            unsigned short box_bits = bandbits_by_index[__tzcnt_u16(fins)/3];  // the box to compare with
+                            unsigned short box_bits = bandbits_by_index[_tzcnt_u16(fins)/3];  // the box to compare with
                             // fins in box? grid point in box?
                             if (  (fins & ~box_bits) || !(box_bits & base_x) ) {
                                 continue;
                             }
 
                             sashimi = !(finln_prl_x & base_x & box_bits);
-                            skyscraper = sashimi && alt_base_x==0 && cnt == 2 && short_popcnt16(fins) == 1;
+                            skyscraper = sashimi && alt_base_x==0 && cnt == 2 &&_popcnt_u16(fins) == 1;
 
                             // roof coordinates for skyscraper:
                             unsigned char cellir {};
@@ -5857,7 +5857,7 @@ done:
                                 // the skyscraper base is a good guess:
                                 if ( solverData.guess_hint_digit == 0 && !clean_bits && sashimi && cnt == 2 ) {
                                     solverData.guess_hint_digit = 1<<dgt;
-                                    solverData.guess_hint_index = t + __tzcnt_u16(base_x & ~box_bits)*9;
+                                    solverData.guess_hint_index = t + _tzcnt_u16(base_x & ~box_bits)*9;
                                 }
                             }
                             // skyscraper is not singled out in statistics
@@ -5870,8 +5870,8 @@ done:
 
                             if ( skyscraper ) {
                                 // col:
-                                cellir = fin_sub + __tzcnt_u16(fins)*9;
-                                cellir2 = t + __tzcnt_u16(box_bits & base_x)*9;
+                                cellir = fin_sub + _tzcnt_u16(fins)*9;
+                                cellir2 = t + _tzcnt_u16(box_bits & base_x)*9;
                                 clean_bits.u128 =   *cast2cu128(big_index_lut[cellir][All])
                                                   & *cast2cu128(big_index_lut[cellir2][All]);
                                 unsigned char cellirxor = (1<<(cellir/3%3)) ^ (1<<(cellir2/3%3));
@@ -5879,7 +5879,7 @@ done:
                                     if (    _popcnt32(candidate_bits_by_value[dgt].get_indexbits(cellir/3*3, 3) & 0x7) == 1
                                          && _popcnt32(candidate_bits_by_value[dgt].get_indexbits(cellir2/3*3, 3) & 0x7) == 1) {
                                         // the roof candidates must not have 'siblings' in their respective boxes
-                                        bit128_t base_row = { .u128= *cast2cu128(big_index_lut[__tzcnt_u16(base_x & ~box_bits)*9][Row]) & dgt_bits.u128 };
+                                        bit128_t base_row = { .u128= *cast2cu128(big_index_lut[_tzcnt_u16(base_x & ~box_bits)*9][Row]) & dgt_bits.u128 };
                                         if ( base_row.popcount() == 2 ) { // the skyscraper's floor is strongly linked
                                             unsigned char cellir3rd2 = _tzcnt_u32(7^((1<<(cellir/9%3))^(1<<(cellir2/9%3))));
                                             unsigned char cellir3rd = _tzcnt_u32(7^cellirxor);
@@ -5908,8 +5908,8 @@ done:
                                 }
                                 if ( verbose == VDebug ) {
                                     if ( skyscraper ) {
-                                        unsigned char cellif = t + __tzcnt_u16(base_x&~box_bits)*9;
-                                        unsigned char cellif2 = fin_sub + __tzcnt_u16(base_x&~box_bits)*9;
+                                        unsigned char cellif = t + _tzcnt_u16(base_x&~box_bits)*9;
+                                        unsigned char cellif2 = fin_sub + _tzcnt_u16(base_x&~box_bits)*9;
                                         if ( debug > 2 ) {
                                             show_skyscraper(cellif, cellif2, cellir, cellir2, clean_bits, dgt_bits, solverData, "skyscraper (row)");
                                         }
@@ -5918,9 +5918,9 @@ done:
                                         if ( debug > 2 ) {
                                             show_fish<true>(cbbv_col_v, base_x, subsx, clean_bits, dgt_bits, solverData, "finned col fish");
                                         }
-                                        celli = __tzcnt_u16(subsx) + __tzcnt_u16(base_x)*9;
+                                        celli = _tzcnt_u16(subsx) + _tzcnt_u16(base_x)*9;
                                         celli2 = (15-__lzcnt16(subsx)) + (15-__lzcnt16(base_x))*9;
-                                        solverData.printf("finned%s %s (cols) digit %d at cells %s - %s\nFin at %s - remove %d at ", sashimi?"/sashimi":"", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fin_sub+__tzcnt_u16(fins&~base_x)*9], dgt+1);
+                                        solverData.printf("finned%s %s (cols) digit %d at cells %s - %s\nFin at %s - remove %d at ", sashimi?"/sashimi":"", fish_names[cnt-2], dgt+1, cl2txt[celli], cl2txt[celli2], cl2txt[fin_sub+_tzcnt_u16(fins&~base_x)*9], dgt+1);
                                     }
                                 }
                                 break;
@@ -5967,7 +5967,7 @@ done:
             }
             // scan for two bi-values forming a triple...
             // just take a single guess with this - it will also catch fin/sashimi
-            unsigned int pair_cnt = short_popcnt16(pair_locs);
+            unsigned int pair_cnt = _popcnt_u16(pair_locs);
             if ( t == 8 && pair_cnt >= 3 ) {
                 unsigned char pos[9];
                 for ( int i=pair_cnt-1; pair_locs; i-- ) {
@@ -5976,7 +5976,7 @@ done:
                 unsigned short res = 0;
                 for ( unsigned int i=0; i<pair_cnt-1; i++) {
                     for ( unsigned int k=i+1; k<pair_cnt; k++ ) {
-                        if ( ( short_popcnt16(res = cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]])) == 3 ) {
+                        if ( ( _popcnt_u16(res = cbbv_col_v.v16[pos[i]] | cbbv_col_v.v16[pos[k]])) == 3 ) {
                             alt_base_x = res;
                             goto done2;
                         }
@@ -6324,9 +6324,9 @@ if ( mode_uqr )
                                                res_data[cuqr_accessp[1]] };
 
                     // cross elimination based on diagonal info
-                    if (short_popcnt16(diag[0]) == 1 ) {
+                    if (_popcnt_u16(diag[0]) == 1 ) {
                         diag[1] &= ~diag[0];
-                    } else if (short_popcnt16(diag[1]) == 1 ) {
+                    } else if (_popcnt_u16(diag[1]) == 1 ) {
                         diag[0] &= ~diag[1];
                     }
 
@@ -6365,7 +6365,7 @@ if ( mode_uqr )
                     for ( int i=0; i<4; i++ ) {
                         unsigned short dgts = candidates[uqr_corners[i].indx];
                         all_digits |= dgts;
-                        unsigned char cnt = short_popcnt16(dgts);
+                        unsigned char cnt = _popcnt_u16(dgts);
                         if ( cnt == 1 ) {
                             uqr_singles |= dgts;
                             uqr_singles_cnt++;
@@ -6375,13 +6375,13 @@ if ( mode_uqr )
                     }
 
                     // Pattern UR-3S
-                    if ( short_popcnt16(uqr_singles) == 2 && uqr_singles_cnt == 3 ) {
-                        unsigned char ix = __tzcnt_u16(not_singles);
+                    if ( _popcnt_u16(uqr_singles) == 2 && uqr_singles_cnt == 3 ) {
+                        unsigned char ix = _tzcnt_u16(not_singles);
                         char ret[32];
                         format_candidate_set(ret, uqr_singles);
                         unsigned char celli = uqr_corners[ix].indx;
                         unsigned short single = candidates[uqr_corners[(ix+2)&3].indx];
-                        if ( (candidates[celli] & single) && short_popcnt16(candidates[celli]) > 1 ) {
+                        if ( (candidates[celli] & single) && _popcnt_u16(candidates[celli]) > 1 ) {
                             if ( verbose != VNone ) {
                                 counters.unique_rectangles_avoided++;
                             }
@@ -6392,10 +6392,10 @@ if ( mode_uqr )
                                 if ( verbose == VDebug ) {
                                     snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        3 singles pattern: remove candidate %d from cell %s",
                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                            1+__tzcnt_u16(single), cl2txt[celli]);
+                                            1+_tzcnt_u16(single), cl2txt[celli]);
                                     snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        3 singles pattern: set %d at %s",
                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                            1+__tzcnt_u16(single), cl2txt[celli]);
+                                            1+_tzcnt_u16(single), cl2txt[celli]);
                                 }
                                 // call make_guess using a lambda
                                 grid_state = grid_state->make_guess<verbose>(
@@ -6417,7 +6417,7 @@ if ( mode_uqr )
                             if ( verbose == VDebug ) {
                                 solverData.printf("avoiding unique rectangle: %s %s - %s\n3 singles pattern: remove candidate %d from cell %s\n",
                                     ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                    1+__tzcnt_u16(single), cl2txt[celli]);
+                                    1+_tzcnt_u16(single), cl2txt[celli]);
                             }
                             if ( (candidates[celli] & (candidates[celli]-1)) == 0) {
                                 e_i = celli;
@@ -6432,7 +6432,7 @@ if ( mode_uqr )
                     }
 
                     // if all corners together contain the same 2 digits, a unique rectangle has been found.
-                    if ( check_back && not_singles && short_popcnt16(all_digits) == 2 ) {
+                    if ( check_back && not_singles && _popcnt_u16(all_digits) == 2 ) {
                         if ( grid_state->stackpointer && rules == Regular ) {
                             if ( verbose == VDebug ) {
                                 char ret[32];
@@ -6469,7 +6469,7 @@ if ( mode_uqr )
                     // complete corner infos, including edges and uqr_pairs infos
                     for ( int i=0; i<4; i++ ) {
                         unsigned short dgts = candidates[uqr_corners[i].indx];
-                        unsigned char cnt = short_popcnt16(dgts);
+                        unsigned char cnt = _popcnt_u16(dgts);
                         if ( cnt == 1 ) {
                             uqr_corners[i].is_single = true;
                         } else if ( cnt == 2 ) {
@@ -6507,7 +6507,7 @@ if ( mode_uqr )
                         case 3:  // UR-3P (aka Type 1):
                         {
                             // find the 4th corner
-                            unsigned char corner4_index = uqr_corners[__tzcnt_u16(~uqr_pairs[pi].crnrs)].indx;
+                            unsigned char corner4_index = uqr_corners[_tzcnt_u16(~uqr_pairs[pi].crnrs)].indx;
                             unsigned short pair = uqr_pairs[pi].digits;
                             if ( candidates[corner4_index] != pair ) {
                                 // unless under 'Regular' rules, provide 'resolution' in form of a guess
@@ -6595,7 +6595,7 @@ if ( mode_uqr )
                             // uqr_cand: the tentative value of x
                             unsigned short uqr_cand = _blsi_u32(uqr_pairs[pi].digits);
                             // all the cells containing that candidate:
-                            __uint128_t *cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                            __uint128_t *cbbv = &candidate_bits_by_value[_tzcnt_u16(uqr_cand)].u128;
                             // either opposite pair will do for both diagonal and side by side
                             // conjugate pairs.
                             // setup the opposing edges without the corners:
@@ -6634,7 +6634,7 @@ if ( mode_uqr )
                                     // when selected each cause a completed UR.
                                     // Quite rare as well.
                                     if ( check_back && uqr_cand != uqr_pairs[pi].digits ) {
-                                        cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand ^ uqr_pairs[pi].digits)].u128;
+                                        cbbv = &candidate_bits_by_value[_tzcnt_u16(uqr_cand ^ uqr_pairs[pi].digits)].u128;
                                         if (    (uqr_opp_edges[0] & *cbbv) == (__uint128_t)0
                                              || (uqr_opp_edges[1] & *cbbv) == (__uint128_t)0 ) {
 
@@ -6687,10 +6687,10 @@ if ( mode_uqr )
                                                 if ( verbose == VDebug ) {
                                                     snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s",
                                                              ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                             1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                                             1+_tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
                                                     snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: set %d at %s",
                                                              ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                             1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                                             1+_tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
                                                 }
                                                 // call make_guess using a lambda
                                                 grid_state = grid_state->make_guess<verbose>(
@@ -6712,7 +6712,7 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 solverData.printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d at %s\n",
                                                        ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                       1+__tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
+                                                       1+_tzcnt_u16(weak_corner_y), cl2txt[weak_corner_indx]);
                                             }
                                             if ( (candidates[weak_corner_indx] & (candidates[weak_corner_indx]-1)) == 0 ) {
                                                 e_i = weak_corner_indx;
@@ -6733,7 +6733,7 @@ if ( mode_uqr )
                                     break;
                                 }
                                 weak_corner = 0xff;
-                                cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                                cbbv = &candidate_bits_by_value[_tzcnt_u16(uqr_cand)].u128;
                             }
                             if ( i<2 ) {
                                 // select the diagonally opposite corners:
@@ -6766,7 +6766,7 @@ if ( mode_uqr )
                                         if ( verbose == VDebug ) {
                                             solverData.printf("avoiding unique rectangle: %s %s - %s\n2 pair pattern: remove candidate %d from cells %s %s\n",
                                                    ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                   1+__tzcnt_u16(uqr_cand),
+                                                   1+_tzcnt_u16(uqr_cand),
                                                    cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
                                         }
                                         if (    (candidates[indx2upd[0]] & (candidates[indx2upd[0]] - 1)) == 0 ) {
@@ -6790,10 +6790,10 @@ if ( mode_uqr )
                                             if ( verbose == VDebug ) {
                                                 snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s and %s",
                                                          ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                         1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                                         1+_tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
                                                 snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: remove candidate %d at %s and %s",
                                                         ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                        1+__tzcnt_u16(other_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                                        1+_tzcnt_u16(other_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
                                             }
                                             // call make_guess using a lambda
                                             grid_state = grid_state->make_guess<verbose>(
@@ -6816,10 +6816,10 @@ if ( mode_uqr )
 
                                                 snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        2 pair pattern: remove candidate %d at %s and %s",
                                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                            1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
+                                                            1+_tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]], cl2txt[indx2upd[1]]);
                                                 snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        2 pair pattern: set candidate %d at %s",
                                                             ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                            1+__tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]]);
+                                                            1+_tzcnt_u16(uqr_cand), cl2txt[indx2upd[0]]);
                                             }
                                             // call make_guess using a lambda
                                             grid_state = grid_state->make_guess<verbose>(
@@ -6856,7 +6856,7 @@ if ( mode_uqr )
                             }
                             // remove the UR candidates to avoid:
                             non_uqr_cands &= ~uqr_pairs[pi].digits;
-                            unsigned char non_uqr_cands_cnt = short_popcnt16(non_uqr_cands);
+                            unsigned char non_uqr_cands_cnt = _popcnt_u16(non_uqr_cands);
 
                             // continuing with UR-P2-BLD patterns (only for Regular rules)
                             //
@@ -6872,12 +6872,12 @@ if ( mode_uqr )
                                     // plug the index bit hole (or prove that to be unnecessary)
                                     cand_removal_indx.u128 =  *cast2cu128(big_index_lut[non_pairs_celli[0]][All]);
                                     cand_removal_indx.u128 &= *cast2cu128(big_index_lut[non_pairs_celli[1]][All]);
-                                    cand_removal_indx.u128 &= candidate_bits_by_value[__tzcnt_u16(non_uqr_cands)].u128;
+                                    cand_removal_indx.u128 &= candidate_bits_by_value[_tzcnt_u16(non_uqr_cands)].u128;
                                     check_set = true;
                                 } else if ( !is_diag ) {   // exclude UR-2P-D pattern
                                     unsigned short non_uqr_cands_ = non_uqr_cands;
                                     while ( non_uqr_cands_ ) {
-                                        unsigned char cand_ = __tzcnt_u16(non_uqr_cands_);
+                                        unsigned char cand_ = _tzcnt_u16(non_uqr_cands_);
                                         non_uqr_cands_ = _blsr_u32(non_uqr_cands_);
                                         cand_removal_indx.u128 |= candidate_bits_by_value[cand_].u128;
                                     }
@@ -6985,7 +6985,7 @@ if ( mode_uqr )
                             // uqr_cand: the tentative value of x
                             unsigned short uqr_cand = _blsi_u32(uqr_pairs[pi].digits);
                             int j=0;
-                            unsigned char crnr_indx = (__tzcnt_u16(uqr_pairs[pi].crnrs)+2)&3;
+                            unsigned char crnr_indx = (_tzcnt_u16(uqr_pairs[pi].crnrs)+2)&3;
                             unsigned char indx = uqr_corners[crnr_indx].indx;
                             __uint128_t uqr_crnr_edges = *uqr_corners[crnr_indx].right_edge | *uqr_corners[(crnr_indx+3)&3].right_edge;
                             __uint128_t *cbbv;
@@ -6995,7 +6995,7 @@ if ( mode_uqr )
                                 // check whether there is anyting to remove:
                                 if ( candidates[indx] & uqr_alt_cand ) {
                                     // all the cells containing that candidate:
-                                    cbbv = &candidate_bits_by_value[__tzcnt_u16(uqr_cand)].u128;
+                                    cbbv = &candidate_bits_by_value[_tzcnt_u16(uqr_cand)].u128;
                                     if ( ((uqr_crnr_edges & *cbbv) | corner_bits) == corner_bits ) {
                                         // found x
                                         break;
@@ -7027,7 +7027,7 @@ if ( mode_uqr )
                                             format_candidate_set(ret, uqr_pairs[pi].digits);
                                             solverData.printf("avoiding unique rectangle: %s %s - %s\n1 pair pattern: remove candidate %d from cell %s\n",
                                                     ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                                    1+_tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
                                         }
                                         found_update = true;
                                         if ( (candidates[indx] & (candidates[indx]-1)) == 0 ) {
@@ -7044,10 +7044,10 @@ if ( mode_uqr )
                                             format_candidate_set(ret, uqr_pairs[pi].digits);
                                             snprintf(guess_message[0], 196, "to allow unique check of unique rectangle: %s %s - %s\n        1 pair pattern: remove candidate %d at %s",
                                                     ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                                    1+_tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
                                             snprintf(guess_message[1], 196, "engender unique rectangle %s %s - %s for subsequent unique checking:\n        1 pair pattern: set %d at %s",
                                                     ret, cl2txt[uqr_corners[0].indx], cl2txt[uqr_corners[2].indx],
-                                                    1+__tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
+                                                    1+_tzcnt_u16(uqr_alt_cand), cl2txt[indx]);
                                         }
                                         // call make_guess using a lambda
                                         grid_state = grid_state->make_guess<verbose>(
