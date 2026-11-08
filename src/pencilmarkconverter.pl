@@ -134,7 +134,9 @@ if ( index($inspec,'STPC') ) {
                         $val |= 1<<$_;
                     }
                 } (0..8);
-                $val != 0 || die "Sudoku input spec (T): found invalid cell with 0 value";
+                if ( $val == 0 ) {
+                    $val = 0x1ff;
+                }
                 $_ = $val; # $val now has the bit pattern representing the valid candidates
             } @board;
             return \@board;
@@ -143,11 +145,15 @@ if ( index($inspec,'STPC') ) {
         $split_chunk_and_digest = sub($line) {
             substr($line,0,2) eq 'PX' || die "Sudoku input spec (P): missing input spec signature prefix of 'PX'";
             $_ = substr($line, 2, length($line)-2);
-            my @board = ($line =~ /.{3}/g);
+            my @board = ($_ =~ /.{3}/g);
             $#board+1 == 81 || die "Sudoku input spec (P): found " . ($#board+1) . " cells";
             @board = map {
                 $_ = hex($_);
                 $_ <= 0x1ff || die "Sudoku input spec (P): found invalid board cell value of $_";
+                if ( $_ == 0 ) {
+                    $_ = 0x1ff;
+                }
+                $_
             } @board;
             return \@board;
         }
@@ -161,7 +167,10 @@ if ( index($inspec,'STPC') ) {
                 map {
                     $val |= 1<<($_-1)
                 } @chars;
-                $val != 0 || die "Sudoku input spec (C): found invalid cell with 0 value";
+                if ( $_ == 0 ) {
+                    $_ = 0x1ff;
+                }
+
                 $_ = $val; # $val now has the bit pattern representing the valid candidates
             } @board;
             return \@board;
@@ -230,6 +239,11 @@ if ( $inspec eq 'B' ) {
         my $binaries = $_[0];
         my @board = unpack ('S<*', $binaries);
         $#board+1 == 81 || die "Sudoku input spec (B): found " . ($#board+1) . " cells";
+        @board = map {
+            if ( $_ == 0 ) {
+                $_ = 0x1f;
+            }
+        }
         return \@board;
     };
 }    
